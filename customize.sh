@@ -22,4 +22,3 @@ set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm_recursive "$MODPATH/web/cgi-bin" 0 0 0755 0755
 set_perm "$MODPATH/lib/common.sh" 0 0 0755
-chmod 0755 "/bin/mihomo" 2>/dev/null

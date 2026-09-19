@@ -9,7 +9,7 @@
 #   action.sh                   (no args) show info + restart service (legacy)
 
 MODDIR=${0%/*}
-DATA_DIR=/data/adb/xiaomi_mifi_web
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 STABLE_IP=192.168.43.1
 PORT=8080
 DESIRED_FILE="$DATA_DIR/desired_state"
@@ -62,7 +62,7 @@ case "$cmd" in
         cmd=$(/system/bin/tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null)
         case "$f" in
           httpd) echo "$cmd" | /system/bin/grep -q httpd && /system/bin/kill "$PID" 2>/dev/null ;;
-          supervisor) echo "$cmd" | /system/bin/grep -q "xiaomi_mifi_web" && /system/bin/kill "$PID" 2>/dev/null ;;
+          supervisor) echo "$cmd" | /system/bin/grep -q "xiaomi14_mifi_web" && /system/bin/kill "$PID" 2>/dev/null ;;
         esac
       done
       /system/bin/sleep 1

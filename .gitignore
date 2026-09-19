@@ -17,6 +17,9 @@ release/
 dist/
 build/
 
+# Large prebuilt binaries (included in release ZIP, not in source repo)
+bin/
+
 # Temp
 *.tmp
 *.log

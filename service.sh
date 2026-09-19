@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 MODDIR=${0%/*}
-DATA_DIR=/data/adb/xiaomi_mifi_web
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 CONFIG="$DATA_DIR/config.conf"
 HTTP_CONF="$DATA_DIR/httpd.conf"
 LOG="$DATA_DIR/service.log"
@@ -32,7 +32,7 @@ if [ -f "$SUPERVISOR_PIDFILE" ]; then
   OLD_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
   case "$OLD_PID" in ''|*[!0-9]*) OLD_PID=0 ;; esac
   W=0
-  while [ "$OLD_PID" -gt 1 ] && [ -r "/proc/$OLD_PID/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null | "$BB" grep -q 'xiaomi_mifi_web/service.sh'; do
+  while [ "$OLD_PID" -gt 1 ] && [ -r "/proc/$OLD_PID/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null | "$BB" grep -q 'xiaomi14_mifi_web/service.sh'; do
     if [ "$W" -ge 10 ]; then kill -9 "$OLD_PID" 2>/dev/null; break; fi
     kill "$OLD_PID" 2>/dev/null
     W=$((W + 1))
@@ -219,7 +219,7 @@ start_httpd() {
 if [ -f "$SUPERVISOR_PIDFILE" ]; then
   OLD_SUPERVISOR=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
   case "$OLD_SUPERVISOR" in ''|*[!0-9]*) OLD_SUPERVISOR=0 ;; esac
-  if [ "$OLD_SUPERVISOR" -gt 1 ] && [ "$OLD_SUPERVISOR" != "$$" ] && [ -r "/proc/$OLD_SUPERVISOR/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_SUPERVISOR/cmdline" | "$BB" grep -q 'xiaomi_mifi_web.*/service.sh'; then
+  if [ "$OLD_SUPERVISOR" -gt 1 ] && [ "$OLD_SUPERVISOR" != "$$" ] && [ -r "/proc/$OLD_SUPERVISOR/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_SUPERVISOR/cmdline" | "$BB" grep -q 'xiaomi14_mifi_web.*/service.sh'; then
     kill "$OLD_SUPERVISOR" 2>/dev/null
   fi
 fi

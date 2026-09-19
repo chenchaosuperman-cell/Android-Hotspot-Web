@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-MODDIR=/data/adb/modules/xiaomi_mifi_web
+MODDIR=/data/adb/modules/xiaomi14_mifi_web
 if [ ! -r "$MODDIR/lib/common.sh" ]; then
   SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
   MODDIR=${SCRIPT_PATH%/web/cgi-bin/diagnose.cgi}
@@ -68,7 +68,7 @@ LOG_TAIL=$("$BB" tail -n 15 "$LOG" 2>/dev/null)
 
 printf '{'
 printf '"ok":true,'
-printf '"module":"xiaomi_mifi_web",'
+printf '"module":"xiaomi14_mifi_web",'
 printf '"iface":"%s","ip":"%s","mgmtIp":"%s","alias":%s,' "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$MIP")" "$ALIAS"
 printf '"desired":%s,"keepalive":%s,"idleShutdown":%s,"schedEnable":%s,' \
   "$DESIRED" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)"
