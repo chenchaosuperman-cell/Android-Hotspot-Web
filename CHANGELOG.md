@@ -1,3 +1,19 @@
+## v1.5.24-beta.1（2026-09-20）
+
+### 新增：科学上网 / Mihomo 代理
+- 内置 Mihomo v1.19.31 ARM64 核心（随模块打包，不在线下载）。
+- 新增"科学"Tab：订阅填写、开关、节点选择、自动测速、故障切换。
+- 三策略组：AUTO(url-test 自动测速) / FALLBACK(故障转移) / MANUAL(手动选择) / GLOBAL。
+- 节点切换走 Mihomo RESTful API（PUT /proxies/GLOBAL），不重启核心。
+- REDIRECT TCP 7893 + DNS 1053，只处理热点客户端，不影响手机本机。
+- GEOIP,CN,DIRECT 规则：国内直连，国外走代理。
+- health-check 120秒自动检测节点可用性。
+- proxy.cgi 只读转发 Mihomo API，前端 JS 解析节点列表和延迟。
+
+### 修复
+- proxy_core_ok() 增加 ELF magic 校验和细分错误状态。
+- DNS REDIRECT 替代 DNAT 到 127.0.0.1。
+- config 模板加 geodata-mode 和 geoip.path 指向本地 MMDB。
 ## v1.5.23-beta.1（2026-09-19）
 
 ### 稳定性修复
