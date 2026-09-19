@@ -1,0 +1,2361 @@
+#!/system/bin/sh
+
+: "${MODDIR:=/data/adb/modules/xiaomi_mifi_web}"
+DATA_DIR=/data/adb/xiaomi_mifi_web
+# 从旧版 xiaomi14_mifi_web 迁移数据
+_OLD_DATA=/data/adb/xiaomi14_mifi_web
+if [ -d "$_OLD_DATA" ] && [ ! -e "$DATA_DIR" ]; then
+  mkdir -p "$DATA_DIR"
+  cp -a "$_OLD_DATA/." "$DATA_DIR/" 2>/dev/null
+fi
+unset _OLD_DATA
+CONFIG="$DATA_DIR/config.conf"
+LOG="$DATA_DIR/service.log"
+HTTP_CONF="$DATA_DIR/httpd.conf"
+HTTP_PIDFILE="$DATA_DIR/httpd.pid"
+DESIRED_FILE="$DATA_DIR/desired_state"
+CSRF_FILE="$DATA_DIR/csrf.token"
+IDLE_FILE="$DATA_DIR/idle.countdown"
+IDLE_SINCE="$DATA_DIR/idle.since"
+OP_STATUS="$DATA_DIR/operation.status"
+OP_LOCK="$DATA_DIR/operation.lock"
+STABLE_IP=192.168.43.1
+IPT=/system/bin/iptables
+NOTIFY_QUEUE="$DATA_DIR/notify.queue"
+SMS_QUEUE="$DATA_DIR/sms.queue"
+SMS_BUSY="$DATA_DIR/sms.busy"
+NOTIFY_HEALTH_FILE="$DATA_DIR/notify_health"
+CLIENT_STATS_FILE="$DATA_DIR/client_stats"
+STOP_REASON_FILE="$DATA_DIR/stop_reason"
+MANAGED_FILE="$DATA_DIR/hotspot_managed"
+# 一键关闭（不保活）写入：当前定时窗口内不再自动开启；窗口结束后由 service.sh 清除
+SKIP_WINDOW_FILE="$DATA_DIR/skip_window"
+PLAN_TH_MARK="$DATA_DIR/plan_th_mark"
+PLAN_PERIOD_FILE="$DATA_DIR/plan_period"
+
+find_busybox() {
+  for candidate in /data/adb/ksu/bin/busybox /data/adb/magisk/busybox /system/xbin/busybox /system/bin/busybox; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  command -v busybox 2>/dev/null
+}
+
+BB=$(find_busybox)
+DATE_CMD=$(command -v date 2>/dev/null || echo /system/bin/date)
+[ -n "$DATE_CMD" ] || DATE_CMD=date
+
+header_json() {
+  printf 'Content-Type: application/json; charset=utf-8\r\n'
+  printf 'Cache-Control: no-store\r\n\r\n'
+}
+
+json_escape() {
+  printf '%s' "$1" | "$BB" tr '\r\n' '  ' | "$BB" sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]//g'
+}
+
+# 读取设备型号与系统版本（按可用属性链回退，属性缺失时保持空字符串）
+# 全局输出：DEVICE_MODEL / OS_VERSION
+read_device_info() {
+  DEVICE_MODEL=""
+  OS_VERSION=""
+  GP=/system/bin/getprop
+  if [ ! -x "$GP" ]; then
+    GP=$("$BB" which getprop 2>/dev/null)
+    [ -n "$GP" ] || GP=""
+  fi
+  if [ -n "$GP" ]; then
+    # 机型：市场名 → 型号 → 设备代号
+    DEVICE_MODEL=$("$GP" ro.product.marketname 2>/dev/null)
+    [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL=$("$GP" ro.product.model 2>/dev/null)
+    [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL=$("$GP" ro.product.device 2>/dev/null)
+    # 系统：MIUI/HyperOS 名称 → 版本号；Android 版本兜底
+    OS_NAME=$("$GP" ro.mi.os.version.name 2>/dev/null)
+    [ -n "$OS_NAME" ] || OS_NAME=$("$GP" ro.build.version.release 2>/dev/null)
+    OS_VER=$("$GP" ro.mi.os.version 2>/dev/null)
+    ANDROID=$("$GP" ro.build.version.release 2>/dev/null)
+    if [ -n "$OS_NAME" ]; then
+      OS_VERSION=$OS_NAME
+      [ -n "$OS_VER" ] && OS_VERSION="$OS_VERSION $OS_VER"
+      if [ -n "$ANDROID" ] && [ "$ANDROID" != "$OS_VER" ]; then
+        OS_VERSION="$OS_VERSION · Android $ANDROID"
+      fi
+    elif [ -n "$ANDROID" ]; then
+      OS_VERSION="Android $ANDROID"
+    fi
+  fi
+}
+
+# 保留换行（转义为 \n）的 JSON 字符串转义，用于可逆导出（如配置备份）
+json_escape_nl() {
+  printf '%s' "$1" | "$BB" tr '\r' ' ' | "$BB" awk '{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/[[:cntrl:]]/,""); printf "%s\\n", $0}'
+}
+
+get_param() {
+  key=$1
+  RAW=$(printf '&%s&' "${QUERY_STRING:-}" | "$BB" sed -n "s/.*&${key}=\([^&]*\)&.*/\1/p")
+  [ -n "$RAW" ] || return 0
+  url_decode "$RAW"
+}
+
+# URL 百分号解码（纯 sed，兼容 BusyBox）。
+# 覆盖 URL 保留字符与常见字符；模块参数中 SSID/备注等文本走 base64url，
+# 不会出现百分号编码，因此无需 UTF-8 多字节解码。
+url_decode() {
+  printf '%s' "$1" | "$BB" sed \
+    -e 's/+/ /g' \
+    -e 's/%20/ /g; s/%21/!/g; s/%23/#/g; s/%24/\$/g; s/%25/%/g' \
+    -e 's/%26/\&/g; s/%27/'"'"'/g; s/%28/(/g; s/%29/)/g' \
+    -e 's/%2A/*/g; s/%2B/+/g; s/%2C/,/g; s/%2D/-/g; s/%2E/./g' \
+    -e 's/%2F/\//g; s/%3A/:/g; s/%3B/;/g; s/%3D/=/g; s/%3F/?/g' \
+    -e 's/%40/@/g; s/%5B/[/g; s/%5C/\\/g; s/%5D/]/g; s/%7E/~/g'
+}
+
+b64url_decode() {
+  value=$1
+  value=$(printf '%s' "$value" | "$BB" tr '_-' '/+')
+  case $((${#value} % 4)) in
+    2) value="${value}==" ;;
+    3) value="${value}=" ;;
+  esac
+  printf '%s' "$value" | "$BB" base64 -d 2>/dev/null
+}
+
+b64url_encode() {
+  printf '%s' "$1" | "$BB" base64 | "$BB" tr -d '\r\n' | "$BB" tr '+/' '-_' | "$BB" tr -d '='
+}
+
+# 配置加载：逐行白名单解析，绝不 source 配置文件内容。
+# 每个字段按类型严格校验（Base64URL / 开关 0-1 / 数值范围 / 时间 HHMM / 信道频段组合 / MAC 列表），
+# 未知字段或非法值直接丢弃，防止配置文件中注入 Shell 命令。
+# 配置字段应用：load_config 与 import_config 共用同一套白名单校验。
+# 未知字段、非法值一律丢弃（不报错、不执行），杜绝配置文件注入 Shell 命令。
+cfg_apply_key() {
+  key=$1
+  value=$2
+  case "$key" in
+
+        SSID_B64)
+          [ -n "$value" ] && valid_b64url "$value" && SSID_B64=$value ;;
+        PASS_B64)
+          if [ -z "$value" ]; then PASS_B64=
+          elif valid_b64url "$value"; then PASS_B64=$value
+          fi ;;
+        SECURITY)
+          case "$value" in wpa2|wpa3|wpa3_transition|open) SECURITY=$value ;; esac ;;
+        BAND)
+          case "$value" in 2|5|any) BAND=$value ;; esac ;;
+        AUTOSTART)
+          case "$value" in 0|1) AUTOSTART=$value ;; esac ;;
+        KEEPALIVE)
+          case "$value" in 0|1) KEEPALIVE=$value ;; esac ;;
+        NOTIFY_LIMIT)
+          case "$value" in 0|1) NOTIFY_LIMIT=$value ;; esac ;;
+        NOTIFY_HOTSPOT_EVT)
+          case "$value" in 0|1) NOTIFY_HOTSPOT_EVT=$value ;; esac ;;
+        NOTIFY_TRAFFIC_THRESHOLDS)
+          # 逗号分隔 1~100，最多 5 个；非法值忽略（默认 80,90,100）
+          _NT_RAW="$value"
+          _NT_OUT=
+          for _NT_V in $(printf '%s' "$_NT_RAW" | "$BB" tr ',' ' '); do
+            case "$_NT_V" in ''|*[!0-9]*) continue ;; esac
+            [ "$_NT_V" -ge 1 ] && [ "$_NT_V" -le 100 ] || continue
+            case " $_NT_OUT " in
+              *" $_NT_V "*) : ;;
+              *) _NT_OUT="${_NT_OUT:+$_NT_OUT,}$_NT_V" ;;
+            esac
+          done
+          [ -n "$_NT_OUT" ] && NOTIFY_TRAFFIC_THRESHOLDS=$_NT_OUT ;;
+        SMS_FWD)
+          case "$value" in 0|1) SMS_FWD=$value ;; esac ;;
+        PORT)
+          case "$value" in ''|*[!0-9]*) : ;;
+            *) [ "$value" -ge 1024 ] && [ "$value" -le 65535 ] && PORT=$value ;;
+          esac ;;
+        CHANNEL)
+          case "$value" in ''|*[!0-9]*) : ;; *) CHANNEL=$value ;; esac ;;
+        MAX_CLIENTS)
+          valid_max_clients "$value" && MAX_CLIENTS=$value ;;
+        IDLE_SHUTDOWN)
+          valid_idle "$value" && IDLE_SHUTDOWN=$value ;;
+        DATA_LIMIT_MB)
+          # P1-31/32：旧版限额字段——合并进 DATA_PLAN_MB（取非零较大值），不再单独存储
+          valid_data_limit "$value" && {
+            P=${DATA_PLAN_MB:-0}
+            case "$P" in ''|*[!0-9]*) P=0 ;; esac
+            [ "$value" -gt "$P" ] 2>/dev/null && DATA_PLAN_MB=$value
+          } ;;
+        SCHED_ENABLE)
+          case "$value" in 0|1) SCHED_ENABLE=$value ;; esac ;;
+        SCHED_ON)
+          valid_hhmm "$value" && SCHED_ON=$value ;;
+        SCHED_OFF)
+          valid_hhmm "$value" && SCHED_OFF=$value ;;
+        SCHED_ON_WD)
+          valid_hhmm "$value" && SCHED_ON_WD=$value ;;
+        SCHED_OFF_WD)
+          valid_hhmm "$value" && SCHED_OFF_WD=$value ;;
+        SCHED_ON_WE)
+          valid_hhmm "$value" && SCHED_ON_WE=$value ;;
+        SCHED_OFF_WE)
+          valid_hhmm "$value" && SCHED_OFF_WE=$value ;;
+        SCHED_MODE)
+          case "$value" in daily|weekday|weekend) SCHED_MODE=$value ;; esac ;;
+        LOWBATT_ENABLE)
+          case "$value" in 0|1) LOWBATT_ENABLE=$value ;; esac ;;
+        LOWBATT_THRESHOLD)
+          case "$value" in ''|*[!0-9]*) : ;;
+            *) [ "$value" -ge 1 ] && [ "$value" -le 100 ] && LOWBATT_THRESHOLD=$value ;;
+          esac ;;
+        DATA_PLAN_MB)
+          case "$value" in ''|*[!0-9]*) : ;;
+            *) [ "$value" -ge 0 ] && [ "$value" -le 10000000 ] && DATA_PLAN_MB=$value ;;
+          esac ;;
+        DATA_PLAN_DAY)
+          case "$value" in ''|*[!0-9]*) : ;;
+            *) [ "$value" -ge 1 ] && [ "$value" -le 31 ] && DATA_PLAN_DAY=$value ;;
+          esac ;;
+        DATA_LIMIT_ACTION)
+          case "$value" in notify|stop) DATA_LIMIT_ACTION=$value ;; esac ;;
+        BLOCKED_MACS)
+          NEW=
+          for m in $value; do
+            if valid_mac "$m"; then
+              if [ -z "$NEW" ]; then NEW=$m; else NEW="$NEW $m"; fi
+            fi
+          done
+          BLOCKED_MACS=$NEW ;;
+        PUSHPLUS_TOKEN_B64)
+          if [ -z "$value" ]; then PUSHPLUS_TOKEN_B64=
+          elif valid_b64url "$value"; then PUSHPLUS_TOKEN_B64=$value
+          fi ;;
+        DINGTALK_WEBHOOK_B64)
+          if [ -z "$value" ]; then DINGTALK_WEBHOOK_B64=
+          elif valid_b64url "$value"; then DINGTALK_WEBHOOK_B64=$value
+          fi ;;
+        DINGTALK_SECRET_B64)
+          if [ -z "$value" ]; then DINGTALK_SECRET_B64=
+          elif valid_b64url "$value"; then DINGTALK_SECRET_B64=$value
+          fi ;;
+        SMS_FWD_KEYWORD_B64)
+          if [ -z "$value" ]; then SMS_FWD_KEYWORD_B64=
+          elif valid_b64url "$value"; then SMS_FWD_KEYWORD_B64=$value
+          fi ;;
+        SMS_FWD_SENDERS_B64)
+          if [ -z "$value" ]; then SMS_FWD_SENDERS_B64=
+          elif valid_b64url "$value"; then SMS_FWD_SENDERS_B64=$value
+          fi ;;
+      esac
+}
+
+load_config() {
+  if [ -f "$CONFIG" ]; then
+    while IFS= read -r line; do
+      case "$line" in
+        ''|'#'*) continue ;;
+      esac
+      key=${line%%=*}
+      value=${line#*=}
+      case "$key" in
+        PORT80_MIGRATED)
+          # P0-65：两个迁移标记必须独立赋值，不能共用一个分支（否则读任一键会同时改两个标记）
+          case "$value" in 0|1) PORT80_MIGRATED=$value ;; esac ;;
+        MIGRATE_REMOVED)
+          case "$value" in 0|1) MIGRATE_REMOVED=$value ;; esac ;;
+        *)
+          cfg_apply_key "$key" "$value" ;;
+      esac
+    done < "$CONFIG"
+  fi
+  SSID_B64=${SSID_B64:-WGlhb21pMTQtTWlGaQ}
+  PASS_B64=${PASS_B64:-ODc2NTQzMjE}
+  LOWBATT_ENABLE=${LOWBATT_ENABLE:-0}
+  LOWBATT_THRESHOLD=${LOWBATT_THRESHOLD:-20}
+  DATA_PLAN_MB=${DATA_PLAN_MB:-0}
+  DATA_PLAN_DAY=${DATA_PLAN_DAY:-1}
+  DATA_LIMIT_ACTION=${DATA_LIMIT_ACTION:-stop}
+  SECURITY=${SECURITY:-wpa2}
+  BAND=${BAND:-2}
+  AUTOSTART=${AUTOSTART:-1}
+  PORT=${PORT:-8080}
+  CHANNEL=${CHANNEL:-0}
+  MAX_CLIENTS=${MAX_CLIENTS:-0}
+  KEEPALIVE=${KEEPALIVE:-1}
+  IDLE_SHUTDOWN=${IDLE_SHUTDOWN:-0}
+  SCHED_ENABLE=${SCHED_ENABLE:-0}
+  SCHED_ON=${SCHED_ON:-2300}
+  SCHED_OFF=${SCHED_OFF:-0700}
+  SCHED_MODE=${SCHED_MODE:-daily}
+  SCHED_ON_WD=${SCHED_ON_WD:-2300}
+  SCHED_OFF_WD=${SCHED_OFF_WD:-0700}
+  SCHED_ON_WE=${SCHED_ON_WE:-2300}
+  SCHED_OFF_WE=${SCHED_OFF_WE:-0700}
+  DATA_LIMIT_MB=${DATA_LIMIT_MB:-0}
+  PORT80_MIGRATED=${PORT80_MIGRATED:-0}
+  MIGRATE_REMOVED=${MIGRATE_REMOVED:-0}
+  BLOCKED_MACS=${BLOCKED_MACS:-}
+  PUSHPLUS_TOKEN_B64=${PUSHPLUS_TOKEN_B64:-}
+  DINGTALK_WEBHOOK_B64=${DINGTALK_WEBHOOK_B64:-}
+  DINGTALK_SECRET_B64=${DINGTALK_SECRET_B64:-}
+  NOTIFY_NEWDEV=${NOTIFY_NEWDEV:-0}
+  NOTIFY_LIMIT=${NOTIFY_LIMIT:-1}
+  NOTIFY_HOTSPOT_EVT=${NOTIFY_HOTSPOT_EVT:-1}
+  NOTIFY_TRAFFIC_THRESHOLDS=${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}
+  PUSHPLUS_TOKEN=$(b64url_decode "$PUSHPLUS_TOKEN_B64")
+  DINGTALK_WEBHOOK=$(b64url_decode "$DINGTALK_WEBHOOK_B64")
+  DINGTALK_SECRET=$(b64url_decode "$DINGTALK_SECRET_B64")
+  SMS_FWD=${SMS_FWD:-0}
+  SMS_FWD_KEYWORD_B64=${SMS_FWD_KEYWORD_B64:-}
+  SMS_FWD_SENDERS_B64=${SMS_FWD_SENDERS_B64:-}
+  SMS_FWD_KEYWORD=$(b64url_decode "$SMS_FWD_KEYWORD_B64")
+  SMS_FWD_SENDERS=$(b64url_decode "$SMS_FWD_SENDERS_B64")
+}
+
+get_hotspot_iface() {
+  if /system/bin/ip -o -4 addr show dev wlan2 2>/dev/null | "$BB" awk -v stable="$STABLE_IP" '$4 !~ "^" stable "/" {found=1} END {exit !found}'; then
+    printf 'wlan2'
+    return
+  fi
+  /system/bin/ip -o -4 addr show 2>/dev/null | "$BB" awk -v stable="$STABLE_IP" '$2 ~ /^wlan[1-9][0-9]*$/ && $4 !~ "^" stable "/" {print $2; exit}'
+}
+
+get_iface_ip() {
+  iface=$1
+  [ -z "$iface" ] && return
+  /system/bin/ip -o -4 addr show dev "$iface" 2>/dev/null | "$BB" awk '{split($4,a,"/"); print a[1]; exit}'
+}
+
+# 原生热点地址：排除模块固定管理别名 STABLE_IP，取接口上的其他 IPv4 地址（热点真实网关）
+get_native_hotspot_ip() {
+  iface=$1
+  [ -z "$iface" ] && return
+  /system/bin/ip -o -4 addr show dev "$iface" 2>/dev/null | "$BB" awk -v stable="$STABLE_IP" '
+    { split($4, a, "/"); if (a[1] != stable) { print a[1]; exit } }
+  ' | "$BB" head -n 1
+}
+
+# 热点真实网段：优先内核路由 scope link（含真实掩码），回退按原生地址 /24 推导，再回退固定网段
+get_hotspot_subnet() {
+  iface=$1
+  [ -z "$iface" ] && { printf '192.168.43.0/24'; return; }
+  NET=$(/system/bin/ip -o -4 route show dev "$iface" scope link 2>/dev/null | "$BB" awk '{print $1; exit}')
+  case "$NET" in
+    *.*.*.*/*) printf '%s' "$NET"; return ;;
+  esac
+  IP=$(get_native_hotspot_ip "$iface")
+  case "$IP" in
+    *.*.*.*) printf '%s.0/24' "${IP%.*}"; return ;;
+  esac
+  printf '192.168.43.0/24'
+}
+
+get_management_ip() {
+  iface=$1
+  [ -z "$iface" ] && return
+  if /system/bin/ip -o -4 addr show dev "$iface" 2>/dev/null | "$BB" grep -q " $STABLE_IP/"; then
+    printf '%s' "$STABLE_IP"
+  else
+    get_iface_ip "$iface"
+  fi
+}
+
+add_management_alias() {
+  iface=$1
+  [ -z "$iface" ] && return 1
+  if /system/bin/ip -o -4 addr show dev "$iface" 2>/dev/null | "$BB" grep -q " $STABLE_IP/"; then
+    return 0
+  fi
+  /system/bin/ip addr add "$STABLE_IP/32" dev "$iface" 2>/dev/null
+}
+
+remove_management_alias() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  /system/bin/ip addr del "$STABLE_IP/32" dev "$iface" 2>/dev/null || true
+}
+
+valid_b64url() {
+  case "$1" in
+    *[!A-Za-z0-9_-]*|'') return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+valid_mac() {
+  case "$1" in
+    [0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_hhmm() {
+  # 严格校验：必须 4 位数字，小时 00–23，分钟 00–59（拒绝 9960 / 2561 这类值）
+  case "$1" in
+    [0-9][0-9][0-9][0-9])
+      HH=${1%??}
+      MM=${1#??}
+      [ "$HH" -le 23 ] && [ "$MM" -le 59 ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# 信道白名单：自动=0；2.4G 1/3/6/9/11/13；5G 36/40/44/48/149/153/157/161/165；自动频段只允许 0
+# 校验频段与信道的组合；band=2|5|any, channel=0 表示自动（任何频段均合法）
+valid_channel() {
+  band=$1
+  channel=$2
+  case "$channel" in
+    ''|0) return 0 ;;
+    *[!0-9]*) return 1 ;;
+  esac
+  case "$band" in
+    2) case "$channel" in 1|3|6|9|11|13) return 0 ;; esac ;;
+    5) case "$channel" in 36|40|44|48|149|153|157|161|165) return 0 ;; esac ;;
+    any) return 1 ;;
+  esac
+  return 1
+}
+
+# 最大连接数 0–32；空闲关闭 0 或 1–600 分钟
+valid_max_clients() {
+  case "$1" in
+    ''|0) return 0 ;;
+    *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] && [ "$1" -le 32 ] ;;
+  esac
+}
+
+valid_idle() {
+  case "$1" in
+    ''|0) return 0 ;;
+    *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] && [ "$1" -le 600 ] ;;
+  esac
+}
+
+# 流量限额 0–10,000,000 MB（0=关闭）
+valid_data_limit() {
+  case "$1" in
+    ''|0) return 0 ;;
+    *[!0-9]*) return 1 ;;
+    *) [ "$1" -ge 1 ] && [ "$1" -le 10000000 ] ;;
+  esac
+}
+
+
+read_csrf_token() {
+  [ -r "$CSRF_FILE" ] && "$BB" head -n 1 "$CSRF_FILE" 2>/dev/null
+}
+
+write_operation() {
+  state=$1
+  message=$2
+  now=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  tmp="$OP_STATUS.tmp.$$"
+  {
+    printf 'STATE=%s\n' "$state"
+    printf 'TIME=%s\n' "$now"
+    printf 'MESSAGE_B64='
+    printf '%s' "$message" | "$BB" base64 | "$BB" tr -d '\r\n'
+    printf '\n'
+  } > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$OP_STATUS"
+}
+
+read_operation() {
+  OP_STATE=idle
+  OP_TIME=0
+  OP_MESSAGE=
+  if [ -r "$OP_STATUS" ]; then
+    OP_STATE=$("$BB" sed -n 's/^STATE=//p' "$OP_STATUS" | "$BB" head -n 1)
+    OP_TIME=$("$BB" sed -n 's/^TIME=//p' "$OP_STATUS" | "$BB" head -n 1)
+    OP_MESSAGE_B64=$("$BB" sed -n 's/^MESSAGE_B64=//p' "$OP_STATUS" | "$BB" head -n 1)
+    OP_MESSAGE=$(printf '%s' "$OP_MESSAGE_B64" | "$BB" base64 -d 2>/dev/null)
+  fi
+  case "$OP_STATE" in idle|working|success|error) : ;; *) OP_STATE=error ;; esac
+  case "$OP_TIME" in ''|*[!0-9]*) OP_TIME=0 ;; esac
+}
+
+acquire_operation_lock() {
+  if mkdir "$OP_LOCK" 2>/dev/null; then
+    /system/bin/date +%s > "$OP_LOCK/created" 2>/dev/null || date +%s > "$OP_LOCK/created"
+    return 0
+  fi
+
+  created=$("$BB" head -n 1 "$OP_LOCK/created" 2>/dev/null)
+  now=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  case "$created" in ''|*[!0-9]*) created=0 ;; esac
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  if [ "$created" -eq 0 ] || [ $((now - created)) -gt 120 ]; then
+    rm -rf "$OP_LOCK"
+    mkdir "$OP_LOCK" 2>/dev/null || return 1
+    printf '%s\n' "$now" > "$OP_LOCK/created"
+    return 0
+  fi
+  return 1
+}
+
+release_operation_lock() {
+  rm -rf "$OP_LOCK"
+}
+
+run_softap() {
+  ssid=$1
+  security=$2
+  password=$3
+  band=$4
+  channel=$5
+  maxclients=$6
+  EXTRA=
+  case "$channel" in ''|0|any) ;; *[!0-9]*) : ;; *) EXTRA="$EXTRA -c $channel" ;; esac
+  case "$maxclients" in ''|0) ;; *[!0-9]*) : ;; *) EXTRA="$EXTRA -m $maxclients" ;; esac
+
+  if [ "$security" = "open" ]; then
+    /system/bin/cmd wifi start-softap "$ssid" open -b "$band" $EXTRA
+  else
+    /system/bin/cmd wifi start-softap "$ssid" "$security" "$password" -b "$band" $EXTRA
+  fi
+}
+
+# ---------- 客户端黑名单（iptables MAC 丢弃） ----------
+apply_blacklist() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  # P0-43：只 DROP FORWARD（禁止上网），不再 DROP INPUT——否则会连管理页/手机本机访问一起阻断
+  # P1-44：逐条验证规则是否真正添加，任一失败记日志（调用方可据此返回“保存但未生效”）
+  for mac in $BLOCKED_MACS; do
+    valid_mac "$mac" || continue
+    if ! $IPT -C FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; then
+      if ! $IPT -I FORWARD 1 -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; then
+        echo "$(date) blacklist: 添加规则失败 mac=$mac iface=$iface" >> "$LOG"
+      fi
+    fi
+  done
+}
+
+clear_blacklist() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  for mac in $BLOCKED_MACS; do
+    valid_mac "$mac" || continue
+    # P1-45：旧版可能残留多条相同规则，循环删除直到 -C 不再匹配（上限 20 防死循环）
+    N=0
+    while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
+      $IPT -D FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
+      N=$((N + 1))
+    done
+    # 兼容旧版 INPUT 规则（v1.5.9 及更早）：同样循环清理，避免残留
+    N=0
+    while [ "$N" -lt 20 ] && $IPT -C INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
+      $IPT -D INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
+      N=$((N + 1))
+    done
+  done
+}
+
+unblock_one_mac() {
+  iface=$1
+  mac=$2
+  valid_mac "$mac" || return 1
+  N=0
+  while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
+    $IPT -D FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
+    N=$((N + 1))
+  done
+  N=0
+  while [ "$N" -lt 20 ] && $IPT -C INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
+    $IPT -D INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
+    N=$((N + 1))
+  done
+}
+
+# ---------- 客户端流量统计（FORWARD 计数链） ----------
+ensure_stats_chain() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  $IPT -N mifi_stats 2>/dev/null || true
+  $IPT -C FORWARD -i "$iface" -j mifi_stats 2>/dev/null || \
+    $IPT -I FORWARD 1 -i "$iface" -j mifi_stats 2>/dev/null
+}
+
+flush_stats_chain() {
+  $IPT -F mifi_stats 2>/dev/null || true
+}
+
+update_stats_rules() {
+  iface=$1
+  shift
+  for ip in "$@"; do
+    case "$ip" in ''|*[!0-9.]*) continue ;; esac
+    $IPT -C mifi_stats -s "$ip" -j RETURN 2>/dev/null || \
+      $IPT -A mifi_stats -s "$ip" -j RETURN 2>/dev/null
+    $IPT -C mifi_stats -d "$ip" -j RETURN 2>/dev/null || \
+      $IPT -A mifi_stats -d "$ip" -j RETURN 2>/dev/null
+  done
+}
+
+# 读一次全量统计，生成 "ip rx tx" 行
+# 链规则：-s 客户端IP 匹配的是客户端上行（tx）；-d 客户端IP 匹配下行（rx）。
+# 输出列序必须为 rx=下行、tx=上行，status.cgi 按第2/3列取数。
+read_all_stats() {
+  # P1-35：遍历 rx/tx 键并集——只有上行（-s 规则命中）的纯上行设备也要出现在输出里
+  $IPT -L mifi_stats -n -v -x 2>/dev/null | "$BB" awk '
+    $3=="RETURN" && $8 ~ /^[0-9.]+$/ {tx[$8]+=$2}
+    $3=="RETURN" && $9 ~ /^[0-9.]+$/ {rx[$9]+=$2}
+    END {
+      for (ip in rx) print ip, rx[ip]+0, tx[ip]+0
+      for (ip in tx) if (!(ip in rx)) print ip, 0, tx[ip]+0
+    }
+  '
+}
+
+get_ip_usage() {
+  printf '%s\n' "$STAT_MAP" | "$BB" awk -v ip="$1" '$1==ip{print $2+0, $3+0; exit}'
+}
+
+# 统一在线客户端发现：/proc/net/arp（DHCP 后必有条目，最可靠）与
+# ip neigh（给出 REACHABLE/STALE 等实时状态）双数据源合并，按 IP 去重。
+# 仅统计热点接口上的条目；输出每行: IP|MAC|STATE
+list_clients() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  {
+    # ip neigh 为主：给出 REACHABLE/STALE/DELAY/PROBE 等实时状态，先输出保证同 IP 去重时保留
+    /system/bin/ip neigh show dev "$iface" 2>/dev/null | "$BB" awk '
+      $1 ~ /:/ {next}
+      $4=="lladdr" && $5!="00:00:00:00:00:00" && $6!="FAILED" && $6!="INCOMPLETE" {print $1"|"$5"|"$6}
+    '
+    # ARP 仅补全：neigh 未覆盖的 IP 提供 MAC（状态 ARP，不参与在线判定）
+    if [ -r /proc/net/arp ]; then
+      # 列序: IP(1) HWtype(2) Flags(3) MAC(4) Mask(5) Device(6)；0x2=完整条目
+      "$BB" awk -v dev="$iface" 'NR>1 && $6==dev && $3=="0x2" && $4!="00:00:00:00:00:00" {print $1"|"$4"|ARP"}' /proc/net/arp
+    fi
+  } | "$BB" awk -F'|' '!($1 in seen) {seen[$1]=1; print}'
+}
+
+# 在线客户端数（用于空闲自动关闭）：只统计确认活跃的条目。
+# REACHABLE/DELAY/PROBE 算在线；ARP(0x2 完整条目) 仅补全 MAC 不算在线，
+# 避免 ARP 缓存残留导致空闲倒计时迟迟不启动。
+count_online_clients() {
+  iface=$1
+  [ -z "$iface" ] && { echo 0; return; }
+  list_clients "$iface" 2>/dev/null | "$BB" awk -F'|' '$3=="REACHABLE"||$3=="DELAY"||$3=="PROBE" {n++} END {print n+0}'
+}
+
+# 已连接客户端数（v1.5.13，用于空闲自动关闭）：邻居状态变 STALE/ARP 只表示
+# 一段时间无通信，Wi-Fi 实际仍连着；若只算活跃状态会把已连接设备误判为离线，
+# 导致有设备时仍倒计时并误关热点。页面"活跃设备"仍用 count_online_clients。
+count_connected_clients() {
+  iface=$1
+  [ -z "$iface" ] && { echo 0; return; }
+  list_clients "$iface" 2>/dev/null | "$BB" awk -F'|' '
+    $3=="REACHABLE" || $3=="DELAY" || $3=="PROBE" || $3=="STALE" || $3=="ARP" { n++ }
+    END { print n+0 }'
+}
+
+# ---------- 上网共享（NAT/转发）检测 ----------
+# v1.5.2：区分“存在任意 MASQUERADE”与“热点相关的 NAT 规则”，
+# 后者按热点管理网段 192.168.43.0/24 或热点接口名匹配。
+check_tethering() {
+  iface=$1
+  TETHER_FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null | "$BB" tr -d ' ')
+  [ -z "$TETHER_FWD" ] && TETHER_FWD=0
+  NAT_ALL=$($IPT -t nat -S 2>/dev/null)
+  TETHER_NAT=$(printf '%s\n' "$NAT_ALL" | "$BB" grep -c MASQUERADE)
+  [ -z "$TETHER_NAT" ] && TETHER_NAT=0
+  # 动态推导热点网段：用热点原生地址（排除固定管理别名）+ 真实掩码；
+  # 找不到时回退固定管理网段，避免 HyperOS 原生网关不是 192.168.43.1 时误判。
+  AP_SUBNET=$(get_hotspot_subnet "$iface")
+  # 固定字符串匹配（子网/接口名含 . 与 / 等正则元字符，不能拼进正则）
+  C1=$(printf '%s\n' "$NAT_ALL" | "$BB" grep MASQUERADE | "$BB" grep -Fc "$AP_SUBNET")
+  C2=$(printf '%s\n' "$NAT_ALL" | "$BB" grep MASQUERADE | "$BB" grep -Fc "$iface")
+  case "$C1" in ''|*[!0-9]*) C1=0 ;; esac
+  case "$C2" in ''|*[!0-9]*) C2=0 ;; esac
+  TETHER_HOTSPOT_NAT=$((C1 + C2))
+  TETHER_PKTS=$($IPT -L FORWARD -n -v -x 2>/dev/null | "$BB" awk -v i="$iface" '$6==i || $7==i {s+=$1} END {print s+0}')
+  [ -z "$TETHER_PKTS" ] && TETHER_PKTS=0
+  # 热点接口在 FORWARD 链中的转发规则条数（转发路径是否建立）
+  FORWARD_IFACE_RULES=$($IPT -L FORWARD -n -v -x 2>/dev/null | "$BB" awk -v i="$iface" '$6==i || $7==i {n++} END {print n+0}')
+  case "$FORWARD_IFACE_RULES" in ''|*[!0-9]*) FORWARD_IFACE_RULES=0 ;; esac
+  # HyperOS 的 MASQUERADE 常只按出口接口（-o wlan0 / -o miw_oem0）匹配，不带热点子网/接口名；
+  # 此时若 NAT 规则存在、且 FORWARD 链已建立热点接口转发路径，同样判定共享 NAT 就绪。
+  if [ "$TETHER_HOTSPOT_NAT" = "0" ] && [ "$TETHER_NAT" -gt 0 ] && [ "$FORWARD_IFACE_RULES" -gt 0 ]; then
+    TETHER_HOTSPOT_NAT=1
+  fi
+}
+
+# ---------- 系统信息 ----------
+get_sysinfo() {
+  SYS_MEM_TOTAL=$("$BB" sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo)
+  SYS_MEM_AVAIL=$("$BB" sed -n 's/^MemAvailable:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo)
+  SYS_LOAD=$("$BB" cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)
+  UPTIME_S=$("$BB" awk '{print int($1)}' /proc/uptime 2>/dev/null)
+  case "$UPTIME_S" in ''|*[!0-9]*) UPTIME_S=0 ;; esac
+  SYS_UPTIME="$((UPTIME_S / 3600))h $(((UPTIME_S % 3600) / 60))m"
+  STOR=$(/system/bin/df -k /data 2>/dev/null | "$BB" awk 'NR==2{print $2, $4}')
+  SYS_STOR_TOTAL=$(printf '%s\n' "$STOR" | "$BB" cut -d' ' -f1)
+  SYS_STOR_AVAIL=$(printf '%s\n' "$STOR" | "$BB" cut -d' ' -f2)
+  [ -z "$SYS_STOR_TOTAL" ] && SYS_STOR_TOTAL=0
+  [ -z "$SYS_STOR_AVAIL" ] && SYS_STOR_AVAIL=0
+  SYS_THERMAL=
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -e "$z/type" ] || continue
+    T=$(cat "$z/type" 2>/dev/null)
+    case "$T" in
+      cpu*|soc*|apc*|cluster*|quiet*|*cpu*)
+        MV=$(cat "$z/temp" 2>/dev/null)
+        case "$MV" in ''|*[!0-9]*) continue ;; esac
+        SYS_THERMAL=$((MV / 1000))
+        break
+        ;;
+    esac
+  done
+}
+
+# ---------- SIM / 蜂窝状态（尽力而为，解析失败显示 --） ----------
+# dumpsys telephony.registry 输出可达数百 KB 且各字段同行逗号分隔；
+# 解析必须按字段精确截断，不能把整行剩余内容带出来。
+# 缓存 30 秒：缓存有效期内直接读取，不再触发 dumpsys。
+get_sim_state() {
+  SIM_OPERATOR=
+  SIM_DATA=0
+  SIM_SIGNAL=
+  SIM_CACHE="$DATA_DIR/sim.cache"
+  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  if [ -r "$SIM_CACHE" ]; then
+    CACHE_MT=$("$BB" stat -c %Y "$SIM_CACHE" 2>/dev/null)
+    case "$CACHE_MT" in ''|*[!0-9]*) CACHE_MT=0 ;; esac
+    if [ "$CACHE_MT" -gt 0 ] && [ $((NOW_S - CACHE_MT)) -ge 0 ] && [ $((NOW_S - CACHE_MT)) -lt 30 ]; then
+      . "$SIM_CACHE" 2>/dev/null || true
+      SIM_OPERATOR=$(b64url_decode "${SIM_OPERATOR_B64:-}")
+      return 0
+    fi
+  fi
+  # telephony.registry 输出可达数百 KB：命令替换捕获后经 printf 传参会触发
+  # ARG_MAX 超限（E2BIG, Argument list too long）。改用临时文件逐字段 grep。
+  DMP_FILE="$DATA_DIR/dumpsys_telephony.tmp"
+  /system/bin/dumpsys telephony.registry > "$DMP_FILE" 2>/dev/null
+  if [ -s "$DMP_FILE" ]; then
+    SIM_OPERATOR=$("$BB" grep -o 'mOperatorAlphaLong=[^,]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mOperatorAlphaLong=//; s/[[:space:]]*$//')
+    SIM_DATA=$("$BB" grep -o 'mDataConnectionState=[0-9]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mDataConnectionState=//')
+    [ -z "$SIM_DATA" ] && SIM_DATA=0
+    SIG=$("$BB" grep -o 'mSignalStrength=[0-9]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mSignalStrength=//')
+    case "$SIG" in ''|*[!0-9]*) ASU=99 ;; *) ASU=$SIG ;; esac
+    if [ "$ASU" -le 31 ] 2>/dev/null; then
+      SIM_SIGNAL=$((ASU * 2 - 113))
+    else
+      SIM_SIGNAL=
+    fi
+    rm -f "$DMP_FILE"
+    TMP_CACHE="$SIM_CACHE.$$"
+    {
+      printf 'SIM_OPERATOR_B64=%s\n' "$(b64url_encode "$SIM_OPERATOR")"
+      printf 'SIM_DATA=%s\n' "$SIM_DATA"
+      printf 'SIM_SIGNAL=%s\n' "$SIM_SIGNAL"
+    } > "$TMP_CACHE" 2>/dev/null
+    chmod 0600 "$TMP_CACHE" 2>/dev/null
+    mv -f "$TMP_CACHE" "$SIM_CACHE" 2>/dev/null
+  fi
+}
+
+# ---------- 定时 ----------
+now_hhmm() {
+  /system/bin/date +%H%M 2>/dev/null
+}
+
+schedule_in_window() {
+  on=$1
+  off=$2
+  now=$3
+  case "$on" in ''|*[!0-9]*) return 1 ;; esac
+  case "$off" in ''|*[!0-9]*) return 1 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$on" -lt "$off" ]; then
+    [ "$now" -ge "$on" ] && [ "$now" -lt "$off" ]
+  else
+    [ "$now" -ge "$on" ] || [ "$now" -lt "$off" ]
+  fi
+}
+
+# 定时计划信息（跨午夜归属正确）。
+# 输出：TODAY_ON TODAY_OFF YEST_ON YEST_OFF（0 表示当日/昨日无计划）
+sched_info() {
+  TODAY_W=$($DATE_CMD +%w 2>/dev/null)
+  case "$TODAY_W" in ''|*[!0-9]*) TODAY_W=9 ;; esac
+  YEST_W=$((TODAY_W - 1))
+  [ "$YEST_W" -lt 0 ] && YEST_W=6
+  case "${SCHED_MODE:-daily}" in
+    weekday)
+      if [ "$TODAY_W" -ge 1 ] && [ "$TODAY_W" -le 5 ]; then printf '%s %s ' "$SCHED_ON_WD" "$SCHED_OFF_WD"; else printf '0 0 '; fi
+      if [ "$YEST_W" -ge 1 ] && [ "$YEST_W" -le 5 ]; then printf '%s %s\n' "$SCHED_ON_WD" "$SCHED_OFF_WD"; else printf '0 0\n'; fi
+      ;;
+    weekend)
+      if [ "$TODAY_W" -eq 0 ] || [ "$TODAY_W" -eq 6 ]; then printf '%s %s ' "$SCHED_ON_WE" "$SCHED_OFF_WE"; else printf '0 0 '; fi
+      if [ "$YEST_W" -eq 0 ] || [ "$YEST_W" -eq 6 ]; then printf '%s %s\n' "$SCHED_ON_WE" "$SCHED_OFF_WE"; else printf '0 0\n'; fi
+      ;;
+    *)
+      printf '%s %s %s %s\n' "$SCHED_ON" "$SCHED_OFF" "$SCHED_ON" "$SCHED_OFF"
+      ;;
+  esac
+}
+
+# 窗口判定（跨午夜正确）：
+# $1=today_on $2=today_off $3=yest_on $4=yest_off $5=now
+# 昨日跨午夜窗口延续（now < yest_off 且昨日窗口为跨午夜）仍视为窗口内。
+sched_in_window() {
+  to=$1; tf=$2; yo=$3; yf=$4; now=$5
+  case "$yo" in ''|*[!0-9]*) yo=0 ;; esac
+  case "$yf" in ''|*[!0-9]*) yf=0 ;; esac
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$yo" != "0" ] && [ "$yf" -lt "$yo" ] && [ "$now" -lt "$yf" ]; then
+    return 0
+  fi
+  case "$to" in ''|0) return 1 ;; esac
+  schedule_in_window "$to" "$tf" "$now"
+}
+
+# SoftAP 综合验证（P1-13）：接口 + IP + 系统 SoftAP 状态
+# 系统状态取不到时不判失败（保持旧接口判定），取到且明确未启用时才判失败。
+SOFTAP_CACHE="$DATA_DIR/softap.cache"
+
+# SoftAP 状态快照（P2-9）：一次 dumpsys wifi，缓存 15 秒；
+# 状态接口每 5 秒轮询时不再重复执行 dumpsys。
+softap_state_snapshot() {
+  SNAP_AP_STATE=
+  SNAP_AP_SSID=
+  SNAP_AP_SECURITY=
+  SNAP_AP_CHANNEL=
+  SNAP_AP_BAND=
+  if [ -r "$SOFTAP_CACHE" ]; then
+    MT=$("$BB" stat -c %Y "$SOFTAP_CACHE" 2>/dev/null)
+    NOW=$(/system/bin/date +%s 2>/dev/null || date +%s)
+    case "$MT" in ''|*[!0-9]*) MT=0 ;; esac
+    if [ "$MT" -gt 0 ] && [ $((NOW - MT)) -lt 15 ]; then
+      # P0(1.5.12)：禁止 source 缓存文件（SSID 可能含引号/反引号/$()）。
+      # 逐行白名单解析：只接受固定键，值做严格字符校验；SSID 走 Base64。
+      while IFS='=' read -r C_KEY C_VAL; do
+        case "$C_KEY" in
+          SNAP_AP_STATE) case "$C_VAL" in ENABLED|DISABLED|DISABLING|ENABLED_AND_SUSPENDED) SNAP_AP_STATE="$C_VAL" ;; esac ;;
+          SNAP_AP_SSID_B64) case "$C_VAL" in ''|*[!A-Za-z0-9+/=-]*) : ;; *) SNAP_AP_SSID_B64="$C_VAL" ;; esac ;;
+          SNAP_AP_SECURITY) case "$C_VAL" in ''|*[!0-9]*) : ;; *) SNAP_AP_SECURITY="$C_VAL" ;; esac ;;
+          SNAP_AP_CHANNEL) case "$C_VAL" in ''|*[!0-9]*) : ;; *) SNAP_AP_CHANNEL="$C_VAL" ;; esac ;;
+          SNAP_AP_BAND) case "$C_VAL" in ''|*[!0-9]*) : ;; *) SNAP_AP_BAND="$C_VAL" ;; esac ;;
+        esac
+      done < "$SOFTAP_CACHE"
+      case "$SNAP_AP_SSID_B64" in
+        '') SNAP_AP_SSID= ;;
+        *) SNAP_AP_SSID=$(printf '%s' "$SNAP_AP_SSID_B64" | "$BB" base64 -d 2>/dev/null) ;;
+      esac
+      return 0
+    fi
+  fi
+  OUT=$(dumpsys wifi 2>/dev/null)
+  AP_STATE=$(printf '%s\n' "$OUT" | "$BB" grep -o 'mWifiApState=[A-Z]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
+  # 尽力解析 SoftAP 配置段（HyperOS 输出格式多样，取不到字段时留空=unknown，不判失败）
+  # 常见形态1：WifiApInfo{ssid="xxx", ...} / mWifiApInfo SSID: xxx
+  AP_SSID=$(printf '%s\n' "$OUT" | "$BB" grep -o 'WifiApInfo{[^}]*ssid="[^"]*"' | "$BB" head -n1 | "$BB" sed -n 's/.*ssid="\([^"]*\)".*/\1/p')
+  [ -z "$AP_SSID" ] && AP_SSID=$(printf '%s\n' "$OUT" | "$BB" grep -o 'SSID: [^,}]*' | "$BB" head -n1 | "$BB" sed -n 's/SSID: //p' | "$BB" tr -d ' \r')
+  # 常见形态2：WifiConfiguration 段落里的 SSID:"xxx"
+  [ -z "$AP_SSID" ] && AP_SSID=$(printf '%s\n' "$OUT" | "$BB" grep -o 'SSID:"[^"]*"' | "$BB" head -n1 | "$BB" sed -n 's/SSID:"\([^"]*\)"/\1/p')
+  # 安全模式：WifiApInfo/WifiConfiguration 中 security 或 allowedKeyManagement
+  AP_SECURITY=$(printf '%s\n' "$OUT" | "$BB" grep -o 'security=[0-9]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
+  AP_CHANNEL=$(printf '%s\n' "$OUT" | "$BB" grep -o 'mWifiApInfo[^}]*channel=[0-9]*' | "$BB" head -n1 | "$BB" sed -n 's/.*channel=\([0-9]*\).*/\1/p')
+  [ -z "$AP_CHANNEL" ] && AP_CHANNEL=$(printf '%s\n' "$OUT" | "$BB" grep -o 'channel=[0-9]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
+  AP_BAND=$(printf '%s\n' "$OUT" | "$BB" grep -o 'band=[0-9]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
+  TMP="$SOFTAP_CACHE.$$"
+  # SSID 经 Base64 存储，避免特殊字符破坏缓存文件；状态/安全/频段/信道只接受枚举或数字
+  case "$AP_STATE" in
+    ENABLED|DISABLED|DISABLING|ENABLED_AND_SUSPENDED) : ;;
+    *) AP_STATE= ;;
+  esac
+  AP_SSID_B64=$(printf '%s' "$AP_SSID" | "$BB" base64 2>/dev/null | "$BB" tr -d '=\n')
+  {
+    printf 'SNAP_AP_STATE=%s\n' "$AP_STATE"
+    printf 'SNAP_AP_SSID_B64=%s\n' "$AP_SSID_B64"
+    printf 'SNAP_AP_SECURITY=%s\n' "$AP_SECURITY"
+    printf 'SNAP_AP_CHANNEL=%s\n' "$AP_CHANNEL"
+    printf 'SNAP_AP_BAND=%s\n' "$AP_BAND"
+  } > "$TMP" 2>/dev/null
+  mv -f "$TMP" "$SOFTAP_CACHE" 2>/dev/null
+  chmod 0600 "$SOFTAP_CACHE" 2>/dev/null
+}
+
+# SoftAP 真实状态（接口 + IP + 系统状态，读缓存）
+softap_state_ok() {
+  iface=$1
+  [ -n "$iface" ] || return 1
+  IP_ADDR=$(get_iface_ip "$iface")
+  [ -n "$IP_ADDR" ] || return 1
+  softap_state_snapshot
+  case "$SNAP_AP_STATE" in
+    ENABLED) return 0 ;;
+    DISABLED) return 1 ;;
+  esac
+  CMD_STS=$(/system/bin/cmd wifi status 2>/dev/null)
+  case "$CMD_STS" in
+    *"disabled"*|*"Disabled"*|*"DISABLED"*) [ -z "$(get_hotspot_iface)" ] && return 1 ;;
+  esac
+  return 0
+}
+
+# 热点参数核验（P1-8）：SSID/安全/频段/信道尽量与期望比对。
+# 返回 0=匹配或无法核验（不判失败）；2=明确不匹配（调用方写日志告警，不回滚）。
+# $1=期望SSID $2=期望security $3=期望band $4=期望channel
+verify_softap_config() {
+  EXP_SSID=$1
+  EXP_SEC=$2
+  EXP_BAND=$3
+  EXP_CH=$4
+  softap_state_snapshot
+  [ -n "$SNAP_AP_SSID" ] || return 0
+  # SSID 不匹配 → 明确错误（dumpsys 抓到的 SSID 属于 SoftAP 配置段，不是手机连接的 Wi-Fi）
+  [ "$SNAP_AP_SSID" = "$EXP_SSID" ] || return 2
+  # 频段/信道/安全模式只有拿到明确值才比较
+  if [ -n "$SNAP_AP_CHANNEL" ] && [ -n "$EXP_CH" ] && [ "$EXP_CH" != "0" ]; then
+    case "$SNAP_AP_CHANNEL" in ''|*[!0-9]*) : ;; *)
+      [ "$SNAP_AP_CHANNEL" = "$EXP_CH" ] || return 2
+    ;; esac
+  fi
+  if [ -n "$SNAP_AP_BAND" ]; then
+    case "$EXP_BAND:$SNAP_AP_BAND" in
+      2:1|2:2|2:0) : ;;
+      5:2|5:1|5:0) : ;;
+      any:*) : ;;
+      *) return 2 ;;
+    esac
+  fi
+  return 0
+}
+
+
+# ================= v1.3.6 新增 =================
+
+# ---------- 客户端厂商识别（MAC OUI 前缀表） ----------
+# MAC 前 3 字节（大写，如 "F0:18:98"）→ 厂商名；未收录返回空。
+# 调用前先归一化大写：V=$(printf '%s' "$MAC" | tr 'a-f' 'A-F')
+mac_vendor() {
+  mac=$1
+  PREFIX=$(printf '%s' "$mac" | "$BB" cut -d: -f1-3 2>/dev/null)
+  case "$PREFIX" in
+    F0:18:98|A4:83:E7|3C:22:FB|40:CB:C0|44:D8:84|48:43:3A|5C:E9:1E|68:5B:35|70:3E:AC|78:4F:43|88:66:5A|8C:58:77|90:B0:ED|98:01:A7|9C:20:7B|AC:BC:32|B0:65:BD|C0:56:E3|CC:08:E0|D0:E1:40|D4:61:9D|DC:2B:2A|E4:8B:7F|F0:2F:74|F4:0F:1B|F4:F1:5A|F8:8C:BC|FC:A8:9A) echo Apple ;;
+    00:16:6C|00:1A:3F|00:23:D4|00:24:90|08:00:28|0C:1B:8A|14:49:E0|18:68:CB|1C:7E:C5|20:37:06|24:E9:B3|28:CF:E9|2C:21:31|30:CD:A7|34:31:11|38:5F:2D|3C:DB:D5|40:4D:8F|44:52:D9|48:0C:49|4C:77:66|50:3E:AA|54:10:EC|58:50:0B|5C:51:88|60:45:BD|64:6E:97|68:EF:43|6C:09:3B|70:5A:0F|74:78:1C|78:9A:18|7C:04:D0|80:06:5C|84:7B:EB|88:C6:26|8C:47:BE|90:5C:44|94:DA:BF|98:48:27|9C:28:EF|A0:1C:05|A4:77:33|A8:5C:2C|AC:5A:14|B0:47:BF|B4:E9:B0|B8:8A:60|BC:20:A4|C0:24:51|C4:9F:1E|C8:1E:E7|CC:2D:8C|D0:6B:4E|D4:6E:5E|D8:0D:17|DC:0E:A1|E0:27:1A|E4:03:6A|E8:50:8B|EC:0D:9A|F0:27:65|F4:46:FD|F8:3B:7E|FC:5B:26) echo Samsung ;;
+    04:6D:52|08:96:D7|0C:1D:AF|10:2A:B3|14:F6:5A|18:59:36|1C:60:DE|20:2B:C1|24:0A:64|28:6C:07|2C:30:33|30:23:03|34:38:38|38:90:A5|3C:5A:B4|40:97:6E|44:23:7C|48:7D:2E|4C:06:EB|50:9F:27|54:57:5C|58:23:8C|5C:02:14|60:33:4B|64:CC:2E|68:DB:F5|6C:59:5D|70:2C:1F|74:78:9D|78:0C:B8|7C:33:87|80:6C:1B|84:AF:EC|88:C5:5A|8C:5A:F8|90:8D:77|94:65:2D|98:24:B7|9C:99:A0|A0:0A:AD|A4:08:EA|A8:6B:7C|AC:0C:64|B0:35:9F|B4:34:2B|B8:3A:08|BC:3F:8F|C0:21:AD|C4:0A:CB|C8:76:37|CC:03:1F|D0:37:45|D4:3A:2C|D8:C4:97|DC:44:6D|E0:19:1D|E4:C8:1C|E8:9A:8F|EC:26:CA|F0:B4:29|F4:8E:38|F8:A4:5F|FC:6C:31) echo Xiaomi ;;
+    00:E0:FC|04:BD:88|08:19:A6|10:1B:54|14:39:58|18:82:2B|1C:AB:A7|20:1C:0B|28:6E:D4|2C:AB:00|30:FB:B8|34:12:98|38:BC:1A|40:8D:5C|44:1C:A8|48:46:FB|4C:54:99|54:25:EA|58:4A:EA|60:DE:44|64:16:66|68:A0:3E|6C:2E:85|70:B3:D5|74:9D:79|78:F5:FD|7C:7A:91|80:5E:C0|84:25:DB|88:C3:97|8C:34:FD|90:17:AC|94:77:2B|98:E7:F5|9C:34:26|A0:29:42|A4:91:B1|A8:DB:03|AC:61:EA|B0:E5:ED|B4:CD:27|B8:08:D7|BC:76:70|C0:EE:FB|C4:6E:6E|C8:5B:76|CC:16:7E|D0:7E:35|D4:6A:6A|D8:C7:71|DC:D2:FC|E0:2C:3F|E4:A7:A0|E8:AB:FA|EC:F8:EB|F0:27:2D|F4:4C:7F|F8:04:2E|FC:48:EF) echo Huawei ;;
+    04:66:CF|0C:14:8C|1C:4B:D6|20:47:DA|28:05:0B|30:22:2C|34:6B:D3|3C:95:09|44:3C:9C|48:E6:E5|4C:0B:3A|50:9C:56|54:39:DF|5C:F9:38|60:2A:D0|64:7C:34|68:7D:B4|6C:3F:51|70:3D:15|74:27:EA|78:64:6F|7C:0E:CE|80:2C:F8|84:D4:1E|88:2B:B4|8C:4E:8F|90:87:08|94:63:CD|98:4C:26|9C:41:7C|A0:0B:2B|A4:C2:6B|A8:4C:65|AC:5E:8C|B0:5A:1D|B4:6D:83|B8:2D:28|BC:9C:31|C0:0B:16|C4:B4:BD|C8:92:3F|CC:B2:55|D0:8C:50|D4:5D:DF|D8:44:67|DC:21:48|E0:50:51|E4:6E:E7|E8:26:86|EC:90:4F|F0:7D:32|F4:8C:50|F8:87:76|FC:1F:9B) echo Honor ;;
+    10:33:78|18:2F:38|1C:5A:6B|20:91:48|24:78:9C|2C:F0:EE|30:3E:A7|34:95:DB|38:0A:75|3C:32:E5|40:3D:EC|44:35:83|48:CA:43|4C:17:EB|50:2B:73|54:5E:25|58:74:8D|5C:38:6B|60:8C:4A|64:6E:DB|68:37:E9|6C:3B:E5|70:1C:E7|74:47:46|78:8A:FD|7C:2A:D1|80:5A:04|84:CB:FD|88:31:6C|8C:21:0A|90:2B:34|94:19:B8|98:DF:7D|9C:1D:52|A0:0E:9E|A4:4B:D5|A8:7B:39|AC:FD:CE|B0:4E:26|B4:52:7D|B8:B2:4A|BC:7E:3B|C0:2B:3B|C4:77:5E|C8:0E:14|CC:52:AF|D0:4C:C1|D4:6F:42|D8:4F:4D|DC:3A:5E|E0:63:DA|E4:92:05|E8:2A:EA|EC:FD:45|F0:0D:5F|F4:C4:D4|F8:EB:34|FC:23:6E) echo OPPO ;;
+    00:0C:E6|04:0B:27|08:34:51|0C:46:12|10:78:D2|14:34:52|18:8F:76|1C:52:16|20:00:5A|24:3C:20|28:99:3A|2C:35:2B|30:94:0B|34:7D:F6|38:87:D5|3C:8B:FE|40:B3:95|44:03:2C|48:1C:44|4C:66:41|50:3C:BE|54:36:9B|58:BA:D5|5C:59:48|60:02:B4|64:66:B3|68:CB:B1|6C:2B:59|70:08:CD|74:5E:1C|78:3E:FB|7C:76:63|80:52:6B|84:1B:5E|88:3F:4A|8C:89:A5|90:8F:61|94:65:9D|98:38:DA|9C:20:D3|A0:8C:FD|A4:70:D6|A8:4A:AF|AC:2D:70|B0:6A:9F|B4:9C:5A|B8:0F:63|BC:2C:2C|C0:26:DA|C4:1C:FF|C8:4B:D6|CC:B8:A8|D0:3A:2F|D4:77:0F|D8:F1:5B|DC:F4:01|E0:1C:FC|E4:3A:6E|E8:4E:06|EC:AF:9E|F0:56:7D|F4:5E:AB|F8:58:0C|FC:14:0A) echo vivo ;;
+    00:1A:11|04:0C:CE|08:66:98|C8:2A:14|F0:9F:C2|94:A7:B7|2C:54:91) echo Google ;;
+    00:0F:1F|00:1B:21|00:21:86|04:35:6C|08:57:00|0C:1A:1E|10:6F:3F|14:4D:67|18:67:B0|1C:7B:21|20:1B:D5|24:05:88|28:E3:47|2C:4D:54|30:7C:30|34:38:B5|38:2C:4A|3C:18:A0|40:8D:5E|44:1A:FA|48:4B:AA|4C:7F:62|50:3D:E5|54:E6:FC|58:71:8C|5C:50:15|60:1C:EE|64:9E:F3|68:6C:E5|6C:62:6E|70:66:55|74:C3:42|78:6C:1C|7C:61:93|80:57:06|84:38:38|88:91:DD|8C:0C:A3|90:61:AE|94:57:A5|98:9B:CB|9C:93:4E|A0:54:4B|A4:83:C7|A8:7D:12|AC:CB:09|B0:72:BF|B4:FD:05|B8:51:FD|BC:14:01|C0:76:68|C4:8E:8F|C8:5A:92|CC:55:AD|D0:37:61|D4:CA:6D|D8:8E:79|DC:F5:D6|E0:D5:5E|E4:77:D8|E8:94:F6|EC:74:8D|F0:98:9D|F4:F2:6D|F8:FD:CE|FC:8A:C8) echo Lenovo ;;
+    00:04:E2|00:0A:28|00:0E:3A|00:16:B6|00:1F:5B|00:23:58|04:05:4D|08:00:37|0C:44:32|10:5B:AD|14:0E:E0|18:2D:30|1C:06:93|20:12:1F|24:30:DE|28:1D:5C|2C:00:33|30:76:42|34:8E:C6|38:14:1B|3C:4C:BC|40:04:62|44:06:19|48:0E:EC|4C:0F:6E|50:61:5B|54:2D:66|58:46:11|5C:6B:4F|60:0D:81|64:18:5B|68:37:28|6C:1D:1A|70:35:70|74:C9:61|78:8F:2A|7C:13:17|80:63:05|84:3A:4B|88:2B:50|8C:8B:83|90:6D:EE|94:77:C0|98:6B:38|9C:10:CD|A0:63:91|A4:31:35|A8:3D:E4|AC:7A:4B|B0:6B:E7|B4:0B:44|B8:3A:7D|BC:6C:21|C0:6E:5F|C4:90:01|C8:6B:4F|CC:EF:48|D0:5C:7A|D4:63:36|D8:16:E3|DC:97:5B|E0:2C:33|E4:67:2C|E8:6B:EA|EC:0B:AE|F0:27:45|F4:36:6F|F8:15:47|FC:0F:4A) echo Motorola ;;
+    00:04:F2|00:0B:82|00:12:0E|00:1B:FC|00:21:6A|04:92:26|08:60:6E|0C:9D:92|10:BF:48|14:D6:4D|18:A6:F7|1C:B7:2C|20:4E:7F|24:05:0F|28:34:A2|2C:56:DC|30:9C:23|34:97:F6|38:10:D5|3C:52:82|40:4D:8E|44:6C:24|48:5B:39|4C:02:89|50:46:5D|54:04:A6|58:10:8B|5C:62:8B|60:26:FD|68:5D:43|6C:AD:F8|70:8C:B7|74:C6:3B|78:1D:BA|7C:11:BE|80:1F:02|84:1B:77|88:D7:F6|8C:4D:EA|90:9F:33|94:0C:6D|98:FE:94|9C:5C:8E|A0:0B:ED|A4:6E:31|A8:8E:4F|AC:9E:17|B0:6E:BF|B4:82:FE|B8:9A:2A|C0:3F:0E|C4:1D:9F|C8:60:00|CC:04:0B|D0:57:7B|D4:6E:0E|DC:53:83|E0:3F:49|E4:5F:01|E8:EE:CC|EC:2E:4E|F0:0C:0B|F4:1B:A1|F8:63:3F|FC:06:6B) echo ASUS ;;
+    00:16:EA|00:1E:67|3C:97:0E|54:B2:03|68:5C:4B|8C:16:45|AC:7F:3E|B0:48:7A|B4:6B:FC|C8:3A:35|D8:BB:C1|F4:4D:30|F8:CA:B8) echo Intel ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---------- 日志轮转（上限 512KB，超限截断保留尾部） ----------
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  SIZE=$("$BB" wc -c < "$LOG" 2>/dev/null | "$BB" tr -d ' ')
+  case "$SIZE" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$SIZE" -gt 524288 ]; then
+    "$BB" tail -n 400 "$LOG" > "$LOG.tmp" 2>/dev/null
+    mv -f "$LOG.tmp" "$LOG" 2>/dev/null
+    chmod 0600 "$LOG" 2>/dev/null
+    printf '%s 日志已轮转（原 %s 字节）\n' "$(date)" "$SIZE" >> "$LOG"
+  fi
+}
+
+# ---------- 蜂窝流量统计（开机以来 rmnet 累计，只读 /proc/net/dev） ----------
+# 输出: CELL_RX CELL_TX（字节）
+get_cell_stats() {
+  CELL_RX=$(cat /proc/net/dev 2>/dev/null | "$BB" awk '/^[[:space:]]*rmnet/{rx+=$2; tx+=$10} END{print rx+0}')
+  CELL_TX=$(cat /proc/net/dev 2>/dev/null | "$BB" awk '/^[[:space:]]*rmnet/{rx+=$2; tx+=$10} END{print tx+0}')
+  case "$CELL_RX" in ''|*[!0-9]*) CELL_RX=0 ;; esac
+  case "$CELL_TX" in ''|*[!0-9]*) CELL_TX=0 ;; esac
+}
+
+
+# ---------- 电池状态（15 秒缓存，避免每 5 秒轮询都跑 dumpsys） ----------
+get_battery_cached() {
+  BATTERY=0
+  CHARGING=false
+  BATTERY_STATUS=0
+  B_CACHE="$DATA_DIR/battery.cache"
+  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  if [ -r "$B_CACHE" ]; then
+    B_MT=$("$BB" stat -c %Y "$B_CACHE" 2>/dev/null)
+    case "$B_MT" in ''|*[!0-9]*) B_MT=0 ;; esac
+    if [ "$B_MT" -gt 0 ] && [ $((NOW_S - B_MT)) -ge 0 ] && [ $((NOW_S - B_MT)) -lt 15 ]; then
+      . "$B_CACHE" 2>/dev/null || true
+      return 0
+    fi
+  fi
+  LVL=$(/system/bin/dumpsys battery 2>/dev/null | "$BB" awk '/level:/{print $2; exit}')
+  STS=$(/system/bin/dumpsys battery 2>/dev/null | "$BB" awk '/status:/{print $2; exit}')
+  case "$LVL" in ''|*[!0-9]*) LVL=0 ;; esac
+  case "$STS" in 2|5) CHARGING=true ;; *) CHARGING=false ;; esac
+  # 原始状态保留给低电量提醒：2=充电 3=放电 4=未充电 5=已充满 其它=未知
+  case "$STS" in 2|3|4|5) BATTERY_STATUS=$STS ;; *) BATTERY_STATUS=0 ;; esac
+  TMP="$B_CACHE.$$"
+  {
+    printf 'BATTERY=%s\n' "$LVL"
+    printf 'CHARGING=%s\n' "$CHARGING"
+    printf 'BATTERY_STATUS=%s\n' "$BATTERY_STATUS"
+  } > "$TMP" 2>/dev/null
+  chmod 0600 "$TMP" 2>/dev/null
+  mv -f "$TMP" "$B_CACHE" 2>/dev/null
+  BATTERY=$LVL
+}
+
+# ---------- 低电量提醒（移植自 UFI-TOOLS 低电量提醒 v1.3.0，适配本模块） ----------
+# 规则：仅放电中（status=3）且电量≤阈值时提醒；同一轮只提醒一次（armed→attempted）；
+#       连续 2 次检测到充电（status 2/5）或电量回升到 阈值+5（最高100）才重新武装；
+#       推送复用 notify_all_async（PushPlus/钉钉），标题含"热点"以命中机器人自定义关键词。
+LOWBATT_LATCH="$DATA_DIR/lowbatt.latch"   # armed / attempted
+LOWBATT_STAT="$DATA_DIR/lowbatt.status"
+
+lowbatt_tick() {
+  # 未启用：写 disabled 快照，避免页面残留旧状态
+  if [ "${LOWBATT_ENABLE:-0}" != "1" ]; then
+    get_battery_cached
+    printf 'level=%s\npower=%s\nthreshold=%s\nlatch=disabled\nreason=disabled\nchecked=%s\n' \
+      "$BATTERY" "$BATTERY_STATUS" "${LOWBATT_THRESHOLD:-20}" "$(/system/bin/date +%s 2>/dev/null || date +%s)" \
+      > "$LOWBATT_STAT" 2>/dev/null
+    chmod 0600 "$LOWBATT_STAT" 2>/dev/null
+    return 0
+  fi
+  case "${LOWBATT_THRESHOLD:-0}" in ''|*[!0-9]*) LOWBATT_THRESHOLD=20 ;; esac
+  [ "$LOWBATT_THRESHOLD" -ge 1 ] && [ "$LOWBATT_THRESHOLD" -le 100 ] || LOWBATT_THRESHOLD=20
+  get_battery_cached
+  RESET=$((LOWBATT_THRESHOLD + 5)); [ "$RESET" -le 100 ] || RESET=100
+  LATCH=$("$BB" head -n 1 "$LOWBATT_LATCH" 2>/dev/null)
+  case "$LATCH" in armed|attempted) ;; *) LATCH=armed ;; esac
+  REASON=monitoring
+  # 恢复确认：连续 2 tick 检测到充电或电量回升到阈值+5 以上，才重新武装
+  if [ "$BATTERY_STATUS" = "2" ] || [ "$BATTERY_STATUS" = "5" ]; then
+    LB_CHARGE=$(( ${LB_CHARGE:-0} + 1 ))
+    LB_RECOV=0
+  else
+    LB_CHARGE=0
+    if [ "$BATTERY" -ge "$RESET" ]; then LB_RECOV=$(( ${LB_RECOV:-0} + 1 )); else LB_RECOV=0; fi
+  fi
+  if [ "$LATCH" = "attempted" ] && { [ "$LB_CHARGE" -ge 2 ] || [ "$LB_RECOV" -ge 2 ]; }; then
+    printf 'armed\n' > "$LOWBATT_LATCH" 2>/dev/null
+    LATCH=armed
+    echo "$(date) lowbatt: 已恢复（充电或电量回升），允许下一次低电量提醒" >> "$LOG"
+  fi
+  # 触发：放电中 + 电量≤阈值 + 已武装 → 先落 attempted 再异步推送（防重复）
+  if [ "$BATTERY_STATUS" = "3" ] && [ "$BATTERY" -le "$LOWBATT_THRESHOLD" ] && [ "$LATCH" = "armed" ]; then
+    # P2-62：未配置任何通知渠道时不锁定“已提醒”，避免“显示已提醒但实际没发出去”
+    if [ -z "${PUSHPLUS_TOKEN:-}${DINGTALK_WEBHOOK:-}" ]; then
+      REASON=no_channel
+    elif printf 'attempted\n' > "$LOWBATT_LATCH" 2>/dev/null; then
+      LATCH=attempted
+      notify_all_async "热点低电量提醒" "当前电量 $BATTERY%，已低于提醒阈值 $LOWBATT_THRESHOLD%，请及时充电。
+时间: $(/system/bin/date '+%m-%d %H:%M')"
+      echo "$(date) lowbatt: 低电量提醒已进入发送队列（$BATTERY% <= $LOWBATT_THRESHOLD%）" >> "$LOG"
+      REASON=alert_queued
+    else
+      REASON=state_write_failed
+    fi
+  elif [ "$LATCH" = "attempted" ]; then
+    REASON=already_alerted
+  fi
+  # 快照供状态接口读取（15 秒 tick 更新）
+  printf 'level=%s\npower=%s\nthreshold=%s\nlatch=%s\nreason=%s\nchecked=%s\n'     "$BATTERY" "$BATTERY_STATUS" "$LOWBATT_THRESHOLD" "$LATCH" "$REASON"     "$(/system/bin/date +%s 2>/dev/null || date +%s)" > "$LOWBATT_STAT" 2>/dev/null
+  chmod 0600 "$LOWBATT_STAT" 2>/dev/null
+}
+
+
+# ---------- 统计链过期规则清理：链内 RETURN 的 IP 已不在线则删除 ----------
+# 输入: 当前在线 IP 列表（其余参数）
+cleanup_stats_rules() {
+  ONLINE="$*"
+  $IPT -L mifi_stats -n -v -x 2>/dev/null | "$BB" awk '$3=="RETURN" && $8 ~ /^[0-9.]+$/ {print $8} $3=="RETURN" && $9 ~ /^[0-9.]+$/ {print $9}' | sort -u | while read -r ip; do
+    case " $ONLINE " in *" $ip "*) continue ;; esac
+    $IPT -D mifi_stats -s "$ip" -j RETURN 2>/dev/null
+    $IPT -D mifi_stats -d "$ip" -j RETURN 2>/dev/null
+  done
+}
+
+# ---------- 流量限额（累计热点转发流量，持久化防重启清零） ----------
+# v1.5.2 口径变更：从“手机蜂窝总流量（rmnet）”改为“热点转发流量（FORWARD 链）”，
+# 手机自身使用流量不再计入限额。数据文件语义不变（data_usage/last_usage）。
+USAGE_FILE="$DATA_DIR/data_usage"
+USAGE_SNAP="$DATA_DIR/last_usage"
+USAGE_IFACE_FILE="$DATA_DIR/usage_iface"   # 记录上次统计链接口（P1-39，接口变化时清理旧跳转）
+
+# 热点转发流量链：mifi_up（FORWARD -i 热点接口 = 客户端上行）、mifi_dn（FORWARD -o = 客户端下行）。
+# 独立于按客户端 IP 计数的 mifi_stats 链；被黑名单 DROP 的包不进入本链（不计入限额）。
+# 链级字节同时作为"实时速度"的数据源，不再依赖在线设备列表汇总（设备离线/换 IP 不产生瞬时归零与尖峰）。
+ensure_usage_chain() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  # P1-39：热点接口变化时清理旧接口上残留的 FORWARD 跳转，避免旧规则继续计数/残留
+  OLD_IFACE=$("$BB" cat "$USAGE_IFACE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  if [ -n "$OLD_IFACE" ] && [ "$OLD_IFACE" != "$iface" ]; then
+    $IPT -D FORWARD -i "$OLD_IFACE" -j mifi_up 2>/dev/null
+    $IPT -D FORWARD -o "$OLD_IFACE" -j mifi_dn 2>/dev/null
+    echo "$(date) usage: 热点接口 $OLD_IFACE -> $iface，已清理旧接口统计跳转" >> "$LOG"
+  fi
+  printf '%s\n' "$iface" > "$USAGE_IFACE_FILE" 2>/dev/null
+  $IPT -N mifi_up 2>/dev/null || true
+  $IPT -N mifi_dn 2>/dev/null || true
+  $IPT -C FORWARD -i "$iface" -j mifi_up 2>/dev/null || \
+    $IPT -I FORWARD 1 -i "$iface" -j mifi_up 2>/dev/null
+  $IPT -C FORWARD -o "$iface" -j mifi_dn 2>/dev/null || \
+    $IPT -I FORWARD 1 -o "$iface" -j mifi_dn 2>/dev/null
+  # 迁移旧版单链 mifi_usage（无引用时清除；有引用说明旧规则仍在，一并移除避免重复计数）
+  if $IPT -L mifi_usage -n 2>/dev/null | "$BB" grep -q . 2>/dev/null; then
+    $IPT -F mifi_usage 2>/dev/null
+    $IPT -D FORWARD -i "$iface" -j mifi_usage 2>/dev/null
+    $IPT -D FORWARD -o "$iface" -j mifi_usage 2>/dev/null
+    $IPT -X mifi_usage 2>/dev/null
+  fi
+}
+
+# 读取指定统计链当前字节（rx/tx 由 up/dn 链分别给出）
+get_chain_bytes() {
+  chain=$1
+  $IPT -L "$chain" -n -v -x 2>/dev/null | "$BB" awk 'NR>2 && $1 ~ /^[0-9]+$/ {s+=$2} END {print s+0}'
+}
+
+# 把热点转发链相对快照的增量累加进累计（字节）。
+# 链被清/热点重启（计数器归零）时本次不累计，从当前重新开始——热点关闭期间无转发流量，不算漏计。
+accumulate_usage() {
+  CUR=$(( $(get_chain_bytes mifi_up) + $(get_chain_bytes mifi_dn) ))
+  SNAP=$(cat "$USAGE_SNAP" 2>/dev/null | "$BB" tr -d ' ')
+  case "$SNAP" in ''|*[!0-9]*) SNAP=0 ;; esac
+  ACC=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  case "$ACC" in ''|*[!0-9]*) ACC=0 ;; esac
+  if [ "$CUR" -lt "$SNAP" ]; then
+    # P1-38：统计链被系统清除/计数器重置时记录原因与时间（避免静默丢段），从当前值重新开始
+    echo "$(date) usage: 计数器回退 cur=$CUR snap=$SNAP，统计链可能被清除；从当前值重新累计" >> "$LOG"
+    SNAP=$CUR
+  fi
+  DIFF=$((CUR - SNAP))
+  if [ "$DIFF" -gt 0 ]; then
+    ACC=$((ACC + DIFF))
+    printf '%s\n' "$ACC" > "$USAGE_FILE"
+    chmod 0600 "$USAGE_FILE"
+  fi
+  printf '%s\n' "$CUR" > "$USAGE_SNAP"
+  chmod 0600 "$USAGE_SNAP"
+}
+
+# 读取累计用量（MB）与是否超限
+read_usage() {
+  USAGE_BYTES=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  case "$USAGE_BYTES" in ''|*[!0-9]*) USAGE_BYTES=0 ;; esac
+  USAGE_MB=$((USAGE_BYTES / 1048576))
+  USAGE_OVER=false
+  plan_total_mb
+  # P0-24(1.5.12)：超限判断改按账期用量，不再按历史总累计
+  if [ "$PLAN_TOTAL" -gt 0 ] 2>/dev/null; then
+    plan_period_bytes
+    PERIOD_MB=$((PLAN_PERIOD_BYTES / 1048576))
+    [ "$PERIOD_MB" -ge "$PLAN_TOTAL" ] 2>/dev/null && USAGE_OVER=true
+  fi
+}
+
+reset_usage() {
+  # P0-27：与确认框文案一致——累计、客户端统计、账期基线、分级提醒标记全部清零
+  rm -f "$USAGE_FILE" "$USAGE_SNAP" "$TRAFFIC_BASE" "$TRAFFIC_DAILY" "$CLIENT_USAGE_FILE" "$CLIENT_SNAP_FILE" "$PLAN_TH_MARK" "$PLAN_PERIOD_FILE"
+}
+# ---------- 模块数据版本（v1.5.2）：流量限额口径变更，旧统计自动清零 ----------
+VERSION_FILE="$DATA_DIR/module_version"
+
+check_version_upgrade() {
+  # P0(1.5.11)：迁移改为独立标记文件，每个迁移只执行一次；
+  # 不再用“版本号 != 某版本”判断（旧逻辑会导致 VERSION_FILE 在 1.5.2/1.5.10 间交替，
+  # 服务每次重启都会清空流量统计文件）。
+  MIG_DIR="$DATA_DIR/.migrated"
+  # P0(1.5.12)：老版本升级识别——config 已存在且尚无迁移目录，说明本次是从 1.5.10 及以前升级；
+  # 此时已有统计数据，两个迁移都只补标记、不执行破坏性清零（字段合并仍照常）。
+  UPGRADE=0
+  if [ -f "$CONFIG" ] && [ ! -d "$MIG_DIR" ]; then
+    UPGRADE=1
+  fi
+  mkdir -p "$MIG_DIR" 2>/dev/null
+  chmod 0700 "$MIG_DIR" 2>/dev/null
+  # 1.5.2 起点：限额口径切换（历史遗留，一次性）
+  if [ ! -e "$MIG_DIR/v1_5_2" ]; then
+    if [ "$UPGRADE" != "1" ]; then
+      rm -f "$USAGE_FILE" "$USAGE_SNAP" "$TRAFFIC_BASE" "$TRAFFIC_DAILY" "$CLIENT_USAGE_FILE" "$CLIENT_SNAP_FILE"
+    fi
+    : > "$MIG_DIR/v1_5_2"
+    chmod 0600 "$MIG_DIR/v1_5_2" 2>/dev/null
+    echo "$(date) v1.5.2: 流量限额口径已改为热点转发流量，旧统计已清零" >> "$LOG"
+  fi
+  # 1.5.10：日归档改字节保存/账期保留62天 + 限额与套餐字段合并（一次性）
+  if [ ! -e "$MIG_DIR/v1_5_10" ]; then
+    if [ "$UPGRADE" != "1" ]; then
+      rm -f "$TRAFFIC_DAILY" "$TRAFFIC_BASE"
+    fi
+    if [ -f "$CONFIG" ]; then
+      OLD_LIMIT=$("$BB" sed -n 's/^DATA_LIMIT_MB=//p' "$CONFIG" 2>/dev/null | "$BB" head -n1 | "$BB" tr -d ' ')
+      OLD_PLAN=$("$BB" sed -n 's/^DATA_PLAN_MB=//p' "$CONFIG" 2>/dev/null | "$BB" head -n1 | "$BB" tr -d ' ')
+      case "$OLD_LIMIT" in ''|*[!0-9]*) OLD_LIMIT=0 ;; esac
+      case "$OLD_PLAN" in ''|*[!0-9]*) OLD_PLAN=0 ;; esac
+      NEW_PLAN=$OLD_PLAN
+      [ "$OLD_LIMIT" -gt "$NEW_PLAN" ] 2>/dev/null && NEW_PLAN=$OLD_LIMIT
+      if [ "$OLD_LIMIT" != "$OLD_PLAN" ] 2>/dev/null; then
+        "$BB" grep -vE '^(DATA_LIMIT_MB|DATA_PLAN_MB)=' "$CONFIG" > "$CONFIG.tmp.$$" 2>/dev/null
+        printf 'DATA_PLAN_MB=%s\n' "$NEW_PLAN" >> "$CONFIG.tmp.$$" 2>/dev/null
+        mv -f "$CONFIG.tmp.$$" "$CONFIG" 2>/dev/null
+        chmod 0600 "$CONFIG" 2>/dev/null
+      fi
+    fi
+    : > "$MIG_DIR/v1_5_10"
+    chmod 0600 "$MIG_DIR/v1_5_10" 2>/dev/null
+    echo "$(date) v1.5.10: 日流量归档改为字节保存（账期保留62天）；限额/套餐字段合并为 DATA_PLAN_MB" >> "$LOG"
+  fi
+  # 版本文件仅作展示，不参与迁移判断
+  printf '1.5.11\n' > "$VERSION_FILE" 2>/dev/null
+  chmod 0600 "$VERSION_FILE" 2>/dev/null
+}
+
+# ================= v1.3.7 P2 新增 =================
+
+# ---------- 客户端限速（tc HTB，仅下行；实验性，Android 内核兼容性差） ----------
+# 规则文件: rate_limits，每行 MAC|Kbps（0 行不会被写入，删除即解除）
+RATE_FILE="$DATA_DIR/rate_limits"
+
+find_tc() {
+  command -v tc 2>/dev/null || { [ -x /system/bin/tc ] && echo /system/bin/tc; }
+}
+
+# 读取某 MAC 的限速（Kbps），未设置返回空
+get_rate_limit() {
+  mac=$1
+  "$BB" grep "^$mac|" "$RATE_FILE" 2>/dev/null | "$BB" head -n 1 | "$BB" cut -d'|' -f2
+}
+
+# 更新规则文件（mac|rate，rate=0 表示删除该条）
+write_rate_limit() {
+  mac=$1
+  rate=$2
+  TMP="$RATE_FILE.tmp.$$"
+  if [ -f "$RATE_FILE" ]; then
+    "$BB" grep -v "^$mac|" "$RATE_FILE" 2>/dev/null > "$TMP" || true
+  else
+    : > "$TMP"
+  fi
+  if [ "$rate" -gt 0 ] 2>/dev/null; then
+    printf '%s|%s\n' "$mac" "$rate" >> "$TMP"
+  fi
+  mv -f "$TMP" "$RATE_FILE" 2>/dev/null
+  chmod 0600 "$RATE_FILE" 2>/dev/null
+}
+
+# 对当前接口应用全部限速规则（先全清再重放，幂等）
+# 仅限速下行（客户端从互联网下载方向）；上行需 ifb 内核模块，不实现。
+# v1.5.2：保存 MAC→IP 应用快照（rate_limit_ips）；某设备 IP 变化时自动重建，
+# 避免 tc filter 仍指向旧 IP 导致限速失效。
+RATE_IPS_FILE="$DATA_DIR/rate_limit_ips"
+
+apply_rate_limits() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  TC=$(find_tc)
+  if [ -z "$TC" ]; then
+    echo "$(date) rate: tc 不存在，跳过限速" >> "$LOG"
+    return 1
+  fi
+  [ -f "$RATE_FILE" ] || { rm -f "$RATE_IPS_FILE"; return 0; }
+  CLIENTS=$(list_clients "$iface")
+  # IP 变化检测：RATE_FILE 中每个 MAC 的当前 IP 与上次应用快照不一致则需重建
+  REBUILD=0
+  while IFS='|' read -r MAC RATE; do
+    valid_mac "$MAC" || continue
+    CURIP=$(printf '%s\n' "$CLIENTS" | "$BB" awk -F'|' -v m="$MAC" '$2==m{print $1; exit}')
+    [ -z "$CURIP" ] && continue
+    OLDIP=$("$BB" grep "^$MAC|" "$RATE_IPS_FILE" 2>/dev/null | "$BB" head -n 1 | "$BB" cut -d'|' -f2)
+    if [ -n "$OLDIP" ] && [ "$OLDIP" != "$CURIP" ]; then
+      REBUILD=1
+    fi
+  done < "$RATE_FILE"
+  # 已应用（根 qdisc 存在）且映射未变：跳过重建，避免每 15s 全量删除/重建导致客户端断流抖动
+  if "$TC" qdisc show dev "$iface" 2>/dev/null | "$BB" grep -q 'htb'; then
+    [ "$REBUILD" = "1" ] || return 0
+    "$TC" qdisc del dev "$iface" root 2>/dev/null
+  fi
+  # 先清空旧规则（接口重建后 qdisc 已消失，del 失败可忽略）
+  "$TC" qdisc del dev "$iface" root 2>/dev/null
+  IDX=10
+  while IFS='|' read -r MAC RATE; do
+    valid_mac "$MAC" || continue
+    case "$RATE" in ''|*[!0-9]*) continue ;; esac
+    [ "$RATE" -lt 32 ] && RATE=32
+    [ "$RATE" -gt 1000000 ] && RATE=1000000
+    IP=$(printf '%s\n' "$CLIENTS" | "$BB" awk -F'|' -v m="$MAC" '$2==m{print $1; exit}')
+    [ -z "$IP" ] && continue
+    # P1-48：default 30 必须存在稳定创建的默认类 1:30，否则未命中 filter 的流量会被丢弃
+    "$TC" qdisc add dev "$iface" root handle 1: htb default 30 2>/dev/null
+    "$TC" class add dev "$iface" parent 1: classid 1:30 htb rate 1000000kbit ceil 1000000kbit 2>/dev/null
+    "$TC" class add dev "$iface" parent 1: classid "1:$IDX" htb rate "${RATE}kbit" ceil "${RATE}kbit" 2>/dev/null
+    "$TC" filter add dev "$iface" parent 1: protocol ip prio 1 u32 match ip dst "$IP/32" flowid "1:$IDX" 2>/dev/null
+    IDX=$((IDX + 1))
+  done < "$RATE_FILE"
+  # 写映射快照
+  TMP="$RATE_IPS_FILE.tmp.$$"
+  : > "$TMP"
+  while IFS='|' read -r MAC RATE; do
+    valid_mac "$MAC" || continue
+    IP=$(printf '%s\n' "$CLIENTS" | "$BB" awk -F'|' -v m="$MAC" '$2==m{print $1; exit}')
+    [ -n "$IP" ] && printf '%s|%s\n' "$MAC" "$IP" >> "$TMP"
+  done < "$RATE_FILE"
+  mv -f "$TMP" "$RATE_IPS_FILE" 2>/dev/null
+  chmod 0600 "$RATE_IPS_FILE" 2>/dev/null
+  if [ "$IDX" -gt 10 ]; then
+    echo "$(date) rate: 已应用客户端限速规则" >> "$LOG"
+  fi
+}
+
+# 清除接口上全部限速规则
+clear_rate_limits_all() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  TC=$(find_tc)
+  [ -z "$TC" ] && return 0
+  "$TC" qdisc del dev "$iface" root 2>/dev/null
+}
+
+# ---------- 客户端流量按 MAC 持久化（v1.5.2） ----------
+# mifi_stats 链按 IP 计数，设备重拿 IP 会导致历史计数丢失/错配。
+# 每 tick 把链计数增量累加到 client_usage（MAC|rx|tx），并记录链快照（IP|rx|tx），
+# 页面展示以 MAC 为维度的累计值（设备离线/换 IP 后累计仍保留）。
+CLIENT_USAGE_FILE="$DATA_DIR/client_usage"
+CLIENT_SNAP_FILE="$DATA_DIR/client_usage_snap"
+
+persist_client_usage() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  MAP=$(read_all_stats)
+  [ -z "$MAP" ] && return 0
+  CLIENT_MACS=$(list_clients "$iface")
+  SNAP_TMP="$CLIENT_SNAP_FILE.tmp.$$"
+  USAGE_TMP="$CLIENT_USAGE_FILE.tmp.$$"
+  : > "$SNAP_TMP"
+  if [ -f "$CLIENT_USAGE_FILE" ]; then
+    cp -f "$CLIENT_USAGE_FILE" "$USAGE_TMP" 2>/dev/null || : > "$USAGE_TMP"
+  else
+    : > "$USAGE_TMP"
+  fi
+  OLD_SNAP=$("$BB" cat "$CLIENT_SNAP_FILE" 2>/dev/null)
+  printf '%s\n' "$MAP" | while IFS=' ' read -r IP RX TX; do
+    case "$IP" in ''|*[!0-9.]*) continue ;; esac
+    case "$RX" in ''|*[!0-9]*) RX=0 ;; esac
+    case "$TX" in ''|*[!0-9]*) TX=0 ;; esac
+    MAC=$(printf '%s\n' "$CLIENT_MACS" | "$BB" awk -F'|' -v ip="$IP" '$1==ip{print $2; exit}')
+    [ -z "$MAC" ] && continue
+    ORX=0; OTX=0
+    if [ -n "$OLD_SNAP" ]; then
+      OLDLINE=$(printf '%s\n' "$OLD_SNAP" | "$BB" grep "^$IP|" | "$BB" head -n 1)
+      ORX=$(printf '%s\n' "$OLDLINE" | "$BB" cut -d'|' -f2)
+      OTX=$(printf '%s\n' "$OLDLINE" | "$BB" cut -d'|' -f3)
+      case "$ORX" in ''|*[!0-9]*) ORX=0 ;; esac
+      case "$OTX" in ''|*[!0-9]*) OTX=0 ;; esac
+    fi
+    DRX=$((RX - ORX)); [ "$DRX" -lt 0 ] && DRX=0
+    DTX=$((TX - OTX)); [ "$DTX" -lt 0 ] && DTX=0
+    if [ "$DRX" -gt 0 ] || [ "$DTX" -gt 0 ]; then
+      URX=0; UTX=0
+      OLD=$(grep "^$MAC|" "$USAGE_TMP" 2>/dev/null | head -n 1)
+      URX=$(printf '%s\n' "$OLD" | cut -d'|' -f2)
+      UTX=$(printf '%s\n' "$OLD" | cut -d'|' -f3)
+      case "$URX" in ''|*[!0-9]*) URX=0 ;; esac
+      case "$UTX" in ''|*[!0-9]*) UTX=0 ;; esac
+      URX=$((URX + DRX)); UTX=$((UTX + DTX))
+      TMP2="$USAGE_TMP.2"
+      grep -v "^$MAC|" "$USAGE_TMP" 2>/dev/null > "$TMP2" || true
+      printf '%s|%s|%s\n' "$MAC" "$URX" "$UTX" >> "$TMP2"
+      mv -f "$TMP2" "$USAGE_TMP"
+    fi
+    printf '%s|%s|%s\n' "$IP" "$RX" "$TX" >> "$SNAP_TMP"
+  done
+  mv -f "$SNAP_TMP" "$CLIENT_SNAP_FILE" 2>/dev/null
+  chmod 0600 "$CLIENT_SNAP_FILE" 2>/dev/null
+  mv -f "$USAGE_TMP" "$CLIENT_USAGE_FILE" 2>/dev/null
+  chmod 0600 "$CLIENT_USAGE_FILE" 2>/dev/null
+}
+
+# 读取某 MAC 的持久化累计（rx tx 空格分隔，无则空）
+get_client_usage() {
+  mac=$1
+  "$BB" grep "^$mac|" "$CLIENT_USAGE_FILE" 2>/dev/null | "$BB" head -n 1 | "$BB" cut -d'|' -f2,3
+}
+
+# ---------- 设备备注与历史设备 ----------
+# 备注文件: device_notes，每行 MAC|备注（备注可为空=清除）
+DEVICE_NOTES="$DATA_DIR/device_notes"
+
+get_device_note() {
+  mac=$1
+  "$BB" grep "^$mac|" "$DEVICE_NOTES" 2>/dev/null | "$BB" head -n 1 | "$BB" cut -d'|' -f2-
+}
+
+set_device_note() {
+  mac=$1
+  note=$2
+  TMP="$DEVICE_NOTES.tmp.$$"
+  if [ -f "$DEVICE_NOTES" ]; then
+    "$BB" grep -v "^$mac|" "$DEVICE_NOTES" 2>/dev/null > "$TMP" || true
+  else
+    : > "$TMP"
+  fi
+  if [ -n "$note" ]; then
+    printf '%s|%s\n' "$mac" "$note" >> "$TMP"
+  fi
+  mv -f "$TMP" "$DEVICE_NOTES" 2>/dev/null
+  chmod 0600 "$DEVICE_NOTES" 2>/dev/null
+}
+# ================= v1.3.8 新增 =================
+
+
+# 一次性迁移：清理 v1.5.2 及更早版本创建的无 comment 80 端口规则（只执行一次，升级后首次运行）。
+# 精确匹配本模块旧规则形态（192.168.43.1 + tcp dpt:80 + REDIRECT），不误删其他模块。
+migrate_port80_once() {
+  [ "${PORT80_MIGRATED:-0}" = "1" ] && return 0
+  for CHAIN in PREROUTING OUTPUT; do
+    while :; do
+      N=$($IPT -t nat -L "$CHAIN" --line-numbers -n 2>/dev/null | \
+          "$BB" grep '192.168.43.1.*tcp dpt:80' | "$BB" grep -v 'xiaomi14_mifi_web' | \
+          "$BB" grep 'REDIRECT' | "$BB" head -n1 | "$BB" awk '{print $1}')
+      [ -z "$N" ] && break
+      $IPT -t nat -D "$CHAIN" "$N" 2>/dev/null
+    done
+  done
+  # 写入迁移标记（config 不存在则创建）
+  if [ -f "$CONFIG" ]; then
+    "$BB" grep -v '^PORT80_MIGRATED=' "$CONFIG" > "$CONFIG.tmp.$$" 2>/dev/null
+    printf 'PORT80_MIGRATED=1\n' >> "$CONFIG.tmp.$$" 2>/dev/null
+    mv -f "$CONFIG.tmp.$$" "$CONFIG" 2>/dev/null
+  else
+    printf 'PORT80_MIGRATED=1\n' > "$CONFIG" 2>/dev/null
+  fi
+  chmod 0600 "$CONFIG" 2>/dev/null
+  PORT80_MIGRATED=1
+}
+
+
+# ================= v1.5.6 一次性迁移：清理已删除功能 =================
+# 网页终端 / DDNSTO 远程控制 / 普通 Wi‑Fi 开关 / 80 端口转发 / 本机 IP 列表 /
+# 配置预设 / 热点启停通知 / 二维码 已从模块移除。
+# 升级后首次运行清理旧版遗留（目录、进程、状态文件、配置字段），仅执行一次。
+migrate_removed_once() {
+  [ "${MIGRATE_REMOVED:-0}" = "1" ] && return 0
+  # 1. DDNSTO 二进制目录与残留进程
+  # 旧版 DDNSTO 目录固定位于数据目录下（v1.5.5 及更早版本）
+  [ -d "$DATA_DIR/ddnsto" ] && rm -rf "$DATA_DIR/ddnsto" 2>/dev/null
+  # P1-66：只清理模块自身启动的 DDNSTO 进程（cmdline 含模块数据目录），不做全局 pkill，避免误杀独立安装
+  for DP in /proc/[0-9]*; do
+    CMDL=$("$BB" tr '\000' ' ' < "$DP/cmdline" 2>/dev/null)
+    case "$CMDL" in *"$DATA_DIR/ddnsto"*) kill "${DP#/proc/}" 2>/dev/null ;; esac
+  done
+  # 2. 网页终端工作目录文件
+  [ -f "$DATA_DIR/term_cwd" ] && rm -f "$DATA_DIR/term_cwd" 2>/dev/null
+  # 3. 热点启停通知状态文件
+  [ -f "$DATA_DIR/ap_state" ] && rm -f "$DATA_DIR/ap_state" 2>/dev/null
+  # 4. 清理配置中的已删字段（保留 PORT80_MIGRATED 内部迁移标记）
+  if [ -f "$CONFIG" ]; then
+    "$BB" grep -vE '^(PORT80|NOTIFY_HOTSPOT|DDNSTO_TOKEN_B64|DDNSTO_BOOT)=' "$CONFIG" > "$CONFIG.tmp.$$" 2>/dev/null
+    printf 'MIGRATE_REMOVED=1\n' >> "$CONFIG.tmp.$$" 2>/dev/null
+    mv -f "$CONFIG.tmp.$$" "$CONFIG" 2>/dev/null
+  else
+    printf 'MIGRATE_REMOVED=1\n' > "$CONFIG" 2>/dev/null
+  fi
+  chmod 0600 "$CONFIG" 2>/dev/null
+  MIGRATE_REMOVED=1
+}
+
+
+# ================= v1.4.0 新增 =================
+
+# ---------- 消息转发（PushPlus / 钉钉群机器人） ----------
+# PushPlus: https://www.pushplus.plus/ 用 token 推送消息到微信（关注公众号后接收）
+# 钉钉: 群机器人 webhook；支持「加签」安全模式（纯 shell HMAC-SHA256，设备无 openssl 也可用），
+#       也可选「自定义关键词」（消息含“热点”即命中）或「IP 白名单」。
+# 配置经 base64url 存 config（避免 & = 等字符破坏 shell source）。
+# 发送 PushPlus（$1=标题 $2=内容）；返回 0=成功 1=失败 2=未配置
+# 通知渠道健康记录：每行 channel|last_send|last_ok|err|fails
+#   channel=pp/dt/sms；last_send/last_ok 为 epoch 秒（0=无）；err=最近失败原因；fails=连续失败次数
+health_note() {
+  CH=$1; RES=$2; ERR=$3
+  NOW=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  # P2-63：错误内容里的 | 会破坏“|”分隔的健康文件字段，清洗为 _
+  ERR=$(printf '%s' "$ERR" 2>/dev/null | "$BB" tr '|\r\n' '___')
+  # P1-56：并发写保护（mkdir 原子锁），避免多 worker 同时改写健康文件互相覆盖
+  lock_acquire "$NOTIFY_HEALTH_LOCK" || return 0
+  OLD=$("$BB" grep "^$CH|" "$NOTIFY_HEALTH_FILE" 2>/dev/null | "$BB" head -n 1)
+  LAST_OK=$(printf '%s' "$OLD" | "$BB" cut -d'|' -f3)
+  FAILS=$(printf '%s' "$OLD" | "$BB" cut -d'|' -f5)
+  case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
+  case "$LAST_OK" in ''|*[!0-9]*) LAST_OK=0 ;; esac
+  if [ "$RES" = "0" ]; then
+    FAILS=0; LAST_OK=$NOW; ERR=
+  else
+    FAILS=$((FAILS + 1))
+  fi
+  TMP="$NOTIFY_HEALTH_FILE.tmp.$$"
+  "$BB" grep -v "^$CH|" "$NOTIFY_HEALTH_FILE" 2>/dev/null > "$TMP" || true
+  printf '%s|%s|%s|%s|%s\n' "$CH" "$NOW" "$LAST_OK" "$ERR" "$FAILS" >> "$TMP"
+  mv -f "$TMP" "$NOTIFY_HEALTH_FILE" 2>/dev/null
+  chmod 0600 "$NOTIFY_HEALTH_FILE" 2>/dev/null
+  lock_release "$NOTIFY_HEALTH_LOCK"
+}
+
+# 读取渠道健康：输出 last_send|last_ok|err|fails
+read_health() {
+  "$BB" grep "^$1|" "$NOTIFY_HEALTH_FILE" 2>/dev/null | "$BB" head -n 1 | "$BB" cut -d'|' -f2-
+}
+
+send_pushplus() {
+  PUSHPLUS_LAST_ERR=
+  [ -n "${PUSHPLUS_TOKEN:-}" ] || return 2
+  TITLE_ESC=$(json_escape "$1")
+  CONTENT_ESC=$(json_escape_nl "$2")
+  ERR_TMP="$DATA_DIR/.pp_err.$$"
+  R=$(/system/bin/curl -sS -m 8 -X POST https://www.pushplus.plus/send \
+      -H "Content-Type: application/json" \
+      -d "{\"token\":\"${PUSHPLUS_TOKEN}\",\"title\":\"$TITLE_ESC\",\"content\":\"$CONTENT_ESC\"}" 2>"$ERR_TMP")
+  RC=$?
+  CURL_ERR=$("$BB" cat "$ERR_TMP" 2>/dev/null | "$BB" head -c 200)
+  rm -f "$ERR_TMP"
+  if [ "$RC" -ne 0 ]; then
+    PUSHPLUS_LAST_ERR="curl 错误($RC)${CURL_ERR:+: $CURL_ERR}"
+    echo "$(date) pushplus curl failed rc=$RC ${CURL_ERR:+err=$CURL_ERR}" >> "$LOG"
+    health_note pp 1 "$PUSHPLUS_LAST_ERR"
+    return 1
+  fi
+  if printf '%s' "$R" | "$BB" grep -q '"code":200'; then
+    echo "$(date) pushplus ok" >> "$LOG"
+    health_note pp 0 ''
+    return 0
+  fi
+  PERR=$(printf '%s' "$R" | "$BB" head -c 200)
+  PUSHPLUS_LAST_ERR="PushPlus 返回: $PERR"
+  echo "$(date) pushplus err: $PERR" >> "$LOG"
+  health_note pp 1 "$PUSHPLUS_LAST_ERR"
+  return 1
+}
+
+# 钉钉加签：sign = base64( HMAC-SHA256(key=secret, msg=timestamp+"\n"+secret) )。
+# 设备无 openssl，按 RFC2104 展开式纯 shell 实现：K>64 字节先哈希，K⊕ipad/opad，消息为空串。
+dingtalk_sign() {
+  ts=$1
+  secret=$2
+  case "$secret" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+  TMPD="$DATA_DIR/.sig.$$"
+  mkdir -p "$TMPD" 2>/dev/null || return 1
+  # K = secret（≤64 字节直接用，>64 先 SHA-256 压缩）
+  printf '%s' "$secret" > "$TMPD/K.txt"
+  KLEN=${#secret}
+  if [ "$KLEN" -gt 64 ]; then
+    "$BB" sha256sum "$TMPD/K.txt" | "$BB" cut -d' ' -f1 | "$BB" xxd -r -p > "$TMPD/K.bin"
+    KBLEN=32
+  else
+    "$BB" cat "$TMPD/K.txt" > "$TMPD/K.bin"
+    KBLEN=$KLEN
+  fi
+  KBS=$("$BB" od -An -tu1 "$TMPD/K.bin" 2>/dev/null | "$BB" tr -s ' \n' ' ')
+  : > "$TMPD/ipad"
+  : > "$TMPD/opad"
+  N=0
+  for B in $KBS; do
+    [ "$N" -ge "$KBLEN" ] && break
+    case "$B" in ''|*[!0-9]*) continue ;; esac
+    PI=$((B ^ 0x36))
+    PO=$((B ^ 0x5c))
+    printf "\\$(printf '%03o' "$PI")" >> "$TMPD/ipad"
+    printf "\\$(printf '%03o' "$PO")" >> "$TMPD/opad"
+    N=$((N + 1))
+  done
+  PAD=$((64 - KBLEN))
+  J=0
+  while [ "$J" -lt "$PAD" ]; do
+    printf '\066' >> "$TMPD/ipad"
+    printf '\134' >> "$TMPD/opad"
+    J=$((J + 1))
+  done
+  # msg = timestamp + "\n" + secret
+  printf '%s\n%s' "$ts" "$secret" > "$TMPD/M.txt"
+  # inner = SHA256( ipad || msg )
+  { "$BB" cat "$TMPD/ipad"; "$BB" cat "$TMPD/M.txt"; } > "$TMPD/inner_in"
+  IH=$("$BB" sha256sum "$TMPD/inner_in" | "$BB" cut -d' ' -f1)
+  printf '%s' "$IH" | "$BB" xxd -r -p > "$TMPD/inner"
+  # outer = SHA256( opad || inner )
+  { "$BB" cat "$TMPD/opad"; "$BB" cat "$TMPD/inner"; } > "$TMPD/outer"
+  OH=$("$BB" sha256sum "$TMPD/outer" | "$BB" cut -d' ' -f1)
+  printf '%s' "$OH" | "$BB" xxd -r -p | "$BB" base64 | "$BB" tr -d '\r\n'
+  rm -rf "$TMPD"
+}
+
+# 发送钉钉群机器人（$1=内容）；返回 0=成功 1=失败 2=未配置。
+# 失败时把 curl/DNS/钉钉 errmsg 写入日志并记录到 DINGTALK_LAST_ERR（供测试接口展示）。
+send_dingtalk() {
+  DINGTALK_LAST_ERR=
+  [ -n "${DINGTALK_WEBHOOK:-}" ] || return 2
+  CONTENT_ESC=$(json_escape_nl "$1")
+  URL="$DINGTALK_WEBHOOK"
+  if [ -n "${DINGTALK_SECRET:-}" ]; then
+    TS=$(/system/bin/date +%s 2>/dev/null || date +%s)000
+    SIGN=$(dingtalk_sign "$TS" "$DINGTALK_SECRET")
+    if [ -z "$SIGN" ]; then
+      DINGTALK_LAST_ERR='签名计算失败（加签密钥可能无效）'
+      echo "$(date) dingtalk: sign empty (invalid secret)" >> "$LOG"
+      return 1
+    fi
+    SIGN_ENC=$(printf '%s' "$SIGN" | "$BB" sed 's/+/%2B/g; s#/#%2F#g; s/=/ %3D/g' | "$BB" tr -d ' ')
+    case "$URL" in *\?*) URL="$URL&timestamp=$TS&sign=$SIGN_ENC" ;; *) URL="$URL?timestamp=$TS&sign=$SIGN_ENC" ;; esac
+  fi
+  ERR_TMP="$DATA_DIR/.dt_err.$$"
+  R=$(/system/bin/curl -sS -m 8 -X POST "$URL" \
+      -H "Content-Type: application/json" \
+      -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"$CONTENT_ESC\"}}" 2>"$ERR_TMP")
+  RC=$?
+  CURL_ERR=$("$BB" cat "$ERR_TMP" 2>/dev/null | "$BB" head -c 200)
+  rm -f "$ERR_TMP"
+  if [ "$RC" -ne 0 ]; then
+    DINGTALK_LAST_ERR="curl 错误($RC)${CURL_ERR:+: $CURL_ERR}"
+    echo "$(date) dingtalk curl failed rc=$RC ${CURL_ERR:+err=$CURL_ERR}" >> "$LOG"
+    health_note dt 1 "$DINGTALK_LAST_ERR"
+    return 1
+  fi
+  if printf '%s' "$R" | "$BB" grep -q '"errcode":0'; then
+    echo "$(date) dingtalk ok" >> "$LOG"
+    health_note dt 0 ''
+    return 0
+  fi
+  DERR=$(printf '%s' "$R" | "$BB" sed -n 's/.*"errcode":\([0-9]*\).*"errmsg":"\([^"]*\)".*/\1 \2/p' | "$BB" head -c 200)
+  [ -n "$DERR" ] || DERR=$(printf '%s' "$R" | "$BB" head -c 200)
+  DINGTALK_LAST_ERR="钉钉返回: $DERR"
+  echo "$(date) dingtalk err: $DERR" >> "$LOG"
+  health_note dt 1 "$DINGTALK_LAST_ERR"
+  return 1
+}
+
+# 向所有已配置渠道推送（$1=标题 $2=内容，内容可含真实换行）
+# 返回 0=至少一个渠道成功；1=全部失败（未配置渠道按失败计，但调用方应先判断已配置）
+notify_all() {
+  send_pushplus "$1" "$2"
+  RC1=$?
+  # 钉钉机器人若设置自定义关键词（如"热点"），关键词必须在正文中出现：
+  # 把标题并入正文（【标题】 内容），确保自动通知可命中关键词
+  send_dingtalk "【$1】 $2"
+  RC2=$?
+  [ "$RC1" = "0" ] || [ "$RC2" = "0" ]
+}
+
+# 通知队列（目录式，一消息一文件）：事件先入队，后台 worker 顺序发送，主守护循环不被 curl 阻塞。
+# 并发安全：入队=创建独立文件；消费=mkdir 原子锁 + 先删后发。worker 持锁期间按 PID 存活判定，
+# 不再受"30 秒超时"限制（一条通知最长约 16 秒，队列长时也不会被误判失效而并发运行）。
+NOTIFY_QUEUE="$DATA_DIR/notify.queue"          # 新版为目录；旧版遗留文本文件由 migrate 迁移
+NOTIFY_LOCK_DIR="$DATA_DIR/notify.lock"
+NOTIFY_BUSY="$DATA_DIR/notify.busy"            # 旧版遗留（迁移时清理）
+NOTIFY_HEALTH_LOCK="$DATA_DIR/health.lock"     # 通知健康文件并发写锁（P1-56）
+
+# mkdir 原子锁：返回 0=拿到锁；锁内 info 写 "PID 时间"。
+# 锁存在时检查持有者 PID：进程仍存活视为有效锁（无论持锁多久）；PID 已死则回收。
+self_pid() {
+  # 子 Shell 中 $$ 仍是父 PID；/proc/self/stat 才是当前真实 PID
+  "$BB" awk '{print $1}' /proc/self/stat 2>/dev/null
+}
+
+lock_acquire() {
+  lockdir=$1
+  SPID=$(self_pid)
+  case "$SPID" in ''|*[!0-9]*) SPID=$$ ;; esac
+  if mkdir "$lockdir" 2>/dev/null; then
+    printf '%s %s\n' "$SPID" "$($DATE_CMD +%s 2>/dev/null || date +%s)" > "$lockdir/info" 2>/dev/null
+    return 0
+  fi
+  LPID=$("$BB" cut -d' ' -f1 "$lockdir/info" 2>/dev/null)
+  case "$LPID" in ''|*[!0-9]*) LPID=0 ;; esac
+  if [ "$LPID" -gt 0 ] && ! kill -0 "$LPID" 2>/dev/null; then
+    rm -rf "$lockdir" 2>/dev/null
+    if mkdir "$lockdir" 2>/dev/null; then
+      printf '%s %s\n' "$SPID" "$($DATE_CMD +%s 2>/dev/null || date +%s)" > "$lockdir/info" 2>/dev/null
+      return 0
+    fi
+  fi
+  return 1
+}
+
+lock_release() {
+  rm -rf "$1" 2>/dev/null
+}
+
+notify_next_seq() {
+  SEQ_FILE="$DATA_DIR/notify.seq"
+  # P1-55：读改写必须原子（mkdir 锁），否则并发入队可能取到相同序号导致文件互相覆盖
+  if ! lock_acquire "$DATA_DIR/notify.seq.lock"; then
+    # 锁异常兜底：时间戳+真实PID 保证唯一（不保证递增但保证不覆盖）
+    printf '%s%s%s' "$($DATE_CMD +%s 2>/dev/null || date +%s)" "$$" "$("$BB" awk '{print $1}' /proc/self/stat 2>/dev/null)" | "$BB" tr -d ' '
+    return 0
+  fi
+  SEQ=$("$BB" cat "$SEQ_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  case "$SEQ" in ''|*[!0-9]*) SEQ=0 ;; esac
+  SEQ=$((SEQ + 1))
+  printf '%s\n' "$SEQ" > "$SEQ_FILE" 2>/dev/null
+  chmod 0600 "$SEQ_FILE" 2>/dev/null
+  lock_release "$DATA_DIR/notify.seq.lock"
+  printf '%s' "$SEQ"
+}
+
+notify_all_async() {
+  # 入队（标题/正文 base64url 编码，避免 | 与换行破坏行格式）
+  TB=$(printf '%s' "$1" | "$BB" base64 | "$BB" tr '+/' '-_' | "$BB" tr -d '=\n')
+  MB=$(printf '%s' "$2" | "$BB" base64 | "$BB" tr '+/' '-_' | "$BB" tr -d '=\n')
+  mkdir -p "$NOTIFY_QUEUE" 2>/dev/null
+  TS=$($DATE_CMD +%s 2>/dev/null || date +%s)
+  SPID=$(self_pid); case "$SPID" in ''|*[!0-9]*) SPID=$$ ;; esac
+  SEQ=$(notify_next_seq)
+  # 单文件入队：文件名含时间戳/真实PID/原子序号（不依赖 $RANDOM，同秒同进程多条不会覆盖）；
+  # 内容 6 字段：title|msg|pp_state|dt_state|retry|next_ts（渠道独立状态，供失败重试）
+  printf '%s|%s|pending|pending|0|0\n' "$TB" "$MB" > "$NOTIFY_QUEUE/$TS.$SPID.$SEQ.msg" 2>/dev/null
+  # 触发 worker：锁被占用则由现有 worker 继续消费，不会重复发送
+  drain_notify_queue >/dev/null 2>&1 &
+}
+
+# 通知 worker：按文件名时间戳顺序发送；渠道独立状态 + 失败退避重试（1/5/15 分钟，共 4 次）。
+# 消息格式 6 字段：title_b64|msg_b64|pp_state|dt_state|retry|next_ts
+#   pp_state/dt_state: pending=待发 done=成功 failed=最终失败；retry=已重试次数；next_ts=下次尝试时间戳
+pick_due_file() {
+  for f in $("$BB" ls -1 "$NOTIFY_QUEUE" 2>/dev/null | "$BB" sort -n); do
+    NX=$("$BB" cut -d'|' -f6 "$NOTIFY_QUEUE/$f" 2>/dev/null)
+    case "$NX" in ''|*[!0-9]*) NX=0 ;; esac
+    NOW=$($DATE_CMD +%s 2>/dev/null || date +%s)
+    if [ "$NX" -le "$NOW" ]; then printf '%s\n' "$f"; return 0; fi
+  done
+  return 1
+}
+
+drain_notify_queue() {
+  lock_acquire "$NOTIFY_LOCK_DIR" || return 0
+  while :; do
+    # P1-52 修复：按到期时间选取第一个可处理文件；未到期文件不阻塞队列，避免队头死循环
+    # （函数形式：macOS bash3.2 不支持 $(...) 内直接写 case）
+    FIRST=$(pick_due_file)
+    [ -z "$FIRST" ] && break
+    FILE="$NOTIFY_QUEUE/$FIRST"
+    # 兼容旧 2 字段格式（升级迁移前残留）：补渠道状态字段
+    NF=$("$BB" awk -F'|' '{print NF}' "$FILE" 2>/dev/null)
+    case "$NF" in 6) : ;; *) printf '%s|pending|pending|0|0\n' "$($BB cat "$FILE" 2>/dev/null)" > "$FILE" 2>/dev/null ;; esac
+    TITLE_B=$("$BB" cut -d'|' -f1 "$FILE" 2>/dev/null)
+    MSG_B=$("$BB" cut -d'|' -f2 "$FILE" 2>/dev/null)
+    PP=$("$BB" cut -d'|' -f3 "$FILE" 2>/dev/null)
+    DT=$("$BB" cut -d'|' -f4 "$FILE" 2>/dev/null)
+    RETRY=$("$BB" cut -d'|' -f5 "$FILE" 2>/dev/null)
+    NEXT=$("$BB" cut -d'|' -f6 "$FILE" 2>/dev/null)
+    case "$PP" in pending|done|failed) ;; *) PP=pending ;; esac
+    case "$DT" in pending|done|failed) ;; *) DT=pending ;; esac
+    case "$RETRY" in ''|*[!0-9]*) RETRY=0 ;; esac
+    case "$NEXT" in ''|*[!0-9]*) NEXT=0 ;; esac
+    NOW=$($DATE_CMD +%s 2>/dev/null || date +%s)
+    # P1-52：不按队头阻塞——未到期跳过，继续处理队列中已到期的其他消息
+    [ "$NEXT" -gt "$NOW" ] && continue
+    [ -z "$TITLE_B" ] && [ -z "$MSG_B" ] && { rm -f "$FILE" 2>/dev/null; continue; }
+    TITLE=$(b64url_decode "$TITLE_B")
+    MSG=$(b64url_decode "$MSG_B")
+    CHANGED=0
+    if [ "$PP" = "pending" ] || [ "$PP" = "failed" ]; then
+      PP=pending
+      send_pushplus "$TITLE" "$MSG"; PRC=$?
+      if [ "$PRC" = "0" ]; then PP=done
+      elif [ "$PRC" = "2" ]; then PP=done   # 未配置渠道视为完成，不重试
+      else PP=failed; CHANGED=1; fi
+    fi
+    if [ "$DT" = "pending" ] || [ "$DT" = "failed" ]; then
+      DT=pending
+      send_dingtalk "【$TITLE】 $MSG"; DRC=$?
+      if [ "$DRC" = "0" ]; then DT=done
+      elif [ "$DRC" = "2" ]; then DT=done
+      else DT=failed; CHANGED=1; fi
+    fi
+    if [ "$CHANGED" = "1" ]; then
+      RETRY=$((RETRY + 1))
+      if [ "$RETRY" -le 3 ]; then
+        case "$RETRY" in 1) W=60 ;; 2) W=300 ;; 3) W=900 ;; esac
+        NEXT=$((NOW + W))
+        printf '%s|%s|%s|%s|%s|%s\n' "$TITLE_B" "$MSG_B" "$PP" "$DT" "$RETRY" "$NEXT" > "$FILE" 2>/dev/null
+        echo "$(date) notify: 部分渠道失败，${RETRY} 次后 ${W}s 重试（pp=$PP dt=$DT title=$TITLE）" >> "$LOG"
+        continue
+      fi
+      echo "$(date) notify: 已达最大重试次数，丢弃（pp=$PP dt=$DT title=$TITLE）" >> "$LOG"
+      rm -f "$FILE" 2>/dev/null
+      continue
+    fi
+    rm -f "$FILE" 2>/dev/null
+  done
+  lock_release "$NOTIFY_LOCK_DIR"
+}
+
+# 兼容旧版文本文件队列（v1.5.4 及之前）：模块升级启动时一次性迁移到目录式队列。
+# 先用临时目录接收旧行，成功后再原子替换，避免"先建目录导致旧文件读不到"的顺序问题。
+migrate_legacy_queues() {
+  # 通知队列旧文件 notify.queue（每行 ts|title_b64|msg_b64）→ 目录单文件（内容 title|msg）
+  if [ -f "$NOTIFY_QUEUE" ] && [ ! -d "$NOTIFY_QUEUE" ]; then
+    TMPD="$NOTIFY_QUEUE.new.$$"
+    rm -rf "$TMPD" 2>/dev/null
+    mkdir -p "$TMPD" 2>/dev/null
+    N=0
+    while IFS= read -r LINE; do
+      [ -z "$LINE" ] && continue
+      N=$((N + 1))
+      TS=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f1)
+      REST=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f2-)
+      case "$TS" in ''|*[!0-9]*) TS=$($DATE_CMD +%s 2>/dev/null || date +%s) ;; esac
+      printf '%s|pending|pending|0|0\n' "$REST" > "$TMPD/$TS.mig.$N.$RANDOM.msg" 2>/dev/null
+    done < "$NOTIFY_QUEUE" 2>/dev/null
+    rm -f "$NOTIFY_QUEUE" 2>/dev/null
+    mv -f "$TMPD" "$NOTIFY_QUEUE" 2>/dev/null
+  fi
+  # 短信队列旧文件 sms.queue（每行 id|retry|next）→ 目录单文件 id.msg（内容 retry|next）
+  if [ -f "$SMS_QUEUE" ] && [ ! -d "$SMS_QUEUE" ]; then
+    TMPD="$SMS_QUEUE.new.$$"
+    rm -rf "$TMPD" 2>/dev/null
+    mkdir -p "$TMPD" 2>/dev/null
+    while IFS= read -r LINE; do
+      [ -z "$LINE" ] && continue
+      ID=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f1)
+      REST=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f2-)
+      case "$ID" in ''|*[!0-9]*) continue ;; esac
+      printf '%s\n' "$REST" > "$TMPD/$ID.msg" 2>/dev/null
+    done < "$SMS_QUEUE" 2>/dev/null
+    rm -f "$SMS_QUEUE" 2>/dev/null
+    mv -f "$TMPD" "$SMS_QUEUE" 2>/dev/null
+  fi
+  # 清理旧版锁与 busy 文件
+  rm -f "$NOTIFY_BUSY" "$SMS_BUSY" 2>/dev/null
+  rm -rf "$NOTIFY_LOCK" 2>/dev/null
+}
+
+
+# ================= v1.5.0 新增 =================
+
+# ---------- 短信转发（验证码/通知短信 → PushPlus/钉钉） ----------
+# 依赖 Android content 命令查询短信 provider（root 下可用，无需 sqlite3）。
+# 配置: SMS_FWD=1 开启; SMS_FWD_KEYWORD_B64 为空=全部，否则仅含该关键词的短信转发;
+#       SMS_FWD_SENDERS_B64 为空=全部，否则仅白名单号码（逗号分隔，base64url）。
+SMS_LAST_FILE="$DATA_DIR/sms_last_id"
+SMS_QUEUE="$DATA_DIR/sms.queue"               # 新版为目录；旧版遗留文本文件由 migrate 迁移
+SMS_LOCK_DIR="$DATA_DIR/sms.lock"             # 短信 worker 并发锁（mkdir 原子）
+SMS_SCAN_LOCK="$DATA_DIR/sms_scan.lock"       # 短信扫描锁（原 notify.lock 改名，避免与通知锁混淆）
+NOTIFY_LOCK="$DATA_DIR/notify.lock"           # 旧版遗留路径（migrate 清理用）
+TRAFFIC_DAILY="$DATA_DIR/traffic_daily"
+TRAFFIC_BASE="$DATA_DIR/traffic_base"
+DATE_CMD=${DATE_CMD:-/system/bin/date}
+CONTENT_CMD=${CONTENT_CMD:-/system/bin/content}
+
+# 查询新短信（_id > $1 的收件短信），输出每行 id|address|body|date
+# 注意: content query 输出为 "Row: N _id=.., address=.., body=.., date=.."，
+# body 中若出现 ", date=" 会截断（概率极低，可接受）。
+query_new_sms() {
+  LAST=$1
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  $CONTENT_CMD query --uri content://sms --projection _id:address:date:body --where "_id>$LAST AND type=1" 2>/dev/null | while IFS= read -r LINE; do
+    ID=$(printf '%s\n' "$LINE" | "$BB" sed -n 's/^Row: [0-9]* _id=\([0-9]*\).*/\1/p')
+    ADDR=$(printf '%s\n' "$LINE" | "$BB" sed -n 's/^Row: [0-9]* _id=[0-9]*, address=\([^,]*\),.*/\1/p')
+    DATE=$(printf '%s\n' "$LINE" | "$BB" sed -n 's/^Row: [0-9]* _id=[0-9]*, address=[^,]*, date=\([0-9]*\),.*/\1/p')
+    # P1-60：body 放投影最后一位，取“body= 到行尾”，正文中的 ", date=" 不再截断
+    BODY=$(printf '%s\n' "$LINE" | "$BB" sed -n 's/^Row: [0-9]* _id=[0-9]*, address=[^,]*, date=[0-9]*, body=\(.*\)$/\1/p')
+    case "$ID" in ''|*[!0-9]*) continue ;; esac
+    # 顺序: id|address|date|body，body 放最后；body 自身含 | 不影响前三个字段解析
+    printf '%s|%s|%s|%s\n' "$ID" "$ADDR" "$DATE" "$BODY"
+  done
+}
+
+# 短信转发轮询（service 每 15s tick 调用一次）
+check_sms_forward() {
+  [ "${SMS_FWD:-0}" = "1" ] || return 0
+  [ -n "${PUSHPLUS_TOKEN:-}${DINGTALK_WEBHOOK:-}" ] || return 0
+  # 扫描并发锁（mkdir 原子 + PID 存活判定）：上一轮扫描仍持有锁则跳过本 tick
+  lock_acquire "$SMS_SCAN_LOCK" || return 0
+  # 首次启用：只记录当前最大 _id 为起点，不转发历史短信
+  if [ ! -f "$SMS_LAST_FILE" ]; then
+    MAXID=$(query_new_sms 0 | "$BB" cut -d'|' -f1 | "$BB" sort -n | "$BB" tail -n 1 | "$BB" tr -d ' ')
+    case "$MAXID" in ''|*[!0-9]*) MAXID=0 ;; esac
+    printf '%s\n' "$MAXID" > "$SMS_LAST_FILE" 2>/dev/null
+    chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+    lock_release "$SMS_SCAN_LOCK"
+    return 0
+  fi
+  LAST=$(cat "$SMS_LAST_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  # 按 _id 升序处理，保证游标单调推进、失败不跨过
+  NEW=$(query_new_sms "$LAST" | "$BB" sort -n -t'|' -k1,1)
+  if [ -z "$NEW" ]; then
+    lock_release "$SMS_SCAN_LOCK"
+    return 0
+  fi
+  printf '%s\n' "$NEW" | while IFS= read -r LINE; do
+    ID=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f1)
+    ADDR=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f2)
+    DATE=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f3)
+    BODY=$(printf '%s\n' "$LINE" | "$BB" sed 's/^[^|]*|[^|]*|[^|]*|//')
+    case "$ID" in ''|*[!0-9]*) continue ;; esac
+    [ "$ID" -le "$LAST" ] && continue
+    # 关键词过滤（固定字符串匹配，避免正则元字符误匹配）
+    if [ -n "${SMS_FWD_KEYWORD:-}" ]; then
+      if ! printf '%s' "$BODY" | "$BB" grep -Fq "$SMS_FWD_KEYWORD"; then
+        # 被过滤：推进游标（不转发也不重复扫描），继续下一条
+        printf '%s\n' "$ID" > "$SMS_LAST_FILE" 2>/dev/null
+        chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+        LAST=$ID
+        continue
+      fi
+    fi
+    # 发件人白名单过滤（逗号分隔，留空=全部）
+    if [ -n "${SMS_FWD_SENDERS:-}" ]; then
+      HIT=0
+      OLDIFS=$IFS; IFS=','
+      for S in $SMS_FWD_SENDERS; do
+        # P1-59：逐项去空白，'10086, 95533' 中第二个号码带空格也能匹配
+        S=$(printf '%s' "$S" | "$BB" tr -d ' \t')
+        [ -n "$S" ] && [ "$S" = "$ADDR" ] && HIT=1
+      done
+      IFS=$OLDIFS
+      if [ "$HIT" != "1" ]; then
+        # 白名单外：推进游标，继续
+        printf '%s\n' "$ID" > "$SMS_LAST_FILE" 2>/dev/null
+        chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+        LAST=$ID
+        continue
+      fi
+    fi
+    # 匹配短信：检测阶段推进游标（避免每轮重复扫描），实际推送交给短信队列 worker。
+    # 若已在队列（上次失败待重试）则不重复入队；单文件入队（内容 retry|next），并发安全。
+    if [ ! -e "$SMS_QUEUE/$ID.msg" ]; then
+      mkdir -p "$SMS_QUEUE" 2>/dev/null
+      printf '0|0\n' > "$SMS_QUEUE/$ID.msg" 2>/dev/null
+    fi
+    printf '%s\n' "$ID" > "$SMS_LAST_FILE" 2>/dev/null
+    chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+    LAST=$ID
+  done
+  lock_release "$SMS_SCAN_LOCK"
+  # 触发短信 worker（锁被占用时由现有 worker 继续；空队列 worker 立即退出）
+  sms_notify_worker >/dev/null 2>&1 &
+}
+
+# 短信 worker：目录式队列（每文件一条短信，文件名=短信ID，内容 retry|next）。
+# 按 ID 升序处理；失败按 1/5/15 分钟退避，共尝试 4 次后放弃（推进，避免堵住队列）。
+sms_notify_worker() {
+  lock_acquire "$SMS_LOCK_DIR" || return 0
+  while :; do
+    ALL=$("$BB" ls -1 "$SMS_QUEUE" 2>/dev/null | "$BB" sort -n)
+    [ -z "$ALL" ] && break
+    DONE_ANY=0
+    for FNAME in $ALL; do
+      FILE="$SMS_QUEUE/$FNAME"
+      [ -e "$FILE" ] || continue
+      SID=$(printf '%s' "$FNAME" | "$BB" sed 's/\.msg$//')
+      case "$SID" in ''|*[!0-9]*) rm -f "$FILE" 2>/dev/null; continue ;; esac
+      # 兼容旧 2 字段（retry|next）：补渠道状态字段
+      NF=$("$BB" awk -F'|' '{print NF}' "$FILE" 2>/dev/null)
+      case "$NF" in 4) : ;; *) printf '%s|pending|pending\n' "$("$BB" cat "$FILE" 2>/dev/null)" > "$FILE" 2>/dev/null ;; esac
+      SRETRY=$("$BB" cut -d'|' -f1 "$FILE" 2>/dev/null)
+      SNEXT=$("$BB" cut -d'|' -f2 "$FILE" 2>/dev/null)
+      SPP=$("$BB" cut -d'|' -f3 "$FILE" 2>/dev/null)
+      SDT=$("$BB" cut -d'|' -f4 "$FILE" 2>/dev/null)
+      case "$SRETRY" in ''|*[!0-9]*) SRETRY=0 ;; esac
+      case "$SNEXT" in ''|*[!0-9]*) SNEXT=0 ;; esac
+      case "$SPP" in pending|done|failed) ;; *) SPP=pending ;; esac
+      case "$SDT" in pending|done|failed) ;; *) SDT=pending ;; esac
+      NOW_S=$($DATE_CMD +%s 2>/dev/null || date +%s)
+      case "$NOW_S" in ''|*[!0-9]*) NOW_S=0 ;; esac
+      # P1-53：不按最小 ID 队头阻塞——未到期跳过，继续处理队列中已到期的其他短信
+      if [ "$SNEXT" -gt "$NOW_S" ] 2>/dev/null; then
+        continue
+      fi
+      # 从短信库按 ID 取内容（队列只存 ID，避免正文含 | 的转义问题）
+      LINE=$(query_new_sms "$((SID - 1))" | "$BB" grep "^$SID|" | "$BB" head -n1)
+      if [ -z "$LINE" ]; then
+        # 短信已被系统删除：直接推进
+        rm -f "$FILE" 2>/dev/null
+        continue
+      fi
+      ADDR=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f2)
+      DATE=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f3)
+      BODY=$(printf '%s\n' "$LINE" | "$BB" sed 's/^[^|]*|[^|]*|[^|]*|//')
+      DATE_TXT=
+      case "$DATE" in ''|*[!0-9]*) : ;; *)
+        DATE_TXT=$($DATE_CMD -d "@$((DATE / 1000))" '+%m-%d %H:%M' 2>/dev/null || $DATE_CMD '+%m-%d %H:%M')
+      ;; esac
+      # P1-54：双渠道独立发送与状态——PushPlus 成功、钉钉失败时钉钉单独重试，不整体删除任务
+      SCHANGED=0
+      if [ "$SPP" = "pending" ] || [ "$SPP" = "failed" ]; then
+        SPP=pending
+        send_pushplus "新短信" "来自: $ADDR
+内容: $BODY
+时间: $DATE_TXT"; SRC=$?
+        if [ "$SRC" = "0" ]; then SPP=done
+        elif [ "$SRC" = "2" ]; then SPP=done
+        else SPP=failed; SCHANGED=1; fi
+      fi
+      if [ "$SDT" = "pending" ] || [ "$SDT" = "failed" ]; then
+        SDT=pending
+        send_dingtalk "【新短信】 来自: $ADDR
+内容: $BODY
+时间: $DATE_TXT"; SRC2=$?
+        if [ "$SRC2" = "0" ]; then SDT=done
+        elif [ "$SRC2" = "2" ]; then SDT=done
+        else SDT=failed; SCHANGED=1; fi
+      fi
+      if [ "$SCHANGED" = "1" ]; then
+        SRETRY=$((SRETRY + 1))
+        if [ "$SRETRY" -ge 4 ]; then
+          echo "$(date) sms forward GIVEUP: $SID after $SRETRY tries (pp=$SPP dt=$SDT)" >> "$LOG"
+          health_note sms 1 "短信 $SID 多次推送失败已放弃"
+          rm -f "$FILE" 2>/dev/null
+          continue
+        fi
+        case "$SRETRY" in 1) D=60 ;; 2) D=300 ;; 3) D=900 ;; esac
+        NEXT=$((NOW_S + D))
+        echo "$(date) sms forward retry $SID in ${D}s (attempt $SRETRY/4, pp=$SPP dt=$SDT)" >> "$LOG"
+        printf '%s|%s|%s|%s\n' "$SRETRY" "$NEXT" "$SPP" "$SDT" > "$FILE.tmp.$$" 2>/dev/null && mv -f "$FILE.tmp.$$" "$FILE" 2>/dev/null
+        health_note sms 1 "待重试（第 $SRETRY 次）"
+        DONE_ANY=1
+        continue
+      fi
+      echo "$(date) sms forward ok: $SID" >> "$LOG"
+      health_note sms 0 ''
+      rm -f "$FILE" 2>/dev/null
+      DONE_ANY=1
+    done
+    [ "$DONE_ANY" = "1" ] || break
+  done
+  lock_release "$SMS_LOCK_DIR"
+}
+
+# 短信队列统计（status.cgi 展示）：SMS_QUEUED=待发送（retry=0），SMS_RETRYING=重试中（retry>0）
+count_sms_stats() {
+  SMS_QUEUED=0
+  SMS_RETRYING=0
+  for F in "$SMS_QUEUE"/*.msg; do
+    [ -e "$F" ] || continue
+    SRETRY=$("$BB" cut -d'|' -f1 "$F" 2>/dev/null)
+    case "$SRETRY" in ''|*[!0-9]*) SRETRY=0 ;; esac
+    if [ "$SRETRY" -gt 0 ]; then SMS_RETRYING=$((SMS_RETRYING + 1)); else SMS_QUEUED=$((SMS_QUEUED + 1)); fi
+  done
+}
+
+
+# ---------- 流量账期（v1.5.7） ----------
+# 账期起始日 DATA_PLAN_DAY（每月 N 日）；周期已用 = 从本账期起始日到今天的日归档求和 + 今日基准。
+# 返回 PLAN_PERIOD_BYTES / PLAN_PERIOD_DAY（起始日 YYYYMMDD）
+# 计算某月天数（纯 shell，兼容 GNU/toybox/macOS date）
+# $1=YYYYMM → 输出当月天数（28/29/30/31）
+last_day_of_month() {
+  YM=$1
+  case "$YM" in ''|*[!0-9]*) echo 31; return ;; esac
+  Y=$(printf '%s' "$YM" | "$BB" cut -c1-4)
+  M=$(printf '%s' "$YM" | "$BB" cut -c5-6 | "$BB" sed 's/^0//')
+  case "$M" in
+    01|1|03|3|05|5|07|7|08|8|10|12) echo 31 ;;
+    04|4|06|6|09|9|11) echo 30 ;;
+    02|2)
+      if [ $((Y % 4)) -ne 0 ]; then echo 28
+      elif [ $((Y % 100)) -ne 0 ]; then echo 29
+      elif [ $((Y % 400)) -ne 0 ]; then echo 28
+      else echo 29; fi
+      ;;
+    *) echo 31 ;;
+  esac
+}
+
+plan_period_bytes() {
+  PLAN_PERIOD_BYTES=0
+  PLAN_PERIOD_DAY=
+  PD_ORIG=${DATA_PLAN_DAY:-1}
+  case "$PD_ORIG" in ''|*[!0-9]*) PD_ORIG=1 ;; esac
+  TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
+  case "$TODAY" in ''|*[!0-9]*) return 1 ;; esac
+  PD=$PD_ORIG
+  # P1-29(1.5.11)：账期起始日若超出当月天数（如 31 日在 2 月），取当月最后一天。
+  # 用纯 shell 计算月天数，避免依赖 date -d（macOS/部分 toybox 语法不一致）。
+  CM=$($DATE_CMD +%Y%m 2>/dev/null)
+  case "$CM" in ''|*[!0-9]*) CM=0 ;; esac
+  LAST_DOM=$(last_day_of_month "$CM")
+  case "$LAST_DOM" in ''|*[!0-9]*) LAST_DOM=31 ;; esac
+  [ "$PD" -gt "$LAST_DOM" ] 2>/dev/null && PD=$LAST_DOM
+  # 账期起始日：本月 PD 日（若今天 < PD 日，则起始日为上月 PD 日）
+  DOM=$(printf '%s' "$TODAY" | "$BB" cut -c7-8 | "$BB" sed 's/^0*//')
+  case "$DOM" in ''|*[!0-9]*) DOM=1 ;; esac
+  if [ "$DOM" -ge "$PD" ]; then
+    PLAN_PERIOD_DAY=$(printf '%s%02d' "$($DATE_CMD +%Y%m 2>/dev/null)" "$PD")
+  else
+    # 上月 YYYYMM（纯 shell，不依赖 date -d）
+    CM2=$($DATE_CMD +%Y%m 2>/dev/null)
+    case "$CM2" in ''|*[!0-9]*) CM2=197001 ;; esac
+    Y2=$(printf '%s' "$CM2" | "$BB" cut -c1-4)
+    M2=$(printf '%s' "$CM2" | "$BB" cut -c5-6 | "$BB" sed 's/^0//')
+    if [ "$M2" = "1" ] || [ "$M2" = "01" ]; then
+      PREV=$(printf '%s12' "$((Y2 - 1))")
+    else
+      PREV=$(printf '%s%02d' "$Y2" "$((M2 - 1))")
+    fi
+    # 上月按“上月最后一天”独立截断（例：2月28日账期，3月31日配置）
+    # P1-1(1.5.12)：上月必须从原始账期日重新截断（不能用本月已截断的 PD：31 日在 2 月会错成 28）
+    PD_PREV=$PD_ORIG
+    LPD=$(last_day_of_month "$PREV")
+    case "$LPD" in ''|*[!0-9]*) LPD=31 ;; esac
+    [ "$PD_PREV" -gt "$LPD" ] 2>/dev/null && PD_PREV=$LPD
+    PLAN_PERIOD_DAY=$(printf '%s%02d' "$PREV" "$PD_PREV")
+  fi
+  # 日归档求和（>= 账期起始日）
+  if [ -f "$TRAFFIC_DAILY" ]; then
+    while IFS= read -r DL; do
+      DD=$(printf '%s' "$DL" | "$BB" cut -d'|' -f1)
+      DV=$(printf '%s' "$DL" | "$BB" cut -d'|' -f2)
+      case "$DV" in ''|*[!0-9]*) continue ;; esac
+      [ "$DD" -ge "$PLAN_PERIOD_DAY" ] 2>/dev/null || continue
+      # v1.5.10：日归档直接存字节，不再 *1048576 换算（避免小流量丢失）
+      PLAN_PERIOD_BYTES=$((PLAN_PERIOD_BYTES + DV))
+    done < "$TRAFFIC_DAILY"
+  fi
+  # 今日基准
+  if [ -r "$TRAFFIC_BASE" ]; then
+    BD=$("$BB" cut -d'|' -f1 "$TRAFFIC_BASE" 2>/dev/null)
+    BBY=$("$BB" cut -d'|' -f2 "$TRAFFIC_BASE" 2>/dev/null)
+    case "$BBY" in ''|*[!0-9]*) BBY=0 ;; esac
+    if [ "$BD" = "$TODAY" ]; then
+      CUR=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+      case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
+      [ "$CUR" -ge "$BBY" ] 2>/dev/null && PLAN_PERIOD_BYTES=$((PLAN_PERIOD_BYTES + CUR - BBY))
+    fi
+  fi
+  return 0
+}
+
+# 套餐总量（MB）：v1.5.10 合并——限额与套餐为同一字段 DATA_PLAN_MB（0=不限）
+plan_total_mb() {
+  PLAN_TOTAL=${DATA_PLAN_MB:-0}
+  case "$PLAN_TOTAL" in ''|*[!0-9]*) PLAN_TOTAL=0 ;; esac
+}
+
+# 账期使用率（0-100 整数，套餐 0=不限返回 -1）；同时输出 PLAN_PERIOD_USED（MB）
+plan_usage_percent() {
+  plan_period_bytes
+  plan_total_mb
+  case "$PLAN_TOTAL" in ''|*[!0-9]*) PLAN_TOTAL=0 ;; esac
+  PLAN_PERIOD_USED=$((PLAN_PERIOD_BYTES / 1048576))
+  if [ "$PLAN_TOTAL" -le 0 ] 2>/dev/null; then
+    PLAN_PERCENT=-1
+  else
+    PLAN_PERCENT=$((PLAN_PERIOD_BYTES * 100 / (PLAN_TOTAL * 1048576)))
+    [ "$PLAN_PERCENT" -gt 100 ] 2>/dev/null && PLAN_PERCENT=100
+  fi
+}
+
+KNOWN_MACS="$DATA_DIR/known_macs"            # 历史设备（首次发现时间戳）统一路径（P0-42）
+
+# ---------- 客户端历史（v1.5.7） ----------
+# client_stats: 每行 MAC|first_seen|last_seen|online_sec（全部 epoch 秒）
+# 在线累计：每次调用在线客户端 +INC 秒；离线后下次上线续计。
+client_stats_touch() {
+  MAC=$1; INC=$2
+  NOW=$($DATE_CMD +%s 2>/dev/null)
+  case "$NOW" in ''|*[!0-9]*) return 1 ;; esac
+  case "$INC" in ''|*[!0-9]*) INC=0 ;; esac
+  OLD=$("$BB" grep "^$MAC|" "$CLIENT_STATS_FILE" 2>/dev/null | "$BB" head -n1)
+  FIRST=$("$BB" cut -d'|' -f2 <<EOF
+$OLD
+EOF
+)
+  LAST=$("$BB" cut -d'|' -f3 <<EOF
+$OLD
+EOF
+)
+  ON=$("$BB" cut -d'|' -f4 <<EOF
+$OLD
+EOF
+)
+  case "$FIRST" in ''|*[!0-9]*) FIRST=$NOW ;; esac
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  case "$ON" in ''|*[!0-9]*) ON=0 ;; esac
+  ON=$((ON + INC))
+  TMP="$CLIENT_STATS_FILE.tmp.$$"
+  "$BB" grep -v "^$MAC|" "$CLIENT_STATS_FILE" 2>/dev/null > "$TMP" || true
+  printf '%s|%s|%s|%s\n' "$MAC" "$FIRST" "$NOW" "$ON" >> "$TMP"
+  mv -f "$TMP" "$CLIENT_STATS_FILE" 2>/dev/null
+  chmod 0600 "$CLIENT_STATS_FILE" 2>/dev/null
+}
+
+# 读取客户端历史：输出 first|last|online_sec
+client_stats_read() {
+  "$BB" grep "^$1|" "$CLIENT_STATS_FILE" 2>/dev/null | "$BB" head -n1 | "$BB" cut -d'|' -f2-
+}
+
+# ---------- 只读信号质量（v1.5.7） ----------
+# 依次尝试 dumpsys telephony.registry / getprop；取不到的字段留空（前端隐藏，不显示 N/A）。
+# 输出：NETWORK= / OPERATOR= / SIM= / BAND= / PCI= / RSRP= / RSRQ= / SINR=
+get_signal_info() {
+  SIG_NETWORK=; SIG_OPERATOR=; SIG_SIM=; SIG_BAND=; SIG_PCI=; SIG_RSRP=; SIG_RSRQ=; SIG_SINR=
+  SIG_CACHE="$DATA_DIR/sig.cache"
+  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  # P1-80：信号面板 5 秒轮询不应每次执行大型 dumpsys；缓存 60 秒，有效期内直接读取
+  if [ -r "$SIG_CACHE" ]; then
+    CACHE_MT=$("$BB" stat -c %Y "$SIG_CACHE" 2>/dev/null)
+    case "$CACHE_MT" in ''|*[!0-9]*) CACHE_MT=0 ;; esac
+    if [ "$CACHE_MT" -gt 0 ] && [ $((NOW_S - CACHE_MT)) -lt 60 ] 2>/dev/null; then
+      . "$SIG_CACHE" 2>/dev/null || true
+      SIG_OPERATOR=$(b64url_decode "${SIG_OPERATOR_B64:-}")
+      return 0
+    fi
+  fi
+  # P1-81：dumpsys 输出可达数百 KB，直接存 Shell 变量会触发参数过长；先落临时文件再逐字段提取
+  DMP_FILE="$DATA_DIR/dumpsys_sig.tmp"
+  /system/bin/dumpsys telephony.registry > "$DMP_FILE" 2>/dev/null
+  [ -s "$DMP_FILE" ] || /system/bin/dumpsys phone > "$DMP_FILE" 2>/dev/null
+  if [ -s "$DMP_FILE" ]; then
+    SIG_OPERATOR=$("$BB" grep -o 'mOperatorAlphaLong=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mOperatorAlphaLong=//')
+    [ -n "$SIG_OPERATOR" ] || SIG_OPERATOR=$("$BB" grep -o 'mNetworkOperatorName=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mNetworkOperatorName=//')
+    [ -n "$SIG_OPERATOR" ] || SIG_OPERATOR=$(getprop gsm.operator.alpha 2>/dev/null)
+    SIG_OPERATOR=$(printf '%s' "$SIG_OPERATOR" | "$BB" sed 's/[, ]*$//')
+    SIG_SIM=$("$BB" grep -o 'mSimState=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mSimState=//')
+    case "$SIG_SIM" in
+      ''|*) S=$(getprop gsm.sim.state 2>/dev/null); case "$S" in READY|NOT_READY|ABSENT|PIN_REQUIRED|PUK_REQUIRED|NETWORK_LOCKED) SIG_SIM=$S ;; esac ;;
+    esac
+    NT=$("$BB" grep -o 'mDataNetworkType=[0-9]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mDataNetworkType=//')
+    [ -n "$NT" ] || NT=$("$BB" grep -o 'mNetworkType=[0-9]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mNetworkType=//')
+    case "$NT" in
+      20) SIG_NETWORK=5G ;;
+      13) SIG_NETWORK=4G ;;
+      3|8|9|15|16) SIG_NETWORK=3G ;;
+      1|2|4|5|6|7) SIG_NETWORK=2G ;;
+      0) SIG_NETWORK=无服务 ;;
+      *) SIG_NETWORK= ;;
+    esac
+    if [ "$SIG_NETWORK" = "5G" ]; then
+      NRST=$("$BB" grep -o 'mNrState=[0-9]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mNrState=//')
+      case "$NRST" in 3) SIG_NETWORK=5G-SA ;; 2|1) SIG_NETWORK=5G-NSA ;; *) SIG_NETWORK=5G ;; esac
+    fi
+    CI=$("$BB" grep -o 'CellInfo{[^}]*CellIdentityLte=LteCellIdentity{[^}]*}[^}]*CellSignalStrengthLte=LteSignalStrength{[^}]*}' "$DMP_FILE" | "$BB" head -n1)
+    if [ -z "$CI" ]; then
+      CI=$("$BB" grep -o 'CellInfo{[^}]*CellIdentityNr=NrCellIdentity{[^}]*}[^}]*CellSignalStrengthNr=NrSignalStrength{[^}]*}' "$DMP_FILE" | "$BB" head -n1)
+    fi
+    if [ -n "$CI" ]; then
+      SIG_PCI=$(printf '%s' "$CI" | "$BB" grep -o 'mPci=[0-9]*' | "$BB" head -n1 | "$BB" sed 's/mPci=//')
+      SIG_BAND=$(printf '%s' "$CI" | "$BB" grep -o 'mEarfcn=[0-9]*' | "$BB" head -n1 | "$BB" sed 's/mEarfcn=//')
+      [ -n "$SIG_BAND" ] || SIG_BAND=$(printf '%s' "$CI" | "$BB" grep -o 'mNrArfcn=[0-9]*' | "$BB" head -n1 | "$BB" sed 's/mNrArfcn=//')
+      SIG_RSRP=$(printf '%s' "$CI" | "$BB" grep -o 'rsrp=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/rsrp=//')
+      [ -n "$SIG_RSRP" ] || SIG_RSRP=$(printf '%s' "$CI" | "$BB" grep -o 'ssRsrp=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/ssRsrp=//')
+      SIG_RSRQ=$(printf '%s' "$CI" | "$BB" grep -o 'rsrq=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/rsrq=//')
+      [ -n "$SIG_RSRQ" ] || SIG_RSRQ=$(printf '%s' "$CI" | "$BB" grep -o 'ssRsrq=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/ssRsrq=//')
+      SIG_SINR=$(printf '%s' "$CI" | "$BB" grep -o 'sinr=[0-9-.]*' | "$BB" head -n1 | "$BB" sed 's/sinr=//')
+      [ -n "$SIG_SINR" ] || SIG_SINR=$(printf '%s' "$CI" | "$BB" grep -o 'ssSinr=[0-9-.]*' | "$BB" head -n1 | "$BB" sed 's/ssSinr=//')
+    fi
+    TMP_CACHE="$SIG_CACHE.$$"
+    {
+      printf 'SIG_NETWORK=%s\n' "$SIG_NETWORK"
+      printf 'SIG_OPERATOR_B64=%s\n' "$(b64url_encode "$SIG_OPERATOR")"
+      printf 'SIG_SIM=%s\n' "$SIG_SIM"
+      printf 'SIG_BAND=%s\n' "$SIG_BAND"
+      printf 'SIG_PCI=%s\n' "$SIG_PCI"
+      printf 'SIG_RSRP=%s\n' "$SIG_RSRP"
+      printf 'SIG_RSRQ=%s\n' "$SIG_RSRQ"
+      printf 'SIG_SINR=%s\n' "$SIG_SINR"
+    } > "$TMP_CACHE" 2>/dev/null
+    chmod 0600 "$TMP_CACHE" 2>/dev/null
+    mv -f "$TMP_CACHE" "$SIG_CACHE" 2>/dev/null
+  fi
+  rm -f "$DMP_FILE" 2>/dev/null
+}
+
+# 信号等级（RSRP dBm）：≥-85 优秀；-85~-95 良好；-95~-105 一般；<-105 较差
+signal_level() {
+  case "$1" in ''|*[!0-9-]*) echo 未知; return 1 ;; esac
+  if [ "$1" -ge -85 ] 2>/dev/null; then echo 优秀
+  elif [ "$1" -ge -95 ] 2>/dev/null; then echo 良好
+  elif [ "$1" -ge -105 ] 2>/dev/null; then echo 一般
+  else echo 较差
+  fi
+}
+
+# 读取 httpd.conf 当前后台密码（busybox httpd auth 行 "/:user:pass" 取末段）
+read_admin_password() {
+  "$BB" sed -n 's#^/:[^:]*:##p' "$HTTP_CONF" 2>/dev/null | "$BB" head -n 1
+}
+
+# ---------- 流量按日/月度统计 ----------
+# TRAFFIC_BASE: "YYYYMMDD|bytes"（当日开始基准）；TRAFFIC_DAILY: 每行 "YYYYMMDD|MB"（保留 11 天）
+accumulate_daily() {
+  CUR=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  case "$CUR" in ''|*[!0-9]*) return 0 ;; esac
+  TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
+  case "$TODAY" in ''|*[!0-9]*) return 0 ;; esac
+  BASE_DATE=
+  BASE_BYTES=0
+  if [ -r "$TRAFFIC_BASE" ]; then
+    BASE_DATE=$("$BB" cut -d'|' -f1 "$TRAFFIC_BASE" 2>/dev/null)
+    BASE_BYTES=$("$BB" cut -d'|' -f2 "$TRAFFIC_BASE" 2>/dev/null)
+    case "$BASE_BYTES" in ''|*[!0-9]*) BASE_BYTES=0 ;; esac
+  fi
+  if [ -z "$BASE_DATE" ] || [ "$BASE_DATE" != "$TODAY" ]; then
+    # 跨日（或首次）：把 [BASE_BYTES, CUR) 记入前一日期（首次无前日则跳过）
+    if [ -n "$BASE_DATE" ] && [ "$CUR" -ge "$BASE_BYTES" ]; then
+      # v1.5.10：按字节保存，不足 1MB 的小流量不再被截断（页面显示时再换算）
+      YDAY_BYTES=$((CUR - BASE_BYTES))
+      TMP="$TRAFFIC_DAILY.tmp.$$"
+      if [ -f "$TRAFFIC_DAILY" ]; then
+        "$BB" grep -v "^$BASE_DATE|" "$TRAFFIC_DAILY" 2>/dev/null > "$TMP" || true
+      else
+        : > "$TMP"
+      fi
+      printf '%s|%s\n' "$BASE_DATE" "$YDAY_BYTES" >> "$TMP"
+      # P0-28：图表只展示最近 11 天，但账期求和至少保留 62 天（月套餐跨第 12 天不漏算）
+      "$BB" tail -n 62 "$TMP" > "$TMP.2" 2>/dev/null
+      mv -f "$TMP.2" "$TMP" 2>/dev/null
+      mv -f "$TMP" "$TRAFFIC_DAILY" 2>/dev/null
+      chmod 0600 "$TRAFFIC_DAILY" 2>/dev/null
+    fi
+    printf '%s|%s\n' "$TODAY" "$CUR" > "$TRAFFIC_BASE" 2>/dev/null
+    chmod 0600 "$TRAFFIC_BASE" 2>/dev/null
+  fi
+}
+
+# 输出: TRAFFIC_TODAY_BYTES / TRAFFIC_MONTH_BYTES / TRAFFIC_DAYS（最近 11 行 "YYYYMMDD|bytes"）
+# v1.5.10：today/month 改为字节输出（前端 formatTrafficMb(d/1048576) 换算显示），小流量不再恒为 0
+read_traffic_stats() {
+  TRAFFIC_TODAY_BYTES=0
+  TRAFFIC_MONTH_BYTES=0
+  TRAFFIC_TODAY_VALID=false
+  TRAFFIC_MONTH_VALID=false
+  TRAFFIC_DAYS=
+  CUR=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
+  BASE_DATE=
+  BASE_BYTES=0
+  if [ -r "$TRAFFIC_BASE" ]; then
+    BASE_DATE=$("$BB" cut -d'|' -f1 "$TRAFFIC_BASE" 2>/dev/null)
+    BASE_BYTES=$("$BB" cut -d'|' -f2 "$TRAFFIC_BASE" 2>/dev/null)
+    case "$BASE_BYTES" in ''|*[!0-9]*) BASE_BYTES=0 ;; esac
+  fi
+  TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
+  THIS_MONTH=$($DATE_CMD +%Y%m 2>/dev/null)
+  if [ -n "$BASE_DATE" ] && [ "$BASE_DATE" = "$TODAY" ]; then
+    if [ "$CUR" -ge "$BASE_BYTES" ]; then
+      TRAFFIC_TODAY_BYTES=$((CUR - BASE_BYTES))
+    else
+      TRAFFIC_TODAY_BYTES=0
+    fi
+    TRAFFIC_TODAY_VALID=true
+  fi
+  MONTH_SUM=0
+  if [ -f "$TRAFFIC_DAILY" ]; then
+    MONTH_SUM=$("$BB" awk -F'|' -v m="$THIS_MONTH" 'index($1,m)==1{s+=$2} END{print s+0}' "$TRAFFIC_DAILY" 2>/dev/null)
+  fi
+  case "$MONTH_SUM" in ''|*[!0-9]*) MONTH_SUM=0 ;; esac
+  if [ -f "$TRAFFIC_DAILY" ] || [ "$TRAFFIC_TODAY_VALID" = "true" ]; then
+    TRAFFIC_MONTH_VALID=true
+  fi
+  TRAFFIC_MONTH_BYTES=$((MONTH_SUM + TRAFFIC_TODAY_BYTES))
+  TRAFFIC_DAYS=$("$BB" tail -n 11 "$TRAFFIC_DAILY" 2>/dev/null)
+}

@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build / release
+*.zip
+*.apk
+*.aab
+release/
+dist/
+build/
+
+# Temp
+*.tmp
+*.log
+node_modules/
+__pycache__/
