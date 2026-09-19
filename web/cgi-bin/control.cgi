@@ -332,7 +332,55 @@ case "$ACTION" in
     fi
     release_operation_lock
     ;;
-  admin_password)
+  proxy_save)
+    SUB_B64=$(get_param sub_b64)
+    MODE=$(get_param mode)
+    ENABLE=$(get_param enable)
+    BLOCK_QUIC=$(get_param block_quic)
+    [ -n "$SUB_B64" ] && { valid_b64url "$SUB_B64" && PROXY_SUB_B64="$SUB_B64"; }
+    [ -n "$MODE" ] && case "$MODE" in auto|fallback|manual) PROXY_MODE="$MODE" ;; esac
+    [ -n "$ENABLE" ] && case "$ENABLE" in 0|1) PROXY_ENABLE="$ENABLE" ;; esac
+    [ -n "$BLOCK_QUIC" ] && case "$BLOCK_QUIC" in 0|1) PROXY_BLOCK_QUIC="$BLOCK_QUIC" ;; esac
+    save_config
+    printf '{"ok":true,"message":"订阅已保存"}'
+    ;;
+  proxy_start)
+    PROXY_ENABLE=1
+    save_config
+    proxy_start
+    if [ "$(proxy_read_state)" = "running" ] || [ "$(proxy_read_state)" = "waiting_hotspot" ]; then
+      printf '{"ok":true,"message":"科学上网已启动"}'
+    else
+      printf '{"ok":false,"message":"启动失败，请看代理日志"}'
+    fi
+    ;;
+  proxy_stop)
+    PROXY_ENABLE=0
+    save_config
+    proxy_stop
+    printf '{"ok":true,"message":"科学上网已停止"}'
+    ;;
+  proxy_set_mode)
+    MODE=$(get_param mode)
+    proxy_set_mode "$MODE"
+    PROXY_MODE="$MODE"
+    save_config
+    printf '{"ok":true}'
+    ;;
+  proxy_set_node)
+    NODE_B64=$(get_param node_b64)
+    NODE=$(b64d "$NODE_B64" 2>/dev/null)
+    [ -n "$NODE" ] && proxy_set_node "$NODE"
+    printf '{"ok":true}'
+    ;;
+  proxy_update)
+    proxy_update_provider
+    printf '{"ok":true,"message":"订阅已更新"}'
+    ;;
+  proxy_healthcheck)
+    proxy_healthcheck
+    printf '{"ok":true}'
+    ;;  admin_password)
     NEW_ADMIN_B64=$(get_param password)
     valid_b64url "$NEW_ADMIN_B64" || { printf '{"ok":false,"message":"后台密码格式错误"}'; exit 0; }
     NEW_ADMIN=$(b64url_decode "$NEW_ADMIN_B64")

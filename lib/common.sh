@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 : "${MODDIR:=/data/adb/modules/xiaomi_mifi_web}"
-DATA_DIR=/data/adb/xiaomi_mifi_web
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 # 从旧版 xiaomi14_mifi_web 迁移数据
 _OLD_DATA=/data/adb/xiaomi14_mifi_web
 if [ -d "$_OLD_DATA" ] && [ ! -e "$DATA_DIR" ]; then
@@ -2358,4 +2358,312 @@ read_traffic_stats() {
   fi
   TRAFFIC_MONTH_BYTES=$((MONTH_SUM + TRAFFIC_TODAY_BYTES))
   TRAFFIC_DAYS=$("$BB" tail -n 11 "$TRAFFIC_DAILY" 2>/dev/null)
+}
+
+
+# ---------- Mihomo / Proxy (v1.5.24) ----------
+PROXY_DIR="$DATA_DIR/proxy"
+PROXY_BIN="$MODDIR/bin/mihomo"
+PROXY_CFG="$PROXY_DIR/config.yaml"
+PROXY_TMP_CFG="$PROXY_DIR/config.yaml.tmp"
+PROXY_PIDFILE="$PROXY_DIR/mihomo.pid"
+PROXY_LOG="$PROXY_DIR/mihomo.log"
+PROXY_RUNTIME_LOG="$PROXY_DIR/proxy.log"
+PROXY_SECRET_FILE="$PROXY_DIR/secret"
+PROXY_STATE_FILE="$PROXY_DIR/state"
+PROXY_LAST_ERROR="$PROXY_DIR/last_error"
+PROXY_SUB_FILE="$PROXY_DIR/sub_url.txt"
+PROXY_LOCK="$PROXY_DIR/proxy.lock"
+PROXY_REDIR_PORT=7893
+PROXY_DNS_PORT=1053
+PROXY_API_HOST="127.0.0.1"
+PROXY_API_PORT=9090
+PROXY_CORE_VERSION="1.19.31"
+
+proxy_init_dirs() {
+  mkdir -p "$PROXY_DIR/providers" "$PROXY_DIR/cache"
+}
+
+proxy_core_ok() {
+  if [ ! -f "$PROXY_BIN" ]; then echo "core_missing"; return 1; fi
+  if [ ! -x "$PROXY_BIN" ]; then
+    chmod 0755 "$PROXY_BIN" 2>/dev/null
+    [ -x "$PROXY_BIN" ] || { echo "core_not_executable"; return 1; }
+  fi
+  local magic
+  magic=$(od -An -tx1 -N4 "$PROXY_BIN" 2>/dev/null | tr -d ' \n')
+  [ "$magic" = "7f454c46" ] || { echo "core_invalid_binary"; return 1; }
+  "$PROXY_BIN" -v >/dev/null 2>&1 || { echo "core_launch_failed"; return 1; }
+  return 0
+}
+
+proxy_generate_secret() {
+  if [ ! -s "$PROXY_SECRET_FILE" ]; then
+    head -c 16 /dev/urandom | md5sum | cut -c1-16 > "$PROXY_SECRET_FILE"
+  fi
+  cat "$PROXY_SECRET_FILE" 2>/dev/null
+}
+
+proxy_read_state() {
+  cat "$PROXY_STATE_FILE" 2>/dev/null || echo "stopped"
+}
+
+proxy_write_state() {
+  echo "$1" > "$PROXY_STATE_FILE"
+}
+
+proxy_is_running() {
+  [ -f "$PROXY_PIDFILE" ] || return 1
+  local pid
+  pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+proxy_api_ready() {
+  local secret
+  secret=$(proxy_generate_secret)
+  curl -s --connect-timeout 2 --max-time 3 \
+    -H "Authorization: Bearer $secret" \
+    "http://$PROXY_API_HOST:$PROXY_API_PORT/version" >/dev/null 2>&1
+}
+
+proxy_api() {
+  local method="$1" path="$2" data="$3"
+  local secret
+  secret=$(proxy_generate_secret)
+  if [ -n "$data" ]; then
+    curl -s --connect-timeout 2 --max-time 5 -X "$method" \
+      -H "Authorization: Bearer $secret" \
+      -H "Content-Type: application/json" \
+      -d "$data" \
+      "http://$PROXY_API_HOST:$PROXY_API_PORT$path" 2>/dev/null
+  else
+    curl -s --connect-timeout 2 --max-time 5 -X "$method" \
+      -H "Authorization: Bearer $secret" \
+      "http://$PROXY_API_HOST:$PROXY_API_PORT$path" 2>/dev/null
+  fi
+}
+
+proxy_generate_config() {
+  proxy_init_dirs
+  local sub_url secret
+  sub_url=$(cat "$PROXY_SUB_FILE" 2>/dev/null)
+  secret=$(proxy_generate_secret)
+  cat > "$PROXY_TMP_CFG" <<EOF
+mixed-port: 7890
+redir-port: $PROXY_REDIR_PORT
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+external-controller: $PROXY_API_HOST:$PROXY_API_PORT
+secret: "$secret"
+ipv6: false
+profile:
+  store-selected: true
+dns:
+  enable: true
+  listen: 0.0.0.0:$PROXY_DNS_PORT
+  enhanced-mode: redir-host
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+geodata-mode: true
+geo-auto-update: false
+geoip:
+  path: ./geoip.metadb
+proxy-providers:
+  airport:
+    type: http
+    url: "$sub_url"
+    path: ./providers/airport.yaml
+    interval: 86400
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 120
+      timeout: 5000
+      lazy: false
+proxy-groups:
+  - name: AUTO
+    type: url-test
+    use: [airport]
+    url: https://www.gstatic.com/generate_204
+    interval: 120
+    tolerance: 80
+  - name: FALLBACK
+    type: fallback
+    use: [airport]
+    url: https://www.gstatic.com/generate_204
+    interval: 60
+  - name: MANUAL
+    type: select
+    use: [airport]
+  - name: GLOBAL
+    type: select
+    proxies: [AUTO, FALLBACK, MANUAL, DIRECT]
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,GLOBAL
+EOF
+}
+
+proxy_validate_config() {
+  proxy_init_dirs
+  proxy_generate_config
+  "$PROXY_BIN" -t -d "$PROXY_DIR" -f "$PROXY_TMP_CFG" >> "$PROXY_LOG" 2>&1
+}
+
+proxy_setup_iptables() {
+  local iface="$1"
+  [ -z "$iface" ] && return 1
+  $IPT -t nat -N MIFI_PROXY 2>/dev/null
+  $IPT -t nat -F MIFI_PROXY
+  $IPT -t nat -A MIFI_PROXY -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT
+  $IPT -t nat -A MIFI_PROXY -i "$iface" -p tcp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT
+  $IPT -t nat -A MIFI_PROXY -d 127.0.0.0/8 -j RETURN
+  $IPT -t nat -A MIFI_PROXY -d 10.0.0.0/8 -j RETURN
+  $IPT -t nat -A MIFI_PROXY -d 172.16.0.0/12 -j RETURN
+  $IPT -t nat -A MIFI_PROXY -d 192.168.0.0/16 -j RETURN
+  $IPT -t nat -A MIFI_PROXY -d 224.0.0.0/4 -j RETURN
+  $IPT -t nat -A MIFI_PROXY -p tcp -j REDIRECT --to-port $PROXY_REDIR_PORT
+  # 挂 PREROUTING
+  $IPT -t nat -C PREROUTING -j MIFI_PROXY 2>/dev/null || $IPT -t nat -A PREROUTING -j MIFI_PROXY
+  # 阻止 QUIC
+  if [ "${PROXY_BLOCK_QUIC:-1}" = "1" ]; then
+    $IPT -t filter -N MIFI_BLOCK_QUIC 2>/dev/null
+    $IPT -t filter -F MIFI_BLOCK_QUIC
+    $IPT -t filter -A MIFI_BLOCK_QUIC -i "$iface" -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+    $IPT -t filter -C FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null || $IPT -t filter -A FORWARD -j MIFI_BLOCK_QUIC
+  fi
+}
+
+proxy_teardown_iptables() {
+  $IPT -t nat -D PREROUTING -j MIFI_PROXY 2>/dev/null
+  $IPT -t nat -F MIFI_PROXY 2>/dev/null
+  $IPT -t nat -X MIFI_PROXY 2>/dev/null
+  $IPT -t filter -D FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null
+  $IPT -t filter -F MIFI_BLOCK_QUIC 2>/dev/null
+  $IPT -t filter -X MIFI_BLOCK_QUIC 2>/dev/null
+}
+
+proxy_sync_iptables() {
+  local iface
+  iface=$(get_hotspot_iface 2>/dev/null)
+  proxy_teardown_iptables
+  [ -n "$iface" ] && proxy_setup_iptables "$iface"
+}
+
+proxy_start() {
+  proxy_init_dirs
+  proxy_write_state "starting"
+  core_check=$(proxy_core_ok)
+  if [ $? -ne 0 ]; then
+    echo "核心错误: $core_check" > "$PROXY_LAST_ERROR"
+    proxy_write_state "$core_check"
+    return 1
+  fi
+  local sub_url
+  sub_url=$(cat "$PROXY_SUB_FILE" 2>/dev/null)
+  [ -z "$sub_url" ] && sub_url=$(b64d "${PROXY_SUB_B64:-}" 2>/dev/null)
+  [ -z "$sub_url" ] && sub_url=$(echo "$PROXY_SUB_B64" | base64 -d 2>/dev/null)
+  echo "$sub_url" > "$PROXY_SUB_FILE"
+  if ! proxy_validate_config; then
+    proxy_write_state "config_error"
+    rm -f "$PROXY_TMP_CFG"
+    return 1
+  fi
+  mv "$PROXY_TMP_CFG" "$PROXY_CFG"
+  if proxy_is_running; then
+    local pid; pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
+    kill "$pid" 2>/dev/null
+    sleep 1
+  fi
+  nohup "$PROXY_BIN" -d "$PROXY_DIR" -f "$PROXY_CFG" >> "$PROXY_LOG" 2>&1 &
+  echo $! > "$PROXY_PIDFILE"
+  # 等 API 就绪
+  local i
+  for i in $(seq 1 15); do
+    sleep 1
+    if proxy_api_ready; then
+      break
+    fi
+  done
+  if ! proxy_api_ready; then
+    proxy_write_state "core_error"
+    return 1
+  fi
+  # 等热点接口
+  local iface
+  for i in $(seq 1 10); do
+    iface=$(get_hotspot_iface 2>/dev/null)
+    [ -n "$iface" ] && break
+    sleep 1
+  done
+  if [ -z "$iface" ]; then
+    proxy_write_state "waiting_hotspot"
+    return 0
+  fi
+  proxy_setup_iptables "$iface" || {
+    proxy_teardown_iptables
+    proxy_write_state "firewall_error"
+    return 1
+  }
+  proxy_write_state "running"
+}
+
+proxy_stop() {
+  proxy_teardown_iptables
+  if proxy_is_running; then
+    local pid; pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
+    kill "$pid" 2>/dev/null
+    sleep 1
+    kill -9 "$pid" 2>/dev/null
+  fi
+  rm -f "$PROXY_PIDFILE"
+  proxy_write_state "stopped"
+}
+
+proxy_update_provider() {
+  proxy_api PUT "/providers/proxies/airport" ""
+}
+
+proxy_healthcheck() {
+  proxy_api GET "/providers/proxies/airport/healthcheck" ""
+}
+
+proxy_set_mode() {
+  local mode="$1"
+  case "$mode" in
+    auto) proxy_api PUT "/proxies/GLOBAL" '{"name":"AUTO"}' ;;
+    fallback) proxy_api PUT "/proxies/GLOBAL" '{"name":"FALLBACK"}' ;;
+    manual) proxy_api PUT "/proxies/GLOBAL" '{"name":"MANUAL"}' ;;
+  esac
+}
+
+proxy_set_node() {
+  local node="$1"
+  proxy_api PUT "/proxies/MANUAL" "{\"name\":\"$node\"}"
+  proxy_api PUT "/proxies/GLOBAL" '{"name":"MANUAL"}'
+}
+
+proxy_status_json() {
+  local state running iface has_sub last_error transparent="redirect"
+  state=$(proxy_read_state)
+  running=$(proxy_is_running && echo true || echo false)
+  iface=$(get_hotspot_iface 2>/dev/null)
+  [ -n "$iface" ] || iface=""
+  has_sub=$( { [ -s "$PROXY_SUB_FILE" ] || [ -n "${PROXY_SUB_B64:-}" ]; } && echo true || echo false)
+  last_error=$(cat "$PROXY_LAST_ERROR" 2>/dev/null)
+  printf '{"enabled":%s,"running":%s,"state":"%s","transparentMode":"%s","coreVersion":"%s","interface":"%s","hasSubscription":%s,"lastError":"%s"}' \
+    "$([ "${PROXY_ENABLE:-0}" = "1" ] && echo true || echo false)" \
+    "$running" "$state" "$transparent" "$PROXY_CORE_VERSION" \
+    "$(json_escape "$iface")" "$has_sub" "$(json_escape "$last_error")"
 }

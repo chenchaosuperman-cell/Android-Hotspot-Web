@@ -6,7 +6,7 @@ LATESTARTSERVICE=true
 
 MOD_VER=$(sed -n 's/^version=//p' "$MODPATH/module.prop" 2>/dev/null | head -n 1)
 ui_print "*******************************"
-ui_print " Android-Hotspot-Web v${MOD_VER:-1.5.10}"
+ui_print " Xiaomi 14 MiFi Web Control v${MOD_VER:-1.5.10}"
 ui_print " HyperOS 3 / Android 16"
 ui_print "*******************************"
 ui_print "Default hotspot: Xiaomi14-MiFi"
@@ -22,3 +22,4 @@ set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm_recursive "$MODPATH/web/cgi-bin" 0 0 0755 0755
 set_perm "$MODPATH/lib/common.sh" 0 0 0755
+chmod 0755 "/bin/mihomo" 2>/dev/null

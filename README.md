@@ -1,11 +1,6 @@
-<img width="393" height="3056" alt="0c1f8cf4f159811756971b8696447f86" src="https://github.com/user-attachments/assets/56b63b7b-074a-4bf0-8c31-6318f89119de" />
-<img width="590" height="1278" alt="50befdd30dce7c54ab72da6b9a878291" src="https://github.com/user-attachments/assets/2d2e9e79-4a57-4403-933c-c5ccee1fa444" />
-<img width="590" height="1278" alt="9a8ede0ec7001e3b0cf4202a50a4799b" src="https://github.com/user-attachments/assets/42ebf207-5756-4160-9fc7-fe4c8e228924" />
-<img width="393" height="1834" alt="fc1c67ec6ca4fc170f9dd9f21944459f(1)" src="https://github.com/user-attachments/assets/6bf475ac-9e56-4412-9e9d-33a1f949b241" />
-<img width="393" height="1261" alt="09c22a26b43717eaa6f61cf210c1e3a3" src="https://github.com/user-attachments/assets/ad6da339-cbf5-4c8e-aa6f-5e7214a5d397" />
-# Android-Hotspot-Web
+# Xiaomi MiFi Web
 
-面向已 Root 的 Android 设备的本地热点管理 KernelSU 模块。
+面向已 Root 的小米、Redmi、POCO 设备的本地热点管理模块。
 
 本项目通过 KernelSU 模块在手机本地运行轻量 Web 管理后台，允许连接热点的设备查看状态、开关热点、修改热点参数、管理客户端、统计流量并配置自动化与消息通知。
 
