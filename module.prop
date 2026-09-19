@@ -1,6 +1,6 @@
 id=xiaomi_mifi_web
 name=Android-Hotspot-Web
-version=1.5.24-beta.1
-versionCode=1525
+version=1.5.24-beta.2
+versionCode=1526
 author=chenchaosuperman
 description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, scheduling, SMS forward, mihomo proxy, PushPlus/DingTalk notifications. Primarily tested on Xiaomi 14 / HyperOS 3 / Android 16.
