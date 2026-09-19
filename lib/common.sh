@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 : "${MODDIR:=/data/adb/modules/xiaomi_mifi_web}"
-DATA_DIR=/data/adb/xiaomi14_mifi_web
+DATA_DIR=/data/adb/xiaomi_mifi_web
 # 从旧版 xiaomi14_mifi_web 迁移数据
 _OLD_DATA=/data/adb/xiaomi14_mifi_web
 if [ -d "$_OLD_DATA" ] && [ ! -e "$DATA_DIR" ]; then
@@ -1425,7 +1425,7 @@ migrate_port80_once() {
   for CHAIN in PREROUTING OUTPUT; do
     while :; do
       N=$($IPT -t nat -L "$CHAIN" --line-numbers -n 2>/dev/null | \
-          "$BB" grep '192.168.43.1.*tcp dpt:80' | "$BB" grep -v 'xiaomi14_mifi_web' | \
+          "$BB" grep '192.168.43.1.*tcp dpt:80' | "$BB" grep -v 'xiaomi_mifi_web' | \
           "$BB" grep 'REDIRECT' | "$BB" head -n1 | "$BB" awk '{print $1}')
       [ -z "$N" ] && break
       $IPT -t nat -D "$CHAIN" "$N" 2>/dev/null

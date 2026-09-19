@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-DATA_DIR=/data/adb/xiaomi14_mifi_web
+DATA_DIR=/data/adb/xiaomi_mifi_web
 
 # 先读黑名单再清理 iptables：卸载后残留的 MAC DROP 规则会让被拉黑设备继续断网
 # P1-90：卸载脚本同样不 source 配置文件（避免执行注入内容），只提取黑名单字段
@@ -55,7 +55,7 @@ fi
 if [ -f "$DATA_DIR/supervisor.pid" ]; then
   PID=$(cat "$DATA_DIR/supervisor.pid" 2>/dev/null)
   case "$PID" in ''|*[!0-9]*) PID=0 ;; esac
-  [ "$PID" -gt 1 ] && [ -r "/proc/$PID/cmdline" ] && tr '\000' ' ' < "/proc/$PID/cmdline" | grep -q 'xiaomi14_mifi_web.*/service.sh' && kill "$PID" 2>/dev/null
+  [ "$PID" -gt 1 ] && [ -r "/proc/$PID/cmdline" ] && tr '\000' ' ' < "/proc/$PID/cmdline" | grep -q 'xiaomi_mifi_web.*/service.sh' && kill "$PID" 2>/dev/null
 fi
 if [ "$MANAGED" = "1" ]; then
   /system/bin/cmd wifi stop-softap >/dev/null 2>&1
