@@ -1,4 +1,4 @@
-Xiaomi 14 MiFi Web Control v1.7.1-beta.1
+Xiaomi 14 MiFi Web Control v1.7.2-beta
 ==================================
 
 适用环境：

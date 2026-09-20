@@ -149,6 +149,54 @@ https://ghps.cc/$RAW_URL"
 fi
 
 
+
+# Download geosite.dat（国内域名集合，GEOSITE,CN 规则依赖）：
+# 分流模式下国内 HTTPS 依赖 GEOSITE,CN 按域名直连（GEOIP,no-resolve 对已嗅探
+# SNI 的连接无法判定）。数据源 MetaCubeX meta-rules-dat latest；无固定 SHA
+# （随上游 release 更新），下载后校验：非空 + V2Ray protobuf 格式特征。
+# 下载失败不阻塞模块安装，但分流模式下国内流量可能回退走代理。
+GEOSITE_BIN="$MODPATH/bin/geosite.dat"
+if [ ! -s "$GEOSITE_BIN" ]; then
+  ui_print "- Downloading geosite.dat (GEOSITE,CN domestic direct rules) ..."
+  mkdir -p "$MODPATH/bin"
+  GS_RAW="https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat"
+  GS_URLS="$GS_RAW
+https://ghfast.top/$GS_RAW
+https://mirror.ghproxy.com/$GS_RAW
+https://gh-proxy.com/$GS_RAW"
+  TMPD="${TMPDIR:-/data/local/tmp}"
+  mkdir -p "$TMPD"
+  GS_TMP="$TMPD/geosite.$$.dat"
+  GS_OK=
+  printf '%s\n' "$GS_URLS" | while read -r URL; do
+    [ -z "$URL" ] && continue
+    ui_print "  Trying: $(echo "$URL" | cut -c1-60)..."
+    if curl -fsSL --connect-timeout 15 --max-time 180 "$URL" -o "$GS_TMP" 2>/dev/null && [ -s "$GS_TMP" ]; then
+      # V2Ray geosite.dat protobuf 首字段应为 field1/wire2（0x0a）
+      GS_MAGIC=$(od -An -tx1 -N1 "$GS_TMP" 2>/dev/null | tr -d ' \n')
+      GS_SIZE=$(wc -c < "$GS_TMP" 2>/dev/null)
+      if [ "$GS_MAGIC" = "0a" ] && [ "$GS_SIZE" -gt 1000000 ] 2>/dev/null; then
+        mv "$GS_TMP" "$GEOSITE_BIN"
+        chmod 0644 "$GEOSITE_BIN"
+        echo "OK" > "$TMPD/geosite_dl_ok.$$"
+        ui_print "- geosite.dat OK (${GS_SIZE} bytes)"
+        break
+      else
+        ui_print "    format/size invalid (magic=$GS_MAGIC size=$GS_SIZE), discarding"
+        rm -f "$GS_TMP"
+      fi
+    fi
+    rm -f "$GS_TMP"
+    sleep 2
+  done
+  if [ ! -s "$GEOSITE_BIN" ]; then
+    ui_print "- WARN: geosite.dat download failed"
+    ui_print "- 分流模式下国内网站可能走代理（节点可用时仍可访问，速度偏慢）"
+    ui_print "- 解决：手动放置 geosite.dat 到 $GEOSITE_BIN 后重启模块"
+  fi
+  rm -f "$GS_TMP" "$TMPD/geosite_dl_ok.$$"
+fi
+
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755
@@ -158,3 +206,4 @@ set_perm "$MODPATH/lib/common.sh" 0 0 0755 0644
 
 [ -f "$MODPATH/bin/mihomo" ] && set_perm "$MODPATH/bin/mihomo" 0 0 0755
 [ -f "$MODPATH/bin/geoip.metadb" ] && set_perm "$MODPATH/bin/geoip.metadb" 0 0 0644
+[ -f "$MODPATH/bin/geosite.dat" ] && set_perm "$MODPATH/bin/geosite.dat" 0 0 0644

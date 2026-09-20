@@ -2584,6 +2584,14 @@ proxy_init_dirs() {
       chmod 0600 "$PROXY_GEO_DB" 2>/dev/null
     fi
   fi
+  # GEOSITE 数据（国内域名集合）随模块安装时下载，与运行目录保持同步。
+  # 缺失时 GEOSITE,CN 规则静默失效，国内 HTTPS 会回退走代理，因此尽量保证在位。
+  if [ -s "$MODDIR/bin/geosite.dat" ]; then
+    if [ ! -s "$PROXY_DIR/geosite.dat" ] || ! "$BB" cmp -s "$MODDIR/bin/geosite.dat" "$PROXY_DIR/geosite.dat" 2>/dev/null; then
+      cp -f "$MODDIR/bin/geosite.dat" "$PROXY_DIR/geosite.dat" 2>/dev/null
+      chmod 0600 "$PROXY_DIR/geosite.dat" 2>/dev/null
+    fi
+  fi
 }
 
 proxy_core_ok() {
@@ -2828,6 +2836,10 @@ rules:
   - DOMAIN-SUFFIX,googleplay.com,GLOBAL
   - DOMAIN-SUFFIX,xn--ngstr-lra8j.com,GLOBAL
   - DOMAIN-SUFFIX,googlevideo.com,GLOBAL
+  # GEOSITE,CN 按域名判定国内直连，补上 GEOIP,no-resolve 对"已嗅探 SNI 的连接"
+  # 无法用 IP 判定的盲区（否则国内 HTTPS 会全部落入 MATCH,GLOBAL 走代理）。
+  # 分类名必须大写 CN（geosite 分类大小写敏感），geosite.dat 由 customize.sh 安装。
+  - GEOSITE,CN,DIRECT
   - GEOIP,CN,DIRECT,no-resolve
   - MATCH,GLOBAL
 EOF

@@ -1,3 +1,16 @@
+# v1.7.2-beta（2026-09-20）
+
+- **修复分流模式（rule）下国内 HTTPS 全部走代理、导致全网断连的问题**（真机故障）。
+  - 根因①：`GEOIP,CN,DIRECT,no-resolve` 对已被 sniffer 嗅探出 SNI 的连接无法用 IP 判定，
+    国内 HTTPS 全部落入 `MATCH,GLOBAL` 走代理；
+  - 根因②：GLOBAL 组当时选中节点不可达（连接超时），走代理的流量全断。
+  - 修复：规则新增 `GEOSITE,CN,DIRECT`（按域名判定国内直连），置于 GEOIP 规则之前；
+    下载 geosite.dat 国内域名集合（MetaCubeX meta-rules-dat）。
+- **GEOSITE 分类名大小写陷阱**：geosite 分类名大小写敏感，必须写大写 `CN`（小写 `cn` 匹配不到任何数据、规则静默失效）。
+- **代码落地**：`common.sh` 规则模板与 `proxy_init_dirs` 自动同步 geosite.dat；
+  `customize.sh` 安装时多镜像在线下载 geosite.dat（V2Ray protobuf 格式 + 大小校验，失败不阻塞安装但会提示）。
+- 验证：微信/豆包/小米/iCloud.cn 直连（`GeoSite(CN) DIRECT`）；google/github 经代理 200。
+
 # v1.7.1-beta.1（2026-09-20）
 
 - **模块目录与 ID 完全统一**：安装目录固定为 `/data/adb/modules/xiaomi_mifi_web`（目录名 = MODID，符合 KernelSU 规范）；所有 CGI/公共脚本不再硬编码 `xiaomi14_mifi_web` 模块路径；`dedup_dup_modules` 改为优先保留标准目录、备份非标准残留副本，运行时不移当前执行目录（避免服务路径失效）。
