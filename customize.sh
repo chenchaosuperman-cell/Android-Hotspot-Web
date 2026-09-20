@@ -45,11 +45,29 @@ https://ghps.cc/$RAW_URL"
     [ -f /tmp/mihomo_dl_ok ] && break
   done
   if [ -f "$MIHOMO_BIN" ]; then
-    ui_print "- Mihomo core downloaded OK"
-  else
-    ui_print "- WARN: Mihomo core download failed after all mirrors."
-    ui_print "- You can manually place it at: $MIHOMO_BIN"
-    ui_print "- File: mihomo-android-arm64-v8 $MIHOMO_VER"
+    # 校验：ELF magic
+    MAGIC=$(od -An -tx1 -N4 "$MIHOMO_BIN" 2>/dev/null | tr -d ' \n')
+    if [ "$MAGIC" = "7f454c46" ]; then
+      chmod 0755 "$MIHOMO_BIN"
+      VER=$("$MIHOMO_BIN" -v 2>/dev/null | head -n 1)
+      if [ -n "$VER" ]; then
+        ui_print "- Mihomo core OK: $VER"
+      else
+        ui_print "- WARN: mihomo -v failed, removing invalid binary"
+        rm -f "$MIHOMO_BIN"
+      fi
+    else
+      ui_print "- WARN: binary is not ELF (magic=$MAGIC), removing"
+      rm -f "$MIHOMO_BIN"
+    fi
+  fi
+  if [ ! -f "$MIHOMO_BIN" ]; then
+    ui_print "- ============================================"
+    ui_print "- 模块主体安装成功，但科学上网功能不可用"
+    ui_print "- 原因：Mihomo 核心自动下载失败"
+    ui_print "- 解决：手动放置 mihomo 到 $MIHOMO_BIN"
+    ui_print "- 或安装后执行: $MODPATH/action.sh"
+    ui_print "- ============================================"
   fi
   rm -f /tmp/mihomo_dl_ok /tmp/mihomo.gz /tmp/mihomo
 fi

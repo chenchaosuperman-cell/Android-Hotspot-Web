@@ -67,7 +67,7 @@
 - 测试通知功能
 
 ### 科学上网（Mihomo）
-- 内置 Mihomo ARM64 核心，不依赖首次在线下载
+- 安装时自动下载 Mihomo ARM64 核心（v1.19.31），多镜像 fallback
 - 支持 Clash/Mihomo 订阅、AUTO 自动选择、FALLBACK 故障转移、MANUAL 手动选节点
 - 热点客户端 TCP/DNS 透明代理，国内 IP 直连、其它流量按代理策略处理
 - 节点测速、订阅更新、节点健康检查和异常自动恢复
