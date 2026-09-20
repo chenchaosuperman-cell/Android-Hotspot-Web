@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-MODDIR=/data/adb/modules/xiaomi14_mifi_web
+MODDIR=/data/adb/modules/xiaomi_mifi_web
 if [ ! -r "$MODDIR/lib/common.sh" ]; then
   SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
   MODDIR=${SCRIPT_PATH%/web/cgi-bin/log.cgi}

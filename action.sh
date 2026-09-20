@@ -39,8 +39,11 @@ case "$cmd" in
       start)
         rm -f "$MANUAL_OFF_FILE" 2>/dev/null
         echo 1 > "$DESIRED_FILE" && chmod 0600 "$DESIRED_FILE"
-        /system/bin/cmd wifi start-softap >/dev/null 2>&1
-        echo "hotspot start requested"
+        # v1.7.1：与 Web 后台一致，按模块保存的 SSID/密码/频段/信道/最大客户端参数启动
+        . "$MODDIR/lib/common.sh" 2>/dev/null
+        load_config
+        run_softap "$SSID" "$SECURITY" "$PASS" "$BAND" "$CHANNEL" "$MAX_CLIENTS" >/dev/null 2>&1
+        echo "hotspot start requested with saved config"
         ;;
       stop)
         echo 1 > "$MANUAL_OFF_FILE" && chmod 0600 "$MANUAL_OFF_FILE"

@@ -1,3 +1,12 @@
+# v1.7.1-beta.1（2026-09-20）
+
+- **模块目录与 ID 完全统一**：安装目录固定为 `/data/adb/modules/xiaomi_mifi_web`（目录名 = MODID，符合 KernelSU 规范）；所有 CGI/公共脚本不再硬编码 `xiaomi14_mifi_web` 模块路径；`dedup_dup_modules` 改为优先保留标准目录、备份非标准残留副本，运行时不移当前执行目录（避免服务路径失效）。
+- **Mihomo 下载供应链加固**：仅允许 arm64/aarch64 安装代理组件；下载后强制校验官方 v1.19.31 SHA-256（`.gz` 与解压后二进制双重校验，`de00bc53…` / `dbd8af27…`），任一校验失败立即删除、绝不执行；临时文件改用 KernelSU `$TMPDIR` 唯一命名，不再共用 `/tmp/mihomo`。
+- **后台安全（第一轮）**：首次安装生成随机后台管理密码（安装输出中显示，升级不覆盖已有密码）；新增 Web 管理端口访问控制——仅放行 `lo`、热点接口与 USB 共享接口，其余接口（蜂窝数据等）一律 `DROP`，supervisor 主循环周期性保活规则。
+- **修复配置导入校验**：`NOTIFY_TRAFFIC_THRESHOLDS`（1~5 个 1~100 整数）、`PROXY_ROUTE_MODE`（rule/global）、`PROXY_SCOPE`（hotspot/self/both）从“只能是 0 或 1”分支拆出，导入可完整恢复。
+- **行为一致性**：`action.sh hotspot start` 改为按模块保存的 SSID/密码/频段/信道/最大客户端启动，与 Web 后台一致。
+- **文档/元数据**：README 同步 v1.7.1；新增 `update.json`（KernelSU 在线检查更新）；module.prop 增加 `updateJson`。
+
 # v1.7.0（2026-09-20）
 
 - **修复 KernelSU 管理器下滑模块列表闪退（根治）**：当 `/data/adb/modules/` 下存在多个目录且 `module.prop` 的 `id` 相同（如 `xiaomi14_mifi_web` 与误复制的 `xiaomi_mifi_web` 并存）时，KSU Manager 渲染模块列表 Compose key 冲突崩溃。

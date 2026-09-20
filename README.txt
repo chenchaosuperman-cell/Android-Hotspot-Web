@@ -1,4 +1,4 @@
-Xiaomi 14 MiFi Web Control v1.6.0-beta.4
+Xiaomi 14 MiFi Web Control v1.7.1-beta.1
 ==================================
 
 适用环境：
@@ -13,7 +13,8 @@ Xiaomi 14 MiFi Web Control v1.6.0-beta.4
 4. 连接热点 Xiaomi14-MiFi，密码 87654321。
 5. 优先访问固定地址 http://192.168.43.1:8080。
 6. 如果固定地址在当前ROM不可达，在客户端 Wi-Fi 详情中查看“路由器/网关”地址，然后访问 http://网关地址:8080。
-7. 默认网页登录：admin / admin。
+7. 网页登录：admin / <安装时随机生成的后台密码>（见 KernelSU 安装输出，首次安装有效）。
+   升级安装不会重置密码；忘记密码可查看 /data/adb/xiaomi14_mifi_web/httpd.conf 中 ":admin:密码"。
 8. 首次登录后立即进入“后台安全”修改管理密码。
 
 默认设置：
@@ -22,6 +23,13 @@ Xiaomi 14 MiFi Web Control v1.6.0-beta.4
 - 频段：2.4GHz
 - 开机自动启动：开启
 - Web端口：8080
+
+v1.7.1 更新
+- 模块目录与 ID 统一：安装目录固定为 /data/adb/modules/xiaomi_mifi_web（目录名=MODID），所有 CGI/脚本不再硬编码旧目录；残留非标准目录自动备份清理。
+- Mihomo 供应链加固：仅 arm64 安装；下载后强制校验官方 SHA-256（gz 与二进制双重校验），失败立即删除绝不执行；临时文件使用 KernelSU TMPDIR。
+- 后台安全：首次安装生成随机管理密码（安装输出中显示）；Web 管理端口仅允许本机/热点/USB 共享接口访问，其余接口（蜂窝等）一律拒绝。
+- 修复配置导入：NOTIFY_TRAFFIC_THRESHOLDS / PROXY_ROUTE_MODE / PROXY_SCOPE 三个字段导入不再被误判为 0/1 而失效。
+- action.sh hotspot start 与 Web 后台一致：按模块保存的 SSID/密码/频段/信道启动。
 
 v1.6.0-beta.4 更新
 - “通知”Tab 调整为“消息”，短信转发放在最上方。

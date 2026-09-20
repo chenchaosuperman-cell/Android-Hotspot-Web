@@ -1,14 +1,8 @@
 #!/system/bin/sh
 
-: "${MODDIR:=/data/adb/modules/xiaomi14_mifi_web}"
+: "${MODDIR:=/data/adb/modules/xiaomi_mifi_web}"
+# 数据目录：模块配置/日志/状态都存这里（保持历史路径，避免升级丢失用户配置）
 DATA_DIR=/data/adb/xiaomi14_mifi_web
-# 从旧版 xiaomi14_mifi_web 迁移数据
-_OLD_DATA=/data/adb/xiaomi14_mifi_web
-if [ -d "$_OLD_DATA" ] && [ ! -e "$DATA_DIR" ]; then
-  mkdir -p "$DATA_DIR"
-  cp -a "$_OLD_DATA/." "$DATA_DIR/" 2>/dev/null
-fi
-unset _OLD_DATA
 CONFIG="$DATA_DIR/config.conf"
 LOG="$DATA_DIR/service.log"
 HTTP_CONF="$DATA_DIR/httpd.conf"
@@ -58,25 +52,34 @@ DATE_CMD=$(command -v date 2>/dev/null || echo /system/bin/date)
 # 崩溃。本函数将同 id 的其他目录移入 /data/adb/ksu/modules_dup_bak/，
 # 保证每个模块 id 全局唯一；service.sh 每次启动时自动执行。
 dedup_dup_modules() {
-  [ -z "$MODDIR" ] && MODDIR=/data/adb/modules/xiaomi14_mifi_web
+  [ -z "$MODDIR" ] && MODDIR=/data/adb/modules/xiaomi_mifi_web
   [ -z "$BB" ] && BB=$(find_busybox)
   MY_ID=$("$BB" sed -n 's/^id=//p' "$MODDIR/module.prop" 2>/dev/null | "$BB" head -n 1)
   [ -z "$MY_ID" ] && return 0
+  # 标准目录 = /data/adb/modules/<id>（KernelSU 规范：目录名必须等于 MODID）。
+  # 标准目录永远保留；仅备份“目录名与 ID 不一致”的残留副本。
+  STD_DIR=/data/adb/modules/$MY_ID
   BK_DIR=/data/adb/ksu/modules_dup_bak
   for D in /data/adb/modules/*/; do
     [ -d "$D" ] || continue
     D=${D%/}
-    [ "$D" = "$MODDIR" ] && continue
+    [ "$D" = "$STD_DIR" ] && continue
     [ -f "$D/module.prop" ] || continue
     DID=$("$BB" sed -n 's/^id=//p' "$D/module.prop" 2>/dev/null | "$BB" head -n 1)
     if [ -n "$DID" ] && [ "$DID" = "$MY_ID" ]; then
+      # 运行时不要移动当前正在执行的模块目录（服务已加载但后续读写路径会失败）：
+      # 若当前运行目录就是非标准副本，只记录告警，提示重装到标准目录。
+      if [ "$D" = "$MODDIR" ]; then
+        echo "$($DATE_CMD '+%F %T') dedup: WARN running from non-standard dir '$D', expected '$STD_DIR' (reinstall to standard dir)" >> "$LOG" 2>/dev/null
+        continue
+      fi
       "$BB" mkdir -p "$BK_DIR" 2>/dev/null
       TS=$("$DATE_CMD" +%Y%m%d-%H%M%S 2>/dev/null)
       [ -z "$TS" ] && TS=$$
       NAME=$("$BB" basename "$D" 2>/dev/null)
       [ -z "$NAME" ] && NAME=dup_module
       if "$BB" mv "$D" "$BK_DIR/${NAME}.${TS}" 2>/dev/null; then
-        echo "$($DATE_CMD '+%F %T') dedup: moved duplicate module dir '$D' -> '$BK_DIR/${NAME}.${TS}'" >> "$LOG" 2>/dev/null
+        echo "$($DATE_CMD '+%F %T') dedup: moved non-standard duplicate module dir '$D' -> '$BK_DIR/${NAME}.${TS}'" >> "$LOG" 2>/dev/null
       fi
     fi
   done

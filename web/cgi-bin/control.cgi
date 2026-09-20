@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-MODDIR=/data/adb/modules/xiaomi14_mifi_web
+MODDIR=/data/adb/modules/xiaomi_mifi_web
 if [ ! -r "$MODDIR/lib/common.sh" ]; then
   SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
   MODDIR=${SCRIPT_PATH%/web/cgi-bin/control.cgi}
@@ -561,8 +561,23 @@ case "$ACTION" in
       case "$k" in
         SECURITY) case "$v" in open|wpa2|wpa3|wpa3_transition) return 0 ;; esac ;;
         BAND) case "$v" in 2|5|any) return 0 ;; esac ;;
-        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)
+        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF)
           case "$v" in 0|1) return 0 ;; esac ;;
+        NOTIFY_TRAFFIC_THRESHOLDS)
+          # 1~5 个逗号分隔的 1~100 整数（如 80,90,100）；修复导入时被误判为 0/1 而失效
+          case "$v" in ''|*[!0-9,]*) : ;; *)
+            N=0; OK=1
+            _LIST=$(printf '%s' "$v" | "$BB" tr ',' ' ')
+            for T in $_LIST; do
+              case "$T" in ''|*[!0-9]*) OK=0; break ;; esac
+              if [ "$T" -lt 1 ] || [ "$T" -gt 100 ]; then OK=0; break; fi
+              N=$((N+1))
+            done
+            if [ "$OK" = 1 ] && [ "$N" -ge 1 ] && [ "$N" -le 5 ]; then return 0; fi
+            ;;
+          esac ;;
+        PROXY_ROUTE_MODE) case "$v" in rule|global) return 0 ;; esac ;;
+        PROXY_SCOPE) case "$v" in hotspot|self|both) return 0 ;; esac ;;
         PORT) case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -ge 1024 ] && [ "$v" -le 65535 ] && return 0 ;; esac ;;
         CHANNEL) case "$v" in ''|*[!0-9]*) : ;; *) return 0 ;; esac ;;
         MAX_CLIENTS) valid_max_clients "$v" && return 0 ;;

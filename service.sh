@@ -100,8 +100,14 @@ EOF
 fi
 
 if [ ! -f "$HTTP_CONF" ]; then
-  cat > "$HTTP_CONF" <<'EOF'
-/:admin:admin
+  ADMIN_PASS=admin
+  if [ -r "$MODDIR/.admin_pwd" ]; then
+    ADMIN_PASS=$(cat "$MODDIR/.admin_pwd" 2>/dev/null | tr -d ' \r\n')
+    case "$ADMIN_PASS" in ''|*[!A-Za-z0-9._@!-]*) ADMIN_PASS=admin ;; esac
+    rm -f "$MODDIR/.admin_pwd"
+  fi
+  cat > "$HTTP_CONF" <<EOF
+/:admin:$ADMIN_PASS
 *.cgi:/system/bin/sh
 EOF
   chmod 0600 "$HTTP_CONF"
@@ -115,6 +121,18 @@ else
   fi
   chmod 0600 "$HTTP_CONF"
 fi
+
+# Web 管理页访问控制（v1.7.1）：仅允许本机(lo)、热点接口与 USB 共享接口访问管理端口，
+# 其余接口（蜂窝数据等）一律 DROP。规则由 supervisor 主循环周期性校验保活
+# （Android netd 在热点启停时可能清空自定义 INPUT 规则）。
+ensure_web_fw() {
+  [ -n "$PORT" ] || PORT=8080
+  $IPT -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || $IPT -A INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null
+  $IPT -C INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+  for IFACE in wlan0 wlan1 wlan2 wlan3 wlan4 ap0 rndis0 usb0 eth0; do
+    $IPT -C INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+  done
+}
 
 if [ ! -s "$CSRF_FILE" ]; then
   "$BB" od -An -N24 -tx1 /dev/urandom 2>/dev/null | "$BB" tr -d ' \r\n' > "$CSRF_FILE"
@@ -270,6 +288,8 @@ TICK=0
 IDLE_SECS=0
 while true; do
   sleep 5
+  # Web 管理页访问控制保活（每轮校验，被框架清空后自动重建）
+  ensure_web_fw
 
   # 处理 CGI 提交的控制任务（由常驻进程执行，避免 CGI 子进程被杀）
   if [ -s "$CONTROL_REQUEST" ]; then
