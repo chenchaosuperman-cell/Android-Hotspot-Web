@@ -50,6 +50,39 @@ BB=$(find_busybox)
 DATE_CMD=$(command -v date 2>/dev/null || echo /system/bin/date)
 [ -n "$DATE_CMD" ] || DATE_CMD=date
 
+# ── 模块目录去重自检（v1.7.0）────────────────────────────────────
+# 修复 KernelSU 管理器打开/下滑模块列表闪退：
+# 当 /data/adb/modules/ 下存在多个目录、其 module.prop 的 id 与当前模块
+# 相同（例如误将工作副本直接复制为 xiaomi_mifi_web 目录，与
+# xiaomi14_mifi_web 并存），KSU Manager 渲染列表时 Compose key 冲突导致
+# 崩溃。本函数将同 id 的其他目录移入 /data/adb/ksu/modules_dup_bak/，
+# 保证每个模块 id 全局唯一；service.sh 每次启动时自动执行。
+dedup_dup_modules() {
+  [ -z "$MODDIR" ] && MODDIR=/data/adb/modules/xiaomi14_mifi_web
+  [ -z "$BB" ] && BB=$(find_busybox)
+  MY_ID=$("$BB" sed -n 's/^id=//p' "$MODDIR/module.prop" 2>/dev/null | "$BB" head -n 1)
+  [ -z "$MY_ID" ] && return 0
+  BK_DIR=/data/adb/ksu/modules_dup_bak
+  for D in /data/adb/modules/*/; do
+    [ -d "$D" ] || continue
+    D=${D%/}
+    [ "$D" = "$MODDIR" ] && continue
+    [ -f "$D/module.prop" ] || continue
+    DID=$("$BB" sed -n 's/^id=//p' "$D/module.prop" 2>/dev/null | "$BB" head -n 1)
+    if [ -n "$DID" ] && [ "$DID" = "$MY_ID" ]; then
+      "$BB" mkdir -p "$BK_DIR" 2>/dev/null
+      TS=$("$DATE_CMD" +%Y%m%d-%H%M%S 2>/dev/null)
+      [ -z "$TS" ] && TS=$$
+      NAME=$("$BB" basename "$D" 2>/dev/null)
+      [ -z "$NAME" ] && NAME=dup_module
+      if "$BB" mv "$D" "$BK_DIR/${NAME}.${TS}" 2>/dev/null; then
+        echo "$($DATE_CMD '+%F %T') dedup: moved duplicate module dir '$D' -> '$BK_DIR/${NAME}.${TS}'" >> "$LOG" 2>/dev/null
+      fi
+    fi
+  done
+  return 0
+}
+
 header_json() {
   printf 'Content-Type: application/json; charset=utf-8\r\n'
   printf 'Cache-Control: no-store\r\n\r\n'

@@ -1,3 +1,10 @@
+# v1.7.0（2026-09-20）
+
+- **修复 KernelSU 管理器下滑模块列表闪退（根治）**：当 `/data/adb/modules/` 下存在多个目录且 `module.prop` 的 `id` 相同（如 `xiaomi14_mifi_web` 与误复制的 `xiaomi_mifi_web` 并存）时，KSU Manager 渲染模块列表 Compose key 冲突崩溃。
+- 新增模块目录去重自检 `dedup_dup_modules`：`service.sh` 每次启动自动扫描 `/data/adb/modules/`，将与本模块同 `id` 的其他目录移入 `/data/adb/ksu/modules_dup_bak/` 备份，确保每个模块 `id` 全局唯一。
+- `customize.sh` 安装/更新时同样执行去重，杜绝再次出现重复目录。
+- 版本号升级：v1.6.2 → v1.7.0（versionCode 1700）。
+
 # v1.6.0-beta.8
 
 - 修复“全部测速”后节点延迟一直显示 `—`：改为等待 Mihomo MANUAL 策略组测速并直接返回结果。

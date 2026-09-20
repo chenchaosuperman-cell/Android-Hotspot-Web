@@ -24,6 +24,10 @@ done
 sleep 5
 
 . "$MODDIR/lib/common.sh"
+# 模块目录去重自检（v1.7.0）：清理与当前模块同 id 的残留目录，
+# 修复 KSU 管理器下滑模块列表闪退（重复 id → LazyColumn key 冲突）
+dedup_dup_modules
+
 # 旧版文本队列 → 目录式队列（一次性迁移，升级兼容）
 migrate_legacy_queues
 

@@ -1,6 +1,6 @@
 id=xiaomi_mifi_web
 name=Android-Hotspot-Web
-version=1.6.2
-versionCode=1620
+version=1.7.0
+versionCode=1700
 author=chenchaosuperman
-description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, scheduling, SMS forward, mihomo proxy, PushPlus/DingTalk notifications. Primarily tested on Xiaomi 14 / HyperOS 3 / Android 16.
+description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, scheduling, SMS forward, mihomo proxy, PushPlus/DingTalk notifications. Primarily tested on Xiaomi 14 / HyperOS 3 / Android 16. v1.7.0: built-in duplicate module dir self-check prevents KernelSU Manager list crash.

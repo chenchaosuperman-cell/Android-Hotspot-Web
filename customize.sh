@@ -14,6 +14,28 @@ ui_print "Web port: 8080"
 ui_print "Web login: admin / admin"
 ui_print "IMPORTANT: change the Web password after first login."
 
+# 模块目录去重自检（v1.7.0）：安装/更新时清理与当前模块同 id 的残留目录，
+# 修复 KernelSU 管理器下滑模块列表闪退（重复 id → LazyColumn key 冲突）。
+# 残留目录移入 /data/adb/ksu/modules_dup_bak/ 备份，不直接删除。
+MOD_ID=$(sed -n 's/^id=//p' "$MODPATH/module.prop" 2>/dev/null | head -n 1)
+if [ -n "$MOD_ID" ]; then
+  BK_DIR=/data/adb/ksu/modules_dup_bak
+  for D in /data/adb/modules/*/; do
+    [ -d "$D" ] || continue
+    D=${D%/}
+    [ "$D" = "$MODPATH" ] && continue
+    [ -f "$D/module.prop" ] || continue
+    DID=$(sed -n 's/^id=//p' "$D/module.prop" 2>/dev/null | head -n 1)
+    if [ -n "$DID" ] && [ "$DID" = "$MOD_ID" ]; then
+      mkdir -p "$BK_DIR" 2>/dev/null
+      TS=$(date +%Y%m%d-%H%M%S 2>/dev/null); [ -z "$TS" ] && TS=$$
+      if mv "$D" "$BK_DIR/$(basename "$D").$TS" 2>/dev/null; then
+        ui_print "- dedup: moved duplicate module $D"
+      fi
+    fi
+  done
+fi
+
 # Download Mihomo core if not bundled
 MIHOMO_BIN="$MODPATH/bin/mihomo"
 MIHOMO_VER="v1.19.31"
