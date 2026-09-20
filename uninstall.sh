@@ -57,6 +57,34 @@ if [ -f "$DATA_DIR/supervisor.pid" ]; then
   case "$PID" in ''|*[!0-9]*) PID=0 ;; esac
   [ "$PID" -gt 1 ] && [ -r "/proc/$PID/cmdline" ] && tr '\000' ' ' < "/proc/$PID/cmdline" | grep -q 'xiaomi_mifi_web.*/service.sh' && kill "$PID" 2>/dev/null
 fi
+# 科学上网清理：先撤透明代理/QUIC 规则，再停止 Mihomo，避免卸载后热点断网。
+PROXY_IFACE=$(cat "$DATA_DIR/proxy/iface" 2>/dev/null | tr -d ' \r\n')
+for IFACE in $PROXY_IFACE wlan2 wlan3 wlan4; do
+  [ -n "$IFACE" ] || continue
+  while /system/bin/iptables -t nat -C PREROUTING -i "$IFACE" -j MIFI_PROXY 2>/dev/null; do
+    /system/bin/iptables -t nat -D PREROUTING -i "$IFACE" -j MIFI_PROXY 2>/dev/null || break
+  done
+  while /system/bin/iptables -t filter -C FORWARD -i "$IFACE" -j MIFI_BLOCK_QUIC 2>/dev/null; do
+    /system/bin/iptables -t filter -D FORWARD -i "$IFACE" -j MIFI_BLOCK_QUIC 2>/dev/null || break
+  done
+done
+# 兼容 beta2 遗留的无接口限制规则
+while /system/bin/iptables -t nat -C PREROUTING -j MIFI_PROXY 2>/dev/null; do
+  /system/bin/iptables -t nat -D PREROUTING -j MIFI_PROXY 2>/dev/null || break
+done
+while /system/bin/iptables -t filter -C FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null; do
+  /system/bin/iptables -t filter -D FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null || break
+done
+/system/bin/iptables -t nat -F MIFI_PROXY 2>/dev/null || true
+/system/bin/iptables -t nat -X MIFI_PROXY 2>/dev/null || true
+/system/bin/iptables -t filter -F MIFI_BLOCK_QUIC 2>/dev/null || true
+/system/bin/iptables -t filter -X MIFI_BLOCK_QUIC 2>/dev/null || true
+if [ -r "$DATA_DIR/proxy/mihomo.pid" ]; then
+  MPID=$(cat "$DATA_DIR/proxy/mihomo.pid" 2>/dev/null)
+  case "$MPID" in ''|*[!0-9]*) MPID=0 ;; esac
+  [ "$MPID" -gt 1 ] 2>/dev/null && kill "$MPID" 2>/dev/null || true
+fi
+
 if [ "$MANAGED" = "1" ]; then
   /system/bin/cmd wifi stop-softap >/dev/null 2>&1
 fi

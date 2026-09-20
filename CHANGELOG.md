@@ -1,3 +1,29 @@
+## v1.5.24-beta.5
+
+- 修复科学插件 `Mihomo 配置校验失败`：收敛为更保守、当前文档支持的基础配置，移除首启阶段非必要 DNS/GEO 可选项。
+- 保留 `GEOIP,CN,DIRECT` + `MATCH,GLOBAL`，国内 IP 直连、其它流量进入代理策略组。
+- 配置校验失败时把 Mihomo 的真实错误摘要写入状态接口并显示在科学页，不再只显示泛化“配置错误”。
+- Provider/AUTO/FALLBACK/MANUAL、DNS 劫持和 REDIRECT 逻辑保持不变。
+
+## v1.5.24-beta.4
+- 修复 Safari/移动端启动科学上网时 `Load failed`：代理启动改为后台任务，CGI 立即返回，不再用 20~40 秒长请求阻塞 Web 控制。
+- `status.cgi` 改为读取代理健康快照，不再每 5 秒同步调用 Mihomo API/Provider，避免状态接口被代理网络请求拖死。
+- service 守护每 30 秒更新 API/Provider/节点数量快照，并异步恢复 Mihomo。
+- 更新订阅/全部测速改为后台任务，避免控制接口长时间占用。
+- proxy.cgi 移除重复 API 预检查，减少节点列表失败时等待。
+- 前端接口缓存版本升至 v142，并显示科学页自身接口错误。
+
+
+## v1.5.24-beta.3
+- 修复科学插件配置持久化：PROXY_ENABLE / PROXY_SUB_B64 / PROXY_MODE / PROXY_BLOCK_QUIC 正确读写。
+- 修复订阅/节点 Base64URL 解码与 proxy.cgi action 解析。
+- 修复节点列表：正确解析 Mihomo `/proxies` 的 `data.proxies` 结构。
+- Provider 必须实际加载到节点后才挂透明代理；启动失败自动 fail-open。
+- 国内 GEOIP 继续直连，GEO 数据改用内置 `geoip.metadb` + `geodata-mode: false`。
+- DNS 增加境外 fallback（经 GLOBAL）与 Google/YouTube 污染过滤。
+- iptables 仅挂到热点接口，修复 beta2 全局 PREROUTING 风险；支持热点接口变化自动重挂。
+- service.sh 增加 Mihomo/API/iptables 守护；uninstall.sh 完整清理代理规则和核心进程。
+- 去除重复代理 JS；新增核心/订阅/API/节点数量状态。
 ## v1.5.24-beta.1（2026-09-20）
 
 ### 新增：科学上网 / Mihomo 代理

@@ -168,6 +168,16 @@ cfg_apply_key() {
             esac
           done
           [ -n "$_NT_OUT" ] && NOTIFY_TRAFFIC_THRESHOLDS=$_NT_OUT ;;
+        PROXY_ENABLE)
+          case "$value" in 0|1) PROXY_ENABLE=$value ;; esac ;;
+        PROXY_SUB_B64)
+          if [ -z "$value" ]; then PROXY_SUB_B64=
+          elif valid_b64url "$value"; then PROXY_SUB_B64=$value
+          fi ;;
+        PROXY_MODE)
+          case "$value" in auto|fallback|manual) PROXY_MODE=$value ;; esac ;;
+        PROXY_BLOCK_QUIC)
+          case "$value" in 0|1) PROXY_BLOCK_QUIC=$value ;; esac ;;
         SMS_FWD)
           case "$value" in 0|1) SMS_FWD=$value ;; esac ;;
         PORT)
@@ -311,6 +321,10 @@ load_config() {
   SMS_FWD_SENDERS_B64=${SMS_FWD_SENDERS_B64:-}
   SMS_FWD_KEYWORD=$(b64url_decode "$SMS_FWD_KEYWORD_B64")
   SMS_FWD_SENDERS=$(b64url_decode "$SMS_FWD_SENDERS_B64")
+  PROXY_ENABLE=${PROXY_ENABLE:-0}
+  PROXY_SUB_B64=${PROXY_SUB_B64:-}
+  PROXY_MODE=${PROXY_MODE:-auto}
+  PROXY_BLOCK_QUIC=${PROXY_BLOCK_QUIC:-1}
 }
 
 get_hotspot_iface() {
@@ -2361,7 +2375,7 @@ read_traffic_stats() {
 }
 
 
-# ---------- Mihomo / Proxy (v1.5.24) ----------
+# ---------- Mihomo / Proxy (v1.5.24-beta.3) ----------
 PROXY_DIR="$DATA_DIR/proxy"
 PROXY_BIN="$MODDIR/bin/mihomo"
 PROXY_CFG="$PROXY_DIR/config.yaml"
@@ -2374,14 +2388,40 @@ PROXY_STATE_FILE="$PROXY_DIR/state"
 PROXY_LAST_ERROR="$PROXY_DIR/last_error"
 PROXY_SUB_FILE="$PROXY_DIR/sub_url.txt"
 PROXY_LOCK="$PROXY_DIR/proxy.lock"
+PROXY_IFACE_FILE="$PROXY_DIR/iface"
+PROXY_HEALTH_FILE="$PROXY_DIR/health.state"
+PROXY_START_LOCK="$PROXY_DIR/start.lock"
+PROXY_GEO_DB="$PROXY_DIR/geoip.metadb"
 PROXY_REDIR_PORT=7893
 PROXY_DNS_PORT=1053
 PROXY_API_HOST="127.0.0.1"
 PROXY_API_PORT=9090
 PROXY_CORE_VERSION="1.19.31"
+PROXY_CURL=/system/bin/curl
+[ -x "$PROXY_CURL" ] || PROXY_CURL=$(command -v curl 2>/dev/null)
+
+proxy_log() {
+  proxy_init_dirs
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$PROXY_RUNTIME_LOG" 2>/dev/null
+  # 512 KiB 简单轮换，避免代理日志无限增长
+  local size
+  size=$(wc -c < "$PROXY_RUNTIME_LOG" 2>/dev/null | tr -d ' ')
+  case "$size" in ''|*[!0-9]*) size=0 ;; esac
+  if [ "$size" -gt 524288 ] 2>/dev/null; then
+    tail -c 262144 "$PROXY_RUNTIME_LOG" > "$PROXY_RUNTIME_LOG.tmp" 2>/dev/null && mv -f "$PROXY_RUNTIME_LOG.tmp" "$PROXY_RUNTIME_LOG"
+  fi
+}
 
 proxy_init_dirs() {
   mkdir -p "$PROXY_DIR/providers" "$PROXY_DIR/cache"
+  chmod 0700 "$PROXY_DIR" "$PROXY_DIR/providers" "$PROXY_DIR/cache" 2>/dev/null
+  # GEOIP 数据随模块离线打包。geodata-mode=false 时 Mihomo 使用 MMDB/MetaDB。
+  if [ -s "$MODDIR/bin/geoip.metadb" ]; then
+    if [ ! -s "$PROXY_GEO_DB" ] || ! "$BB" cmp -s "$MODDIR/bin/geoip.metadb" "$PROXY_GEO_DB" 2>/dev/null; then
+      cp -f "$MODDIR/bin/geoip.metadb" "$PROXY_GEO_DB" 2>/dev/null
+      chmod 0600 "$PROXY_GEO_DB" 2>/dev/null
+    fi
+  fi
 }
 
 proxy_core_ok() {
@@ -2398,8 +2438,10 @@ proxy_core_ok() {
 }
 
 proxy_generate_secret() {
+  proxy_init_dirs
   if [ ! -s "$PROXY_SECRET_FILE" ]; then
     head -c 16 /dev/urandom | md5sum | cut -c1-16 > "$PROXY_SECRET_FILE"
+    chmod 0600 "$PROXY_SECRET_FILE" 2>/dev/null
   fi
   cat "$PROXY_SECRET_FILE" 2>/dev/null
 }
@@ -2409,47 +2451,130 @@ proxy_read_state() {
 }
 
 proxy_write_state() {
-  echo "$1" > "$PROXY_STATE_FILE"
+  printf '%s\n' "$1" > "$PROXY_STATE_FILE"
+  chmod 0600 "$PROXY_STATE_FILE" 2>/dev/null
+}
+
+proxy_set_error() {
+  printf '%s\n' "$1" > "$PROXY_LAST_ERROR"
+  chmod 0600 "$PROXY_LAST_ERROR" 2>/dev/null
+  [ -n "$1" ] && proxy_log "error: $1"
+}
+
+proxy_clear_error() {
+  : > "$PROXY_LAST_ERROR" 2>/dev/null
+  chmod 0600 "$PROXY_LAST_ERROR" 2>/dev/null
+}
+
+proxy_health_write() {
+  # Lightweight snapshot for status.cgi. Never make status.cgi wait on Mihomo HTTP APIs.
+  local api="${1:-false}" provider="${2:-false}" count="${3:-0}"
+  case "$api" in true|false) : ;; *) api=false ;; esac
+  case "$provider" in true|false) : ;; *) provider=false ;; esac
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  {
+    printf 'api=%s\n' "$api"
+    printf 'provider=%s\n' "$provider"
+    printf 'count=%s\n' "$count"
+    printf 'time=%s\n' "$(date +%s 2>/dev/null || echo 0)"
+  } > "$PROXY_HEALTH_FILE.tmp" 2>/dev/null && mv -f "$PROXY_HEALTH_FILE.tmp" "$PROXY_HEALTH_FILE" 2>/dev/null
+  chmod 0600 "$PROXY_HEALTH_FILE" 2>/dev/null
+}
+
+proxy_health_read() {
+  PROXY_HEALTH_API=false
+  PROXY_HEALTH_PROVIDER=false
+  PROXY_HEALTH_COUNT=0
+  [ -r "$PROXY_HEALTH_FILE" ] || return 0
+  while IFS='=' read -r k v; do
+    case "$k" in
+      api) case "$v" in true|false) PROXY_HEALTH_API=$v ;; esac ;;
+      provider) case "$v" in true|false) PROXY_HEALTH_PROVIDER=$v ;; esac ;;
+      count) case "$v" in ''|*[!0-9]*) : ;; *) PROXY_HEALTH_COUNT=$v ;; esac ;;
+    esac
+  done < "$PROXY_HEALTH_FILE"
+}
+
+proxy_refresh_health() {
+  local count=0
+  if ! proxy_is_running; then
+    proxy_health_write false false 0
+    return 1
+  fi
+  if ! proxy_api_ready; then
+    proxy_health_write false false 0
+    return 1
+  fi
+  if proxy_provider_ready; then
+    count=$(proxy_provider_node_count)
+    proxy_health_write true true "$count"
+    return 0
+  fi
+  proxy_health_write true false 0
+  return 1
 }
 
 proxy_is_running() {
   [ -f "$PROXY_PIDFILE" ] || return 1
   local pid
   pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
-  [ -n "$pid" ] || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" -gt 1 ] 2>/dev/null || return 1
   kill -0 "$pid" 2>/dev/null
 }
 
 proxy_api_ready() {
+  [ -n "$PROXY_CURL" ] && [ -x "$PROXY_CURL" ] || return 1
   local secret
   secret=$(proxy_generate_secret)
-  curl -s --connect-timeout 2 --max-time 3 \
+  "$PROXY_CURL" -fsS --connect-timeout 2 --max-time 3 \
     -H "Authorization: Bearer $secret" \
     "http://$PROXY_API_HOST:$PROXY_API_PORT/version" >/dev/null 2>&1
 }
 
 proxy_api() {
   local method="$1" path="$2" data="$3"
+  [ -n "$PROXY_CURL" ] && [ -x "$PROXY_CURL" ] || return 1
   local secret
   secret=$(proxy_generate_secret)
   if [ -n "$data" ]; then
-    curl -s --connect-timeout 2 --max-time 5 -X "$method" \
+    "$PROXY_CURL" -fsS --connect-timeout 2 --max-time 5 -X "$method" \
       -H "Authorization: Bearer $secret" \
       -H "Content-Type: application/json" \
       -d "$data" \
       "http://$PROXY_API_HOST:$PROXY_API_PORT$path" 2>/dev/null
   else
-    curl -s --connect-timeout 2 --max-time 5 -X "$method" \
+    "$PROXY_CURL" -fsS --connect-timeout 2 --max-time 5 -X "$method" \
       -H "Authorization: Bearer $secret" \
       "http://$PROXY_API_HOST:$PROXY_API_PORT$path" 2>/dev/null
   fi
 }
 
+proxy_valid_sub_url() {
+  case "$1" in
+    http://*|https://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+proxy_yaml_escape() {
+  # 订阅地址只放入双引号 YAML 标量；转义反斜杠和双引号。
+  printf '%s' "$1" | "$BB" sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 proxy_generate_config() {
   proxy_init_dirs
-  local sub_url secret
+  local sub_url sub_yaml secret
   sub_url=$(cat "$PROXY_SUB_FILE" 2>/dev/null)
+  proxy_valid_sub_url "$sub_url" || return 1
+  sub_yaml=$(proxy_yaml_escape "$sub_url")
   secret=$(proxy_generate_secret)
+
+  # Keep the first production config deliberately conservative.  The beta.4
+  # template contained several optional DNS/GEO knobs at the same time, which
+  # made it hard to distinguish a real subscription problem from a Mihomo
+  # config-parser failure.  This template only uses fields documented by
+  # current Mihomo and keeps CN direct + overseas proxy routing.
   cat > "$PROXY_TMP_CFG" <<EOF
 mixed-port: 7890
 redir-port: $PROXY_REDIR_PORT
@@ -2457,32 +2582,31 @@ allow-lan: true
 bind-address: "*"
 mode: rule
 log-level: info
+ipv6: false
 external-controller: $PROXY_API_HOST:$PROXY_API_PORT
 secret: "$secret"
-ipv6: false
 profile:
   store-selected: true
+
 dns:
   enable: true
   listen: 0.0.0.0:$PROXY_DNS_PORT
+  ipv6: false
   enhanced-mode: redir-host
   default-nameserver:
     - 223.5.5.5
     - 119.29.29.29
   nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
+    - https://doh.pub/dns-query
+    - https://dns.alidns.com/dns-query
   proxy-server-nameserver:
     - 223.5.5.5
     - 119.29.29.29
-geodata-mode: true
-geo-auto-update: false
-geoip:
-  path: ./geoip.metadb
+
 proxy-providers:
   airport:
     type: http
-    url: "$sub_url"
+    url: "$sub_yaml"
     path: ./providers/airport.yaml
     interval: 86400
     health-check:
@@ -2491,179 +2615,404 @@ proxy-providers:
       interval: 120
       timeout: 5000
       lazy: false
+
 proxy-groups:
   - name: AUTO
     type: url-test
-    use: [airport]
-    url: https://www.gstatic.com/generate_204
-    interval: 120
+    use:
+      - airport
     tolerance: 80
   - name: FALLBACK
     type: fallback
-    use: [airport]
-    url: https://www.gstatic.com/generate_204
-    interval: 60
+    use:
+      - airport
   - name: MANUAL
     type: select
-    use: [airport]
+    use:
+      - airport
   - name: GLOBAL
     type: select
-    proxies: [AUTO, FALLBACK, MANUAL, DIRECT]
+    proxies:
+      - AUTO
+      - FALLBACK
+      - MANUAL
+      - DIRECT
+
 rules:
-  - GEOIP,CN,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
   - MATCH,GLOBAL
 EOF
+  chmod 0600 "$PROXY_TMP_CFG" 2>/dev/null
+}
+
+proxy_validation_detail() {
+  # Extract one useful Mihomo error line for diagnostics, but never leak the
+  # subscription URL or controller secret to the UI/log summary.
+  local line
+  line=$("$BB" grep -E 'level=(error|fatal)|Parse config error|configuration file .* test failed|yaml:' "$PROXY_LOG" 2>/dev/null | "$BB" tail -n 1)
+  [ -n "$line" ] || line=$("$BB" tail -n 1 "$PROXY_LOG" 2>/dev/null)
+  # Redact common URL/token shapes and keep the status JSON small.
+  line=$(printf '%s' "$line" | "$BB" sed -E 's#https?://[^ ]+#<url>#g; s/secret[=:][^ ,]+/secret=<redacted>/g; s/token[=:][^ ,]+/token=<redacted>/g' | "$BB" head -c 240)
+  printf '%s' "$line"
 }
 
 proxy_validate_config() {
   proxy_init_dirs
-  proxy_generate_config
+  proxy_generate_config || return 1
+  # Keep a clean validation log for this attempt so the UI can show the actual
+  # parser error instead of the generic "config validation failed" message.
+  : > "$PROXY_LOG" 2>/dev/null
+  chmod 0600 "$PROXY_LOG" 2>/dev/null
   "$PROXY_BIN" -t -d "$PROXY_DIR" -f "$PROXY_TMP_CFG" >> "$PROXY_LOG" 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    local detail
+    detail=$(proxy_validation_detail)
+    [ -n "$detail" ] && printf '%s\n' "$detail" > "$PROXY_DIR/config_error_detail" 2>/dev/null
+    return "$rc"
+  fi
+  rm -f "$PROXY_DIR/config_error_detail" 2>/dev/null
+  return 0
+}
+
+proxy_provider_json() {
+  proxy_api GET "/providers/proxies/airport" ""
+}
+
+proxy_provider_ready() {
+  local data
+  data=$(proxy_provider_json 2>/dev/null) || return 1
+  [ -n "$data" ] || return 1
+  printf '%s' "$data" | "$BB" grep -Eq '"proxies"[[:space:]]*:[[:space:]]*\[[[:space:]]*\{' 2>/dev/null
+}
+
+proxy_provider_node_count() {
+  local data count
+  data=$(proxy_provider_json 2>/dev/null) || { printf '0'; return; }
+  # Provider 返回中每个节点对象都有 name 字段；这里只用于诊断/状态，不参与代理决策。
+  count=$(printf '%s' "$data" | "$BB" grep -o '"provider-name"[[:space:]]*:[[:space:]]*"airport"' 2>/dev/null | "$BB" wc -l | "$BB" tr -d ' ')
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  # 个别版本的 provider JSON 不带 provider-name；此时仅用于状态显示，至少标记为 1。
+  [ "$count" -eq 0 ] 2>/dev/null && proxy_provider_ready && count=1
+  printf '%s' "$count"
 }
 
 proxy_setup_iptables() {
   local iface="$1"
-  [ -z "$iface" ] && return 1
-  $IPT -t nat -N MIFI_PROXY 2>/dev/null
-  $IPT -t nat -F MIFI_PROXY
-  $IPT -t nat -A MIFI_PROXY -i "$iface" -p udp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT
-  $IPT -t nat -A MIFI_PROXY -i "$iface" -p tcp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT
-  $IPT -t nat -A MIFI_PROXY -d 127.0.0.0/8 -j RETURN
-  $IPT -t nat -A MIFI_PROXY -d 10.0.0.0/8 -j RETURN
-  $IPT -t nat -A MIFI_PROXY -d 172.16.0.0/12 -j RETURN
-  $IPT -t nat -A MIFI_PROXY -d 192.168.0.0/16 -j RETURN
-  $IPT -t nat -A MIFI_PROXY -d 224.0.0.0/4 -j RETURN
-  $IPT -t nat -A MIFI_PROXY -p tcp -j REDIRECT --to-port $PROXY_REDIR_PORT
-  # 挂 PREROUTING
-  $IPT -t nat -C PREROUTING -j MIFI_PROXY 2>/dev/null || $IPT -t nat -A PREROUTING -j MIFI_PROXY
-  # 阻止 QUIC
+  [ -n "$iface" ] || return 1
+  case "$iface" in wlan[1-9]*|ap[0-9]*|softap*) : ;; *) proxy_log "refuse unexpected hotspot iface: $iface"; return 1 ;; esac
+
+  # 先清旧引用，避免热点接口变化后重复挂链。
+  proxy_teardown_iptables >/dev/null 2>&1
+
+  $IPT -t nat -N MIFI_PROXY 2>/dev/null || true
+  $IPT -t nat -F MIFI_PROXY 2>/dev/null || return 1
+  # DNS 必须先劫持，再 RETURN 私网；否则 192.168.x.x 网关 DNS 会被提前放行。
+  $IPT -t nat -A MIFI_PROXY -p udp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT || return 1
+  $IPT -t nat -A MIFI_PROXY -p tcp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT || return 1
+  $IPT -t nat -A MIFI_PROXY -d 127.0.0.0/8 -j RETURN || return 1
+  $IPT -t nat -A MIFI_PROXY -d 10.0.0.0/8 -j RETURN || return 1
+  $IPT -t nat -A MIFI_PROXY -d 172.16.0.0/12 -j RETURN || return 1
+  $IPT -t nat -A MIFI_PROXY -d 192.168.0.0/16 -j RETURN || return 1
+  $IPT -t nat -A MIFI_PROXY -d 224.0.0.0/4 -j RETURN || return 1
+  $IPT -t nat -A MIFI_PROXY -p tcp -j REDIRECT --to-ports $PROXY_REDIR_PORT || return 1
+  $IPT -t nat -A PREROUTING -i "$iface" -j MIFI_PROXY || { proxy_teardown_iptables; return 1; }
+
   if [ "${PROXY_BLOCK_QUIC:-1}" = "1" ]; then
-    $IPT -t filter -N MIFI_BLOCK_QUIC 2>/dev/null
-    $IPT -t filter -F MIFI_BLOCK_QUIC
-    $IPT -t filter -A MIFI_BLOCK_QUIC -i "$iface" -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
-    $IPT -t filter -C FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null || $IPT -t filter -A FORWARD -j MIFI_BLOCK_QUIC
+    $IPT -t filter -N MIFI_BLOCK_QUIC 2>/dev/null || true
+    $IPT -t filter -F MIFI_BLOCK_QUIC 2>/dev/null || { proxy_teardown_iptables; return 1; }
+    $IPT -t filter -A MIFI_BLOCK_QUIC -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable || { proxy_teardown_iptables; return 1; }
+    $IPT -t filter -A FORWARD -i "$iface" -j MIFI_BLOCK_QUIC || { proxy_teardown_iptables; return 1; }
   fi
+
+  printf '%s\n' "$iface" > "$PROXY_IFACE_FILE"
+  chmod 0600 "$PROXY_IFACE_FILE" 2>/dev/null
+  proxy_log "iptables enabled iface=$iface mode=redirect"
+  return 0
 }
 
 proxy_teardown_iptables() {
-  $IPT -t nat -D PREROUTING -j MIFI_PROXY 2>/dev/null
-  $IPT -t nat -F MIFI_PROXY 2>/dev/null
-  $IPT -t nat -X MIFI_PROXY 2>/dev/null
-  $IPT -t filter -D FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null
-  $IPT -t filter -F MIFI_BLOCK_QUIC 2>/dev/null
-  $IPT -t filter -X MIFI_BLOCK_QUIC 2>/dev/null
+  local saved current iface
+  saved=$(cat "$PROXY_IFACE_FILE" 2>/dev/null | tr -d ' \r\n')
+  current=$(get_hotspot_iface 2>/dev/null)
+  # 兼容 beta2 旧版无 -i 的全局挂载。
+  while $IPT -t nat -C PREROUTING -j MIFI_PROXY 2>/dev/null; do
+    $IPT -t nat -D PREROUTING -j MIFI_PROXY 2>/dev/null || break
+  done
+  while $IPT -t filter -C FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null; do
+    $IPT -t filter -D FORWARD -j MIFI_BLOCK_QUIC 2>/dev/null || break
+  done
+  for iface in $saved $current wlan2 wlan3 wlan4; do
+    [ -n "$iface" ] || continue
+    while $IPT -t nat -C PREROUTING -i "$iface" -j MIFI_PROXY 2>/dev/null; do
+      $IPT -t nat -D PREROUTING -i "$iface" -j MIFI_PROXY 2>/dev/null || break
+    done
+    while $IPT -t filter -C FORWARD -i "$iface" -j MIFI_BLOCK_QUIC 2>/dev/null; do
+      $IPT -t filter -D FORWARD -i "$iface" -j MIFI_BLOCK_QUIC 2>/dev/null || break
+    done
+  done
+  $IPT -t nat -F MIFI_PROXY 2>/dev/null || true
+  $IPT -t nat -X MIFI_PROXY 2>/dev/null || true
+  $IPT -t filter -F MIFI_BLOCK_QUIC 2>/dev/null || true
+  $IPT -t filter -X MIFI_BLOCK_QUIC 2>/dev/null || true
+  rm -f "$PROXY_IFACE_FILE" 2>/dev/null
+}
+
+proxy_iptables_ok() {
+  local iface="$1"
+  [ -n "$iface" ] || return 1
+  $IPT -t nat -C PREROUTING -i "$iface" -j MIFI_PROXY 2>/dev/null || return 1
+  $IPT -t nat -C MIFI_PROXY -p tcp -j REDIRECT --to-ports $PROXY_REDIR_PORT 2>/dev/null || return 1
+  return 0
 }
 
 proxy_sync_iptables() {
   local iface
   iface=$(get_hotspot_iface 2>/dev/null)
-  proxy_teardown_iptables
-  [ -n "$iface" ] && proxy_setup_iptables "$iface"
+  if [ -z "$iface" ]; then
+    proxy_teardown_iptables
+    proxy_write_state "waiting_hotspot"
+    return 0
+  fi
+  if proxy_iptables_ok "$iface"; then
+    printf '%s\n' "$iface" > "$PROXY_IFACE_FILE" 2>/dev/null
+    return 0
+  fi
+  proxy_setup_iptables "$iface"
 }
 
 proxy_start() {
   proxy_init_dirs
+  proxy_clear_error
+  proxy_health_write false false 0
   proxy_write_state "starting"
+
+  local core_check sub_url iface i
   core_check=$(proxy_core_ok)
   if [ $? -ne 0 ]; then
-    echo "核心错误: $core_check" > "$PROXY_LAST_ERROR"
+    proxy_set_error "$core_check"
     proxy_write_state "$core_check"
+    proxy_teardown_iptables
     return 1
   fi
-  local sub_url
-  sub_url=$(cat "$PROXY_SUB_FILE" 2>/dev/null)
-  [ -z "$sub_url" ] && sub_url=$(b64d "${PROXY_SUB_B64:-}" 2>/dev/null)
-  [ -z "$sub_url" ] && sub_url=$(echo "$PROXY_SUB_B64" | base64 -d 2>/dev/null)
-  echo "$sub_url" > "$PROXY_SUB_FILE"
+
+  # 配置文件是唯一持久来源；每次启动都用最新 PROXY_SUB_B64 覆盖旧 runtime URL。
+  sub_url=""
+  if [ -n "${PROXY_SUB_B64:-}" ]; then
+    sub_url=$(b64url_decode "$PROXY_SUB_B64" 2>/dev/null)
+  fi
+  [ -n "$sub_url" ] || sub_url=$(cat "$PROXY_SUB_FILE" 2>/dev/null)
+  if ! proxy_valid_sub_url "$sub_url"; then
+    proxy_set_error "subscription_missing_or_invalid"
+    proxy_write_state "subscription_error"
+    proxy_teardown_iptables
+    return 1
+  fi
+  printf '%s\n' "$sub_url" > "$PROXY_SUB_FILE"
+  chmod 0600 "$PROXY_SUB_FILE" 2>/dev/null
+
   if ! proxy_validate_config; then
+    proxy_set_error "config_validation_failed"
     proxy_write_state "config_error"
     rm -f "$PROXY_TMP_CFG"
-    return 1
-  fi
-  mv "$PROXY_TMP_CFG" "$PROXY_CFG"
-  if proxy_is_running; then
-    local pid; pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
-    kill "$pid" 2>/dev/null
-    sleep 1
-  fi
-  nohup "$PROXY_BIN" -d "$PROXY_DIR" -f "$PROXY_CFG" >> "$PROXY_LOG" 2>&1 &
-  echo $! > "$PROXY_PIDFILE"
-  # 等 API 就绪
-  local i
-  for i in $(seq 1 15); do
-    sleep 1
-    if proxy_api_ready; then
-      break
-    fi
-  done
-  if ! proxy_api_ready; then
-    proxy_write_state "core_error"
-    return 1
-  fi
-  # 等热点接口
-  local iface
-  for i in $(seq 1 10); do
-    iface=$(get_hotspot_iface 2>/dev/null)
-    [ -n "$iface" ] && break
-    sleep 1
-  done
-  if [ -z "$iface" ]; then
-    proxy_write_state "waiting_hotspot"
-    return 0
-  fi
-  proxy_setup_iptables "$iface" || {
     proxy_teardown_iptables
-    proxy_write_state "firewall_error"
+    return 1
+  fi
+  mv -f "$PROXY_TMP_CFG" "$PROXY_CFG" || {
+    proxy_set_error "config_write_failed"
+    proxy_write_state "config_error"
+    proxy_teardown_iptables
     return 1
   }
+  chmod 0600 "$PROXY_CFG" 2>/dev/null
+
+  # 重启核心前先撤透明代理，确保任何失败都 fail-open，不把热点锁死。
+  proxy_teardown_iptables
+  if proxy_is_running; then
+    local pid
+    pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
+    kill "$pid" 2>/dev/null
+    sleep 1
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PROXY_PIDFILE"
+  : > "$PROXY_LOG" 2>/dev/null
+  chmod 0600 "$PROXY_LOG" 2>/dev/null
+  nohup "$PROXY_BIN" -d "$PROXY_DIR" -f "$PROXY_CFG" >> "$PROXY_LOG" 2>&1 &
+  echo $! > "$PROXY_PIDFILE"
+  chmod 0600 "$PROXY_PIDFILE" 2>/dev/null
+
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    sleep 1
+    proxy_api_ready && break
+    proxy_is_running || break
+  done
+  if ! proxy_api_ready; then
+    proxy_health_write false false 0
+    proxy_set_error "mihomo_api_not_ready"
+    proxy_write_state "core_error"
+    proxy_teardown_iptables
+    return 1
+  fi
+
+  # Provider 是这版最关键的健康门槛：必须真实加载到节点，才允许挂透明代理。
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    proxy_provider_ready && break
+    sleep 1
+  done
+  if ! proxy_provider_ready; then
+    proxy_health_write true false 0
+    proxy_set_error "subscription_loaded_no_nodes"
+    proxy_write_state "subscription_error"
+    proxy_teardown_iptables
+    return 1
+  fi
+
+  proxy_health_write true true "$(proxy_provider_node_count)"
+
+  proxy_set_mode "${PROXY_MODE:-auto}" >/dev/null 2>&1 || {
+    proxy_set_error "proxy_group_switch_failed"
+    proxy_write_state "subscription_error"
+    proxy_teardown_iptables
+    return 1
+  }
+
+  iface=$(get_hotspot_iface 2>/dev/null)
+  if [ -z "$iface" ]; then
+    proxy_clear_error
+    proxy_write_state "waiting_hotspot"
+    proxy_log "mihomo ready; waiting hotspot"
+    return 0
+  fi
+  if ! proxy_setup_iptables "$iface"; then
+    proxy_set_error "iptables_setup_failed"
+    proxy_write_state "firewall_error"
+    proxy_teardown_iptables
+    return 1
+  fi
+  proxy_clear_error
   proxy_write_state "running"
+  proxy_log "proxy started iface=$iface mode=${PROXY_MODE:-auto} nodes=$(proxy_provider_node_count)"
+  return 0
+}
+
+proxy_start_async() {
+  proxy_init_dirs
+  # Avoid stacking several long startup attempts from repeated taps / supervisor races.
+  if ! mkdir "$PROXY_START_LOCK" 2>/dev/null; then
+    local oldpid
+    oldpid=$(cat "$PROXY_START_LOCK/pid" 2>/dev/null)
+    case "$oldpid" in ''|*[!0-9]*) oldpid=0 ;; esac
+    if [ "$oldpid" -gt 1 ] 2>/dev/null && kill -0 "$oldpid" 2>/dev/null; then
+      proxy_write_state "starting"
+      return 0
+    fi
+    rm -rf "$PROXY_START_LOCK" 2>/dev/null
+    mkdir "$PROXY_START_LOCK" 2>/dev/null || return 1
+  fi
+  proxy_clear_error
+  proxy_health_write false false 0
+  proxy_write_state "starting"
+  (
+    # control.cgi holds a config EXIT trap; do not inherit it into this detached worker.
+    trap - EXIT HUP INT TERM
+    # Let BusyBox httpd flush the CGI JSON response before any network rules change.
+    sleep 1
+    proxy_start
+    rc=$?
+    rm -rf "$PROXY_START_LOCK" 2>/dev/null
+    exit $rc
+  ) >> "$PROXY_RUNTIME_LOG" 2>&1 </dev/null &
+  printf '%s\n' "$!" > "$PROXY_START_LOCK/pid" 2>/dev/null
+  chmod 0600 "$PROXY_START_LOCK/pid" 2>/dev/null
+  return 0
 }
 
 proxy_stop() {
+  # Cancel a detached startup job first; otherwise a user can press Stop while
+  # startup is still validating/downloading and the worker would re-enable rules later.
+  if [ -d "$PROXY_START_LOCK" ]; then
+    local spid
+    spid=$(cat "$PROXY_START_LOCK/pid" 2>/dev/null)
+    case "$spid" in ''|*[!0-9]*) spid=0 ;; esac
+    if [ "$spid" -gt 1 ] 2>/dev/null && [ "$spid" != "$$" ]; then
+      kill "$spid" 2>/dev/null || true
+    fi
+    rm -rf "$PROXY_START_LOCK" 2>/dev/null
+  fi
   proxy_teardown_iptables
   if proxy_is_running; then
-    local pid; pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
+    local pid
+    pid=$(cat "$PROXY_PIDFILE" 2>/dev/null)
     kill "$pid" 2>/dev/null
     sleep 1
-    kill -9 "$pid" 2>/dev/null
+    kill -9 "$pid" 2>/dev/null || true
   fi
   rm -f "$PROXY_PIDFILE"
+  proxy_clear_error
+  proxy_health_write false false 0
   proxy_write_state "stopped"
+  proxy_log "proxy stopped"
 }
 
 proxy_update_provider() {
-  proxy_api PUT "/providers/proxies/airport" ""
+  proxy_api PUT "/providers/proxies/airport" "" >/dev/null || return 1
+  # 更新后确认仍有节点；失败时 Mihomo 会继续保留既有 provider 缓存。
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    proxy_provider_ready && return 0
+    sleep 1
+  done
+  return 1
 }
 
 proxy_healthcheck() {
-  proxy_api GET "/providers/proxies/airport/healthcheck" ""
+  proxy_api GET "/providers/proxies/airport/healthcheck" "" >/dev/null
 }
 
 proxy_set_mode() {
-  local mode="$1"
+  local mode="$1" payload
   case "$mode" in
-    auto) proxy_api PUT "/proxies/GLOBAL" '{"name":"AUTO"}' ;;
-    fallback) proxy_api PUT "/proxies/GLOBAL" '{"name":"FALLBACK"}' ;;
-    manual) proxy_api PUT "/proxies/GLOBAL" '{"name":"MANUAL"}' ;;
+    auto) payload='{"name":"AUTO"}' ;;
+    fallback) payload='{"name":"FALLBACK"}' ;;
+    manual) payload='{"name":"MANUAL"}' ;;
+    *) return 1 ;;
   esac
+  proxy_api PUT "/proxies/GLOBAL" "$payload" >/dev/null
 }
 
 proxy_set_node() {
-  local node="$1"
-  proxy_api PUT "/proxies/MANUAL" "{\"name\":\"$node\"}"
-  proxy_api PUT "/proxies/GLOBAL" '{"name":"MANUAL"}'
+  local node="$1" escaped
+  [ -n "$node" ] || return 1
+  # 拒绝控制字符/异常超长节点名，再做 JSON 转义。
+  [ "${#node}" -le 256 ] || return 1
+  printf '%s' "$node" | "$BB" grep -q '[[:cntrl:]]' && return 1
+  escaped=$(json_escape "$node")
+  proxy_api PUT "/proxies/MANUAL" "{\"name\":\"$escaped\"}" >/dev/null || return 1
+  proxy_api PUT "/proxies/GLOBAL" '{"name":"MANUAL"}' >/dev/null || return 1
+  return 0
 }
 
 proxy_status_json() {
-  local state running iface has_sub last_error transparent="redirect"
+  # Keep the main status endpoint fast. Live controller/provider checks belong to
+  # proxy.cgi and the 30s supervisor, not the 5s global UI poll.
+  local state running iface has_sub last_error error_detail transparent="redirect" api_ready=false provider_ready=false node_count=0
   state=$(proxy_read_state)
   running=$(proxy_is_running && echo true || echo false)
   iface=$(get_hotspot_iface 2>/dev/null)
   [ -n "$iface" ] || iface=""
   has_sub=$( { [ -s "$PROXY_SUB_FILE" ] || [ -n "${PROXY_SUB_B64:-}" ]; } && echo true || echo false)
   last_error=$(cat "$PROXY_LAST_ERROR" 2>/dev/null)
-  printf '{"enabled":%s,"running":%s,"state":"%s","transparentMode":"%s","coreVersion":"%s","interface":"%s","hasSubscription":%s,"lastError":"%s"}' \
+  error_detail=$(cat "$PROXY_DIR/config_error_detail" 2>/dev/null | "$BB" head -c 240)
+  proxy_health_read
+  if [ "$running" = "true" ]; then
+    api_ready=$PROXY_HEALTH_API
+    provider_ready=$PROXY_HEALTH_PROVIDER
+    node_count=$PROXY_HEALTH_COUNT
+  fi
+  printf '{"enabled":%s,"running":%s,"state":"%s","mode":"%s","transparentMode":"%s","coreVersion":"%s","interface":"%s","hasSubscription":%s,"apiReady":%s,"providerLoaded":%s,"providerNodeCount":%s,"lastError":"%s","errorDetail":"%s"}' \
     "$([ "${PROXY_ENABLE:-0}" = "1" ] && echo true || echo false)" \
-    "$running" "$state" "$transparent" "$PROXY_CORE_VERSION" \
-    "$(json_escape "$iface")" "$has_sub" "$(json_escape "$last_error")"
+    "$running" "$(json_escape "$state")" "$(json_escape "${PROXY_MODE:-auto}")" "$transparent" "$PROXY_CORE_VERSION" \
+    "$(json_escape "$iface")" "$has_sub" "$api_ready" "$provider_ready" "$node_count" "$(json_escape "$last_error")" "$(json_escape "$error_detail")"
 }
+

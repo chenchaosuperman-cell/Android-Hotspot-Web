@@ -88,6 +88,10 @@ save_config() {
     printf 'DATA_PLAN_MB=%s\n' "${DATA_PLAN_MB:-0}"
     printf 'DATA_PLAN_DAY=%s\n' "${DATA_PLAN_DAY:-1}"
     printf 'DATA_LIMIT_ACTION=%s\n' "${DATA_LIMIT_ACTION:-stop}"
+    printf 'PROXY_ENABLE=%s\n' "${PROXY_ENABLE:-0}"
+    printf 'PROXY_SUB_B64=%s\n' "${PROXY_SUB_B64:-}"
+    printf 'PROXY_MODE=%s\n' "${PROXY_MODE:-auto}"
+    printf 'PROXY_BLOCK_QUIC=%s\n' "${PROXY_BLOCK_QUIC:-1}"
     # P0-64：保留内部迁移标记，避免保存配置后升级迁移被重复执行
     printf 'PORT80_MIGRATED=%s\n' "${PORT80_MIGRATED:-0}"
     printf 'MIGRATE_REMOVED=%s\n' "${MIGRATE_REMOVED:-0}"
@@ -337,49 +341,77 @@ case "$ACTION" in
     MODE=$(get_param mode)
     ENABLE=$(get_param enable)
     BLOCK_QUIC=$(get_param block_quic)
-    [ -n "$SUB_B64" ] && { valid_b64url "$SUB_B64" && PROXY_SUB_B64="$SUB_B64"; }
-    [ -n "$MODE" ] && case "$MODE" in auto|fallback|manual) PROXY_MODE="$MODE" ;; esac
-    [ -n "$ENABLE" ] && case "$ENABLE" in 0|1) PROXY_ENABLE="$ENABLE" ;; esac
-    [ -n "$BLOCK_QUIC" ] && case "$BLOCK_QUIC" in 0|1) PROXY_BLOCK_QUIC="$BLOCK_QUIC" ;; esac
-    save_config
+    if [ -n "$SUB_B64" ]; then
+      valid_b64url "$SUB_B64" || { printf '{"ok":false,"message":"订阅地址编码无效"}'; exit 0; }
+      SUB_URL=$(b64url_decode "$SUB_B64" 2>/dev/null)
+      proxy_valid_sub_url "$SUB_URL" || { printf '{"ok":false,"message":"订阅地址必须以 http:// 或 https:// 开头"}'; exit 0; }
+      PROXY_SUB_B64="$SUB_B64"
+      proxy_init_dirs
+      printf '%s\n' "$SUB_URL" > "$PROXY_SUB_FILE"
+      chmod 0600 "$PROXY_SUB_FILE" 2>/dev/null
+    fi
+    [ -n "$MODE" ] && case "$MODE" in auto|fallback|manual) PROXY_MODE="$MODE" ;; *) printf '{"ok":false,"message":"代理模式无效"}'; exit 0 ;; esac
+    [ -n "$ENABLE" ] && case "$ENABLE" in 0|1) PROXY_ENABLE="$ENABLE" ;; *) printf '{"ok":false,"message":"代理开关参数无效"}'; exit 0 ;; esac
+    [ -n "$BLOCK_QUIC" ] && case "$BLOCK_QUIC" in 0|1) PROXY_BLOCK_QUIC="$BLOCK_QUIC" ;; *) printf '{"ok":false,"message":"QUIC 参数无效"}'; exit 0 ;; esac
+    save_config || { printf '{"ok":false,"message":"代理配置保存失败"}'; exit 0; }
     printf '{"ok":true,"message":"订阅已保存"}'
     ;;
   proxy_start)
     PROXY_ENABLE=1
-    save_config
-    proxy_start
-    if [ "$(proxy_read_state)" = "running" ] || [ "$(proxy_read_state)" = "waiting_hotspot" ]; then
-      printf '{"ok":true,"message":"科学上网已启动"}'
+    save_config || { printf '{"ok":false,"message":"代理配置保存失败"}'; exit 0; }
+    # Startup may need config validation + provider download/health check. Never
+    # keep the browser CGI request open for tens of seconds; Safari reports that
+    # as "Load failed" and the global status poll appears broken at the same time.
+    if proxy_start_async; then
+      printf '{"ok":true,"message":"正在启动科学上网，请稍候"}'
     else
-      printf '{"ok":false,"message":"启动失败，请看代理日志"}'
+      printf '{"ok":false,"message":"无法创建代理启动任务"}'
     fi
     ;;
   proxy_stop)
     PROXY_ENABLE=0
-    save_config
+    save_config || { printf '{"ok":false,"message":"代理配置保存失败"}'; exit 0; }
     proxy_stop
     printf '{"ok":true,"message":"科学上网已停止"}'
     ;;
   proxy_set_mode)
     MODE=$(get_param mode)
-    proxy_set_mode "$MODE"
-    PROXY_MODE="$MODE"
-    save_config
-    printf '{"ok":true}'
+    case "$MODE" in auto|fallback|manual) : ;; *) printf '{"ok":false,"message":"代理模式无效"}'; exit 0 ;; esac
+    if proxy_set_mode "$MODE"; then
+      PROXY_MODE="$MODE"
+      save_config || { printf '{"ok":false,"message":"模式已切换但保存失败"}'; exit 0; }
+      printf '{"ok":true,"message":"模式已切换"}'
+    else
+      printf '{"ok":false,"message":"模式切换失败"}'
+    fi
     ;;
   proxy_set_node)
     NODE_B64=$(get_param node_b64)
-    NODE=$(b64d "$NODE_B64" 2>/dev/null)
-    [ -n "$NODE" ] && proxy_set_node "$NODE"
-    printf '{"ok":true}'
+    valid_b64url "$NODE_B64" || { printf '{"ok":false,"message":"节点参数无效"}'; exit 0; }
+    NODE=$(b64url_decode "$NODE_B64" 2>/dev/null)
+    if [ -n "$NODE" ] && proxy_set_node "$NODE"; then
+      PROXY_MODE=manual
+      save_config >/dev/null 2>&1 || true
+      printf '{"ok":true,"message":"节点已切换"}'
+    else
+      printf '{"ok":false,"message":"节点切换失败"}'
+    fi
     ;;
   proxy_update)
-    proxy_update_provider
-    printf '{"ok":true,"message":"订阅已更新"}'
+    if proxy_is_running; then
+      ( trap - EXIT HUP INT TERM; proxy_update_provider >/dev/null 2>&1; proxy_refresh_health >/dev/null 2>&1 ) >/dev/null 2>&1 </dev/null &
+      printf '{"ok":true,"message":"正在更新订阅"}'
+    else
+      printf '{"ok":false,"message":"请先启动科学上网"}'
+    fi
     ;;
   proxy_healthcheck)
-    proxy_healthcheck
-    printf '{"ok":true}'
+    if proxy_is_running; then
+      ( trap - EXIT HUP INT TERM; proxy_healthcheck >/dev/null 2>&1; sleep 2; proxy_refresh_health >/dev/null 2>&1 ) >/dev/null 2>&1 </dev/null &
+      printf '{"ok":true,"message":"正在测速节点"}'
+    else
+      printf '{"ok":false,"message":"请先启动科学上网"}'
+    fi
     ;;  admin_password)
     NEW_ADMIN_B64=$(get_param password)
     valid_b64url "$NEW_ADMIN_B64" || { printf '{"ok":false,"message":"后台密码格式错误"}'; exit 0; }
@@ -468,7 +500,7 @@ case "$ACTION" in
       case "$k" in
         SECURITY) case "$v" in open|wpa2|wpa3|wpa3_transition) return 0 ;; esac ;;
         BAND) case "$v" in 2|5|any) return 0 ;; esac ;;
-        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT)
+        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC)
           case "$v" in 0|1) return 0 ;; esac ;;
         PORT) case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -ge 1024 ] && [ "$v" -le 65535 ] && return 0 ;; esac ;;
         CHANNEL) case "$v" in ''|*[!0-9]*) : ;; *) return 0 ;; esac ;;
@@ -481,6 +513,8 @@ case "$ACTION" in
         DATA_PLAN_MB) case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -ge 0 ] && [ "$v" -le 10000000 ] && return 0 ;; esac ;;
         DATA_PLAN_DAY) case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -ge 1 ] && [ "$v" -le 31 ] && return 0 ;; esac ;;
         DATA_LIMIT_ACTION) case "$v" in notify|stop) return 0 ;; esac ;;
+        PROXY_MODE) case "$v" in auto|fallback|manual) return 0 ;; esac ;;
+        PROXY_SUB_B64) [ -z "$v" ] || valid_b64url "$v"; return $? ;;
         *) return 0 ;;
       esac
       return 1
@@ -494,7 +528,7 @@ case "$ACTION" in
     printf '%s\n' "$PLAIN" > "$TMP_CFG"
     # 只允许明确白名单字段（不直接 source 上传内容），逐行读取赋值；
     # 排除含 shell 元字符的任意内容，避免导入任意变量进入运行环境
-    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION)=[^;&|`$\\]*$'
+    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC)=[^;&|`$\\]*$'
     "$BB" grep -E "$ALLOWED" "$TMP_CFG" > "$TMP_CFG.clean" 2>/dev/null || true
     if [ ! -s "$TMP_CFG.clean" ]; then
       rm -f "$TMP_CFG" "$TMP_CFG.clean"

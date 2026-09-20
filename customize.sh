@@ -22,3 +22,7 @@ set_perm "$MODPATH/action.sh" 0 0 0755
 set_perm "$MODPATH/uninstall.sh" 0 0 0755
 set_perm_recursive "$MODPATH/web/cgi-bin" 0 0 0755 0755
 set_perm "$MODPATH/lib/common.sh" 0 0 0755
+
+# Mihomo / GEO data
+set_perm "$MODPATH/bin/mihomo" 0 0 0755
+set_perm "$MODPATH/bin/geoip.metadb" 0 0 0644

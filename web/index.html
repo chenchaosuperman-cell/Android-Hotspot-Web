@@ -11,72 +11,6 @@
     window.onerror=function(m,s,l,c,e){try{var op=document.getElementById('operation');if(op){op.hidden=false;op.style.background='var(--warn-bg)';op.style.color='var(--warn-fg)';op.textContent='JS错误: '+m+' @行'+l}}catch(_){} return false};
 (function(){try{var root=document.documentElement;var saved=localStorage.getItem('mifiTheme');var sysDark=window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches;var th=saved==='dark'||saved==='light'?saved:(sysDark?'dark':'light');root.setAttribute('data-theme',th);root.style.colorScheme=th;var tm=document.querySelector('meta[name=theme-color]');if(tm)tm.content=th==='dark'?'#0f1420':'#f5f7fb'}catch(e){}})();
   
-async function proxyToggle(){
-  const btn=$('proxyToggleBtn');btn.disabled=true;const old=btn.textContent;btn.textContent='处理中…';
-  const sub=$('proxySubUrl').value.trim();
-  const mode=$('proxyMode').value;
-  try{
-    // save sub
-    if(sub) await post('action=proxy_save&sub_b64='+b64url(sub)+'&mode='+mode);
-    const running=$('proxyState').dataset.running==='1';
-    const r=await post(running?'action=proxy_stop':'action=proxy_start');
-    toast(r&&r.ok?(running?'已停止':'已启动'):'操作失败');
-  }finally{btn.disabled=false;btn.textContent=old}
-  setTimeout(proxyRefresh,1500);
-}
-async function proxyRefresh(){
-  try{
-    const r=await fetch('/cgi-bin/status.cgi?proxy=1',{cache:'no-store'});
-    const d=await r.json();
-    const p=d.proxy||{};
-    const el=$('proxyState');
-    el.dataset.running=p.running?'1':'0';
-    const stMap={running:'● 已连接',waiting_hotspot:'等待热点启动',starting:'正在启动',stopped:'未启动',config_error:'配置错误',core_error:'核心错误',firewall_error:'规则错误',subscription_error:'订阅错误'};
-    el.innerHTML='状态：'+(stMap[p.state]||p.state||'未知')+(p.lastError?'<br>'+p.lastError:'');
-    el.className=p.running?'okbox':'warnbox';
-    $('proxyToggleBtn').textContent=p.running?'停止科学上网':'启动科学上网';
-    if(p.hasSubscription && !$('proxySubUrl').value) $('proxySubUrl').placeholder='已配置订阅';
-    if(p.running) proxyLoadNodes();
-  }catch(e){}
-}
-async function proxyLoadNodes(){
-  try{
-    const r=await fetch('/cgi-bin/proxy.cgi?action=proxies',{cache:'no-store'});
-    const j=await r.json();
-    if(!j.ok)return;
-    const proxies=j.data;
-    const g=proxies.GLOBAL;
-    const cur=g.now;
-    const curGroup=proxies[cur];
-    const curNode=curGroup.now;
-    const nodes=curGroup.all||[];
-    const el=$('proxyNodes');
-    el.innerHTML='<div class="label" style="margin-bottom:8px">当前：'+cur+' · '+curNode+'</div>';
-    nodes.forEach(n=>{
-      const info=proxies[n];
-      const alive=info.alive;
-      const delay=info.history&&info.history.length?info.history[info.history.length-1].delay:null;
-      const div=document.createElement('div');
-      div.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid var(--line)';
-      const left=document.createElement('span');
-      left.textContent=n;
-      const right=document.createElement('span');
-      right.style.cssText='font-size:12px;color:var(--muted)';
-      right.textContent=alive?(delay?delay+'ms':'—'):'不可用';
-      if(n===curNode){left.style.fontWeight='700';right.style.color='var(--ok-fg)'}
-      div.append(left,right);
-      div.style.cursor='pointer';
-      div.onclick=async()=>{
-        await post('action=proxy_set_node&node_b64='+b64url(n));
-        proxyLoadNodes();
-      };
-      el.appendChild(div);
-    });
-  }catch(e){}
-}
-async function proxyRefreshNodes(){proxyLoadNodes()}
-async function proxyHealthcheck(){await post('action=proxy_healthcheck');toast('测速中…');setTimeout(proxyLoadNodes,3000)}
-async function proxyUpdate(){const r=await post('action=proxy_update');toast(r&&r.ok?'订阅已更新':'更新失败');setTimeout(proxyLoadNodes,2000)}
 </script>
   <style>
     :root{--space-1:4px;--space-2:8px;--space-3:12px;--space-4:16px;--space-5:20px;--space-6:24px;--control-h:46px;--button-h:44px;--small-btn-h:36px;color-scheme:light;--bg:#f5f7fb;--card:#fff;--card-border:rgba(220,226,237,.85);--text:#172033;--muted:#778197;--line:#e9edf4;--blue:#2878ff;--accent:#2878ff;--green:#20b486;--red:#ec5b66;--shadow:0 10px 30px rgba(39,60,92,.08);--input-bg:#f9fafc;--mono-bg:#f2f5fa;--notice-bg:#fff8e8;--notice-fg:#8d6418;--notice-bd:#f6e3b7;--ok-bg:#eaf8f3;--ok-fg:#168764;--ok-bd:#bfe8da;--warn-bg:#fff0f1;--warn-fg:#c74450;--warn-bd:#f3c6cb;--soft-bg:#edf3ff;--soft-fg:#236ad8;--danger-bg:#fff0f1;--danger-fg:#c9414e;--badge-bg:#eaf8f3;--badge-fg:#168764;--badge-off-bg:#fff0f1;--badge-off-fg:#c74450;--toast-bg:#172033;--toast-fg:#fff}
@@ -191,7 +125,7 @@ section[data-tab=home]{display:block}
       <div id="proxyState" class="warnbox" style="margin-bottom:14px">状态：检测中…</div>
       <div class="field"><label>订阅地址（Clash/Mihomo 订阅 URL）</label><input id="proxySubUrl" type="text" placeholder="https://example.com/sub?token=xxx" autocomplete="off"></div>
       <div class="field"><label>模式</label>
-        <select id="proxyMode"><option value="auto">自动选择</option><option value="fallback">故障转移</option><option value="manual">手动选择</option></select>
+        <select id="proxyMode" onchange="proxyChangeMode()"><option value="auto">自动选择</option><option value="fallback">故障转移</option><option value="manual">手动选择</option></select>
       </div>
       <div class="form-submit-wrap"><button class="primary form-submit" id="proxyToggleBtn" onclick="proxyToggle()">启动科学上网</button></div>
       <div class="actions" style="margin-top:8px">
@@ -360,7 +294,7 @@ let firstLoad=true,csrf='',logShown=false,diagShown=false,historyShown=false,his
     function renderClients(items){const box=$('devices');box.replaceChildren();if(!items.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='暂未检测到设备';box.appendChild(empty);return}items.forEach(x=>{const row=document.createElement('div');row.className='device';const info=document.createElement('div');info.className='info';const ip=document.createElement('b');const st=document.createElement('span');st.className='st-badge'+(clientStateText(x.state)==='在线'?' on':'');st.textContent=clientStateText(x.state);const mac=document.createElement('small');ip.textContent=x.ip;const blk=(blockedList||[]).indexOf(x.mac.toLowerCase())>=0;mac.textContent=(x.note?x.note+' — ':'')+(x.vendor?x.vendor+' · ':'')+x.mac+(blk?' · 已禁止上网':'')+' · 首见 '+fmtTime(x.first)+' · 在线 '+fmtDur(x.online)+' · ↑'+fmtBytes(x.tx)+' ↓'+fmtBytes(x.rx);info.append(ip,st,mac);const btns=document.createElement('div');btns.className='btns';const blocked=(blockedList||[]).indexOf(x.mac.toLowerCase())>=0;const b3=document.createElement('button');b3.className='mini secondary';b3.textContent=x.rate?'限速↓'+x.rate+'K':'限速↓';b3.onclick=()=>setRateLimit(x.mac,x.rate||0);btns.appendChild(b3);const more=document.createElement('button');more.className='mini secondary';more.textContent='更多';const moreDiv=document.createElement('div');moreDiv.className='more-actions';moreDiv.hidden=true;const m1=document.createElement('button');m1.className='mini '+(blocked?'secondary':'danger');m1.textContent=blocked?'解除禁止上网':'禁止上网';m1.onclick=()=>blocked?unblockClient(x.mac):blockClient(x.mac);moreDiv.appendChild(m1);const m2=document.createElement('button');m2.className='mini secondary';m2.textContent='临时断网';m2.onclick=()=>kickClient(x.mac);moreDiv.appendChild(m2);const m3=document.createElement('button');m3.className='mini secondary';m3.textContent='备注';m3.onclick=()=>setNote(x.mac,x.note||'');moreDiv.appendChild(m3);more.onclick=()=>{document.querySelectorAll('.more-actions').forEach(m=>{if(m!==moreDiv)m.hidden=true});moreDiv.hidden=!moreDiv.hidden;more.textContent=moreDiv.hidden?'更多':'收起'};btns.appendChild(more);row.append(info,btns,moreDiv);box.appendChild(row)})}
     function renderBlocked(){const box=$('blockedBox');box.replaceChildren();if(!blockedList||!blockedList.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='黑名单为空';box.appendChild(empty);return}blockedList.forEach(m=>{const row=document.createElement('div');row.className='device';const info=document.createElement('div');info.className='info';const ip=document.createElement('b'),mac=document.createElement('small');ip.textContent=m;mac.textContent='已禁止上网（可连接热点但无法访问网络）';info.append(ip,mac);const btn=document.createElement('button');btn.className='secondary mini';btn.textContent='解除';btn.onclick=()=>unblockClient(m);const btns=document.createElement('div');btns.className='btns';btns.appendChild(btn);row.append(info,btns);box.appendChild(row)})}
     let blockedList=[];let lastGoodTime='';
-    var _validTabs=['home','devices','traffic','proxy','notify','settings'];var _h=location.hash.slice(1);if(_validTabs.indexOf(_h)<0)_h='home';document.body.classList.add('ready');if(location.hash.slice(1)){document.querySelectorAll('.tabbtn').forEach(function(b){b.classList.toggle('active',b.dataset.t===_h)});document.querySelectorAll('section[data-tab]').forEach(function(el){el.style.display=(el.dataset.tab===_h)?'block':'none'});var _cb=document.querySelector('.compactBar');if(_cb)_cb.style.display=(_h==='home')?'':'none'}let statusFailCnt=0;setInterval(proxyRefresh,10000);async function status(){try{let r,body;try{r=await fetch('/cgi-bin/status.cgi?v=141',{cache:'no-store'});body=await r.text()}catch(ne){const e2=new Error(ne.message);e2.stage='net';throw e2}if(!r.ok){const e2=new Error('HTTP '+r.status);e2.stage='net';throw e2}let d;try{d=JSON.parse(body)}catch(_){const e2=new Error(body.trim().slice(0,100)||'接口无返回内容');e2.stage='parse';throw e2}if(!d.ok){const e2=new Error(d.error||'状态接口返回错误');e2.stage='api';throw e2}csrf=d.csrf||csrf;if(d.version)$('verBadge').textContent='v'+d.version;const devInfo=[d.deviceModel,d.osVersion].filter(Boolean).join(' · ');$('deviceInfo').textContent=devInfo||'未知设备';$('state').textContent=d.running?'热点运行中':(d.desired?'热点恢复中':'热点未运行');$('state').className='badge'+(d.running?'':' off');const starting=d.desired&&!d.running;const hcT=$('hcTitle'),hcS=$('hcSub'),hcB=$('hcBtn');if(d.running){hcT.textContent='热点运行中';hcT.style.color='var(--ok-fg)';hcS.textContent=(d.ssid||'未命名')+' · '+(d.band==='2'?'2.4 GHz':d.band==='5'?'5 GHz':'自动')+' · 已连接 '+Number(d.connectedClientCount||0)+' 台';hcB.className='danger';hcB.setAttribute('data-action','stop');hcB.textContent='关闭热点';hcB.disabled=false}else if(starting){hcT.textContent='热点正在启动…';hcT.style.color='var(--notice-fg)';hcS.textContent='请稍候';hcB.className='primary';hcB.setAttribute('data-action','start');hcB.textContent='正在开启…';hcB.disabled=true}else{hcT.textContent='热点已关闭';hcT.style.color='var(--muted)';hcS.textContent=d.manualOff?'本次开机已暂停自动开启，通知与短信转发仍运行':'按开机自启或手动开启';hcB.className='primary';hcB.setAttribute('data-action','start');hcB.textContent='开启热点';hcB.disabled=false}
+    var _validTabs=['home','devices','traffic','proxy','notify','settings'];var _h=location.hash.slice(1);if(_validTabs.indexOf(_h)<0)_h='home';document.body.classList.add('ready');if(location.hash.slice(1)){document.querySelectorAll('.tabbtn').forEach(function(b){b.classList.toggle('active',b.dataset.t===_h)});document.querySelectorAll('section[data-tab]').forEach(function(el){el.style.display=(el.dataset.tab===_h)?'block':'none'});var _cb=document.querySelector('.compactBar');if(_cb)_cb.style.display=(_h==='home')?'':'none'}let statusFailCnt=0;setInterval(proxyRefresh,10000);async function status(){try{let r,body;try{r=await fetch('/cgi-bin/status.cgi?v=142',{cache:'no-store'});body=await r.text()}catch(ne){const e2=new Error(ne.message);e2.stage='net';throw e2}if(!r.ok){const e2=new Error('HTTP '+r.status);e2.stage='net';throw e2}let d;try{d=JSON.parse(body)}catch(_){const e2=new Error(body.trim().slice(0,100)||'接口无返回内容');e2.stage='parse';throw e2}if(!d.ok){const e2=new Error(d.error||'状态接口返回错误');e2.stage='api';throw e2}csrf=d.csrf||csrf;if(d.version)$('verBadge').textContent='v'+d.version;const devInfo=[d.deviceModel,d.osVersion].filter(Boolean).join(' · ');$('deviceInfo').textContent=devInfo||'未知设备';$('state').textContent=d.running?'热点运行中':(d.desired?'热点恢复中':'热点未运行');$('state').className='badge'+(d.running?'':' off');const starting=d.desired&&!d.running;const hcT=$('hcTitle'),hcS=$('hcSub'),hcB=$('hcBtn');if(d.running){hcT.textContent='热点运行中';hcT.style.color='var(--ok-fg)';hcS.textContent=(d.ssid||'未命名')+' · '+(d.band==='2'?'2.4 GHz':d.band==='5'?'5 GHz':'自动')+' · 已连接 '+Number(d.connectedClientCount||0)+' 台';hcB.className='danger';hcB.setAttribute('data-action','stop');hcB.textContent='关闭热点';hcB.disabled=false}else if(starting){hcT.textContent='热点正在启动…';hcT.style.color='var(--notice-fg)';hcS.textContent='请稍候';hcB.className='primary';hcB.setAttribute('data-action','start');hcB.textContent='正在开启…';hcB.disabled=true}else{hcT.textContent='热点已关闭';hcT.style.color='var(--muted)';hcS.textContent=d.manualOff?'本次开机已暂停自动开启，通知与短信转发仍运行':'按开机自启或手动开启';hcB.className='primary';hcB.setAttribute('data-action','start');hcB.textContent='开启热点';hcB.disabled=false}
       $('actualState').textContent='当前实际运行：'+(d.running?((d.ssid||'未命名')+' · '+(d.band==='2'?'2.4 GHz':d.band==='5'?'5 GHz':'自动')+' · '+(d.security||'WPA2')):'热点未运行');$('cbBatt').textContent=(d.battery!=null?d.battery+'%'+(d.charging?' ⚡':''):'—');$('cbDev').textContent=Number(d.connectedClientCount||0)+' 台';$('cbBand').textContent=d.band==='2'?'2.4G':d.band==='5'?'5G':'自动';$('cbMode').textContent=d.manualOff?'手动':'自动';
       const cell=d.cell||{};$('cellInfo').textContent=(cell.rx||cell.tx)?('↓'+fmtBytes(cell.rx)+'  ↑'+fmtBytes(cell.tx)):'—';const tf=d.traffic||{};$('trafficToday').textContent=tf.todayValid?formatTrafficBytes(tf.today,displayUnit):'等待首次流量统计';$('trafficMonth').textContent=tf.monthValid?formatTrafficBytes(tf.month,displayUnit):'等待首次流量统计';drawTrafficDays(tf.days||[]);const planEl=$('planBarWrap'),planInfo=$('planInfo');const planMb=Number(tf.plan)||0;const pct=Number(tf.planPercent);if(planMb>0&&pct>=0){const usedMb=Number(tf.periodUsed)||0,remMb=(tf.planRemain||0),ps=tf.periodStart||'';planInfo.textContent=formatTrafficMb(usedMb,displayUnit)+' / '+formatTrafficMb(planMb,displayUnit)+' · 剩 '+formatTrafficMb(remMb,displayUnit)+(ps?'（账期自 '+ps.slice(0,4)+'-'+ps.slice(4,6)+'-'+ps.slice(6)+'）':'');planEl.hidden=false;const f=$('planBarFill');f.style.width=pct+'%';f.style.background=pct>=95?'#e53935':pct>=80?'#fb8c00':'#4caf50';const pt=$('planBarText');pt.textContent=pct+'%（剩 '+formatTrafficMb(remMb,displayUnit)+'）';pt.style.color=pct>=95?'var(--warn-fg)':''}else{planEl.hidden=true;planInfo.textContent=planMb>0?'本账期暂无流量记录 · 套餐 '+formatTrafficMb(planMb,displayUnit):'未设置套餐（在上方输入套餐流量并保存）'}
       const tfh=d.traffic||{};const usedB=Number(tfh.periodUsed)||0;if(planMb>0){$('thPlan').textContent=formatTrafficMb(planMb,displayUnit);$('thUsed').textContent=formatTrafficBytes(usedB,displayUnit);$('thPct').textContent=pct.toFixed(0)+'%';$('thRemain').textContent=formatTrafficMb(Number(tfh.planRemain)||0,displayUnit);const bar=$('thBar');bar.style.width=Math.min(100,pct)+'%';bar.style.background=pct>=100?'#e53935':pct>=90?'#fb8c00':pct>=70?'#fdd835':'#4caf50';$('thStatus').textContent=pct>=100?'已超限':pct>=90?'接近上限':pct>=70?'用量偏高':'正常';$('thStatus').style.color=pct>=100?'#e53935':pct>=90?'#fb8c00':'var(--muted)';const pd=Number(tfh.planDay)||1;$('thDay').textContent=pd;const dl=Number(tfh.daysLeft)||0;$('thDays').textContent='结算日每月'+pd+'日 · 还剩'+dl+'天'}else{$('thPlan').textContent='未设套餐';$('thUsed').textContent=formatTrafficBytes(usedB,displayUnit);$('thPct').textContent='—';$('thRemain').textContent='—';$('thBar').style.width='0%';$('thStatus').textContent='设置套餐后可计算剩余';$('thDay').textContent=1;$('thDays').textContent=''}
@@ -377,7 +311,7 @@ let firstLoad=true,csrf='',logShown=false,diagShown=false,historyShown=false,his
       historyData=d.history||[];if(historyShown)renderHistory();renderTrafficHistory(d.traffic?d.traffic.history:null);if(d.port)portNum=d.port;if(d.cfgSaved)$('cfgSaved').textContent=d.cfgSaved;
       const nowMs=performance.now();const tSec=lastTrafficTime>0?(nowMs-lastTrafficTime)/1000:0;lastTrafficTime=nowMs;const tfx=d.traffic||{};const cUp=Number(tfx.chainUp)||0,cDn=Number(tfx.chainDn)||0;const dRx=lastRxTot>=0?cDn-lastRxTot:0,dTx=lastTxTot>=0?cUp-lastTxTot:0;lastRxTot=cDn;lastTxTot=cUp;traffic.push({rx:tSec>0?Math.max(0,dRx)/tSec:0,tx:tSec>0?Math.max(0,dTx)/tSec:0});if(traffic.length>20)traffic.shift();drawTraffic();
       statusFailCnt=0;document.body.classList.remove('stale');lastGoodTime=new Date().toTimeString().slice(0,8);$('lastUpdate').textContent='更新于 '+lastGoodTime;$('lastUpdate').style.color='';const op=$('operation');if(d.operation&&d.operation.state!=='idle'&&d.operation.message){const opAge=Math.floor(Date.now()/1000)-(Number(d.operation.time)||0);if(d.operation.state==='success'&&opAge>30){op.hidden=true}else{op.hidden=false;let opMsg=(d.operation.time?('['+new Date(d.operation.time*1000).toTimeString().slice(0,8))+'] ':'')+d.operation.message;if(d.operation.state==='working'&&opAge>120)opMsg+='（可能已超时，请检查服务日志）';op.textContent=opMsg;op.style.background=d.operation.state==='error'?'var(--warn-bg)':d.operation.state==='success'?'var(--ok-bg)':'var(--notice-bg)';op.style.color=d.operation.state==='error'?'var(--warn-fg)':d.operation.state==='success'?'var(--ok-fg)':'var(--notice-fg)'}}else op.hidden=true;if(firstLoad){$('ssid').value=d.ssid||'';$('password').value='';$('security').value=d.security;$('band').value=d.band;fillChannels();$('channel').value=d.channel||0;$('autostart').checked=d.autostart;$('schedMode').value=d.sched.mode||'daily';syncSchedRows();const us0=d.usage||{};limitUnit=localStorage.getItem('limitUnit')||'GB';$('dataLimitUnit').value=limitUnit;$('dataLimit').value=us0.limitMb?(limitMbToDisplay(us0.limitMb,limitUnit)):0;displayUnit=localStorage.getItem('trafficUnit')||'auto';$('trafficUnit').value=displayUnit;const tf0=d.traffic||{};const planMb0=Number(tf0.plan)||us0.limitMb||0;const pd0=Number(tf0.planDay)||1;$('dataPlanDay').value=pd0;const la0=d.auto&&d.auto.limitAction||'stop';$('dataLimitAction').value=la0;firstLoad=false}renderClients(d.clients||[]);renderBlocked();}catch(e){const st=(e&&e.stage)||'render';const label=st==='net'?'状态接口异常':st==='parse'?'状态数据解析失败':st==='api'?'状态接口返回错误':'页面渲染异常';if(st==='render'){$('state').textContent=label;$('state').className='badge off';$('lastUpdate').textContent='⚠ '+label+' · 上次更新 '+lastGoodTime;$('lastUpdate').style.color='var(--warn-fg)';const op=$('operation');op.hidden=false;op.style.background='var(--warn-bg)';op.style.color='var(--warn-fg)';op.textContent=label+'：'+e.message+'（请刷新页面重试；控制功能未受影响）'}else{statusFailCnt++;if(statusFailCnt>=3)document.body.classList.add('stale');$('state').textContent=label;$('state').className='badge off';$('lastUpdate').textContent='⚠ '+label+' · 上次更新 '+lastGoodTime;$('lastUpdate').style.color='var(--warn-fg)';const op=$('operation');op.hidden=false;op.style.background='var(--warn-bg)';op.style.color='var(--warn-fg)';op.textContent=label+'：'+e.message}}}
-    async function post(q){if(!csrf){await status();if(!csrf){toast('后台接口未运行，无法执行设置','error');return {ok:false}}}try{const r=await fetch('/cgi-bin/control.cgi?v=141&token='+encodeURIComponent(csrf)+'&'+q,{method:'POST',cache:'no-store'});if(r.status===401){toast('认证已失效（可能已修改后台密码），请刷新页面重新登录','error');return {ok:false}}const body=await r.text();if(!r.ok)throw new Error('HTTP '+r.status);let d;try{d=JSON.parse(body)}catch(_){throw new Error(body.trim().slice(0,80)||'接口无返回内容')}toast(d.message||'操作完成',d.ok===false?'error':undefined);return d}catch(e){toast('控制接口错误：'+e.message,'error');return {ok:false}}}
+    async function post(q){if(!csrf){await status();if(!csrf){toast('后台接口未运行，无法执行设置','error');return {ok:false}}}try{const r=await fetch('/cgi-bin/control.cgi?v=142&token='+encodeURIComponent(csrf)+'&'+q,{method:'POST',cache:'no-store'});if(r.status===401){toast('认证已失效（可能已修改后台密码），请刷新页面重新登录','error');return {ok:false}}const body=await r.text();if(!r.ok)throw new Error('HTTP '+r.status);let d;try{d=JSON.parse(body)}catch(_){throw new Error(body.trim().slice(0,80)||'接口无返回内容')}toast(d.message||'操作完成',d.ok===false?'error':undefined);return d}catch(e){toast('控制接口错误：'+e.message,'error');return {ok:false}}}
     async function applyHotspot(){const ssid=$('ssid').value.trim(),security=$('security').value,pass=$('password').value;if(!ssid)return toast('请输入热点名称');if(security!=='open'&&pass&&(pass.length<8||pass.length>63))return toast('热点密码需为8–63位');const q=new URLSearchParams({action:'start',ssid:b64url(ssid),password:pass?b64url(pass):'',security,band:$('band').value,channel:$('channel').value,maxClients:$('maxClients').value||'0',autostart:$('autostart')?($('autostart').checked?'1':'0'):'1'});await post(q.toString())}
     async function control(action){await post('action='+encodeURIComponent(action));setTimeout(status,800)}
     async function changeAdminPassword(){const pass=$('adminPassword').value;if(pass.length<6||pass.length>32)return toast('后台密码需为6–32位');if(!/^[A-Za-z0-9._@!-]+$/.test(pass))return toast('仅支持字母、数字和 . _ @ ! -');const r=await post(new URLSearchParams({action:'admin_password',password:b64url(pass)}).toString());if(r&&r.ok){sessionStorage.removeItem('mifi_pass');localStorage.removeItem('mifi_pass');$('adminPassword').value='';toast('后台密码已修改，3秒后重新加载页面');setTimeout(()=>location.reload(),3000)}}
@@ -417,7 +351,7 @@ function heroToggle(){if($('hcBtn').disabled)return;if($('hcBtn').getAttribute('
     async function importConfig(input){const f=input.files&&input.files[0];if(!f)return;const txt=await f.text();const keys=[];txt.split(/\r?\n/).forEach(l=>{const i=l.indexOf('=');if(i>0)keys.push(l.slice(0,i))});const names={SSID_B64:'热点名称',SECURITY:'加密方式',BAND:'频段',CHANNEL:'信道',MAX_CLIENTS:'最大连接数',AUTOSTART:'开机自启',KEEPALIVE:'保活',IDLE_SHUTDOWN:'空闲关闭',SCHED_ENABLE:'定时开关',SCHED_MODE:'定时模式',DATA_PLAN_MB:'套餐流量',DATA_PLAN_DAY:'账期起始日',DATA_LIMIT_ACTION:'超额动作',BLOCKED_MACS:'黑名单',PUSHPLUS_TOKEN_B64:'PushPlus',DINGTALK_WEBHOOK_B64:'钉钉Webhook',DINGTALK_SECRET_B64:'钉钉加签',SMS_FWD:'短信转发',LOWBATT_ENABLE:'低电量提醒'};const ks=[...new Set(keys)].filter(k=>names[k]).map(k=>names[k]);if(!ks.length){input.value='';return toast('未识别到可导入的配置字段','error')}if(!confirm('将合并导入以下配置（未包含的字段保持当前值）：\n'+ks.join('、')+'\n\n确定继续吗？')){input.value='';return}const q=new URLSearchParams({action:'import_config',config:b64url(txt)});const r=await post(q.toString());if(r&&r.ok&&r.message)toast(r.message);input.value='';setTimeout(status,800)}
     async function showLog(force){logShown=true;$('logPanel').hidden=false;const r=await fetch('/cgi-bin/log.cgi?lines=80',{cache:'no-store'});try{const d=await r.json();$('logText').textContent=d.ok?(d.log||'（日志为空）'):('错误：'+(d.message||r.status))}catch(e){$('logText').textContent='日志读取失败：'+e.message}}
     function toggleLog(){logShown=!logShown;$('logPanel').hidden=!logShown;if(logShown)showLog(true)}
-    async function runDiagnose(){const btn=$('diagBtn');diagShown=true;$('diagPanel').hidden=false;$('diagText').textContent='生成中…';if(btn){btn.disabled=true;btn.textContent='生成中…'}try{const r=await fetch('/cgi-bin/diagnose.cgi?v=141',{cache:'no-store'});const d=await r.json();if(!d.ok)throw new Error(d.message||r.status);$('diagText').textContent=JSON.stringify(d,null,2);renderDiagTable(d)}catch(e){$('diagText').textContent='诊断失败：'+e.message}finally{if(btn){btn.disabled=false;btn.textContent='生成诊断报告'}}}
+    async function runDiagnose(){const btn=$('diagBtn');diagShown=true;$('diagPanel').hidden=false;$('diagText').textContent='生成中…';if(btn){btn.disabled=true;btn.textContent='生成中…'}try{const r=await fetch('/cgi-bin/diagnose.cgi?v=142',{cache:'no-store'});const d=await r.json();if(!d.ok)throw new Error(d.message||r.status);$('diagText').textContent=JSON.stringify(d,null,2);renderDiagTable(d)}catch(e){$('diagText').textContent='诊断失败：'+e.message}finally{if(btn){btn.disabled=false;btn.textContent='生成诊断报告'}}}
     function renderDiagTable(d){const box=$('diagTable');box.replaceChildren();const rows=[];const add=(k,v,st)=>{const r=document.createElement('div');r.className='diag-row';const a=document.createElement('span');a.className='diag-k';a.textContent=k;const b=document.createElement('span');b.className='diag-v'+(st?' diag-'+st:'');b.textContent=v;r.append(a,b);rows.push(r)};add('模块',d.module||'—');add('Root 权限',d.rootOk?'正常（uid=0）':(d.cmdOk?'命令可用，但未检测到 Root':'不可用（无 Root/命令权限）'),d.rootOk?'ok':(d.cmdOk?'warn':''));add('热点接口',d.iface||'未找到','');add('管理地址',d.mgmtIp?d.mgmtIp+(d.alias?'（固定别名）':'（原生地址）'):'—');add('期望状态',d.desired?'开启':'关闭');add('热点保活 / 空闲关闭 / 定时',[d.keepalive?'保活开':'保活关',d.idleShutdown?'空闲关':'空闲关',d.schedEnable?'定时开':'定时关'].join(' · '));add('内核转发(ip_forward)',(d.tether&&d.tether.fwd==1)?'已开启':'未开启',(d.tether&&d.tether.fwd==1)?'ok':'warn');add('NAT/MASQUERADE 规则',String(d.tether&&d.tether.nat||0)+' 条',(d.tether&&d.tether.nat>0)?'ok':'warn');add('Web 服务',(d.httpd&&d.httpd.alive)?'运行中（PID '+d.httpd.pid+'）':'未运行',(d.httpd&&d.httpd.alive)?'ok':'warn');add('CSRF 防护',d.csrfOk?'已就绪':'未配置',d.csrfOk?'ok':'warn');add('SELinux',d.selinux||'unknown');add('在线客户端',d.clientsFound+' 台');add('防火墙 FORWARD 规则',(d.forwardRules||'—').split('\n').filter(Boolean).length+' 条');add('最近日志',(d.log||'—').split('\n').filter(Boolean).length+' 行');rows.forEach(r=>box.appendChild(r))}
     
     function toggleTopNotice(){const n=$('topNotice');if(!n)return;const b=n.querySelector('button');const c=n.classList.toggle('collapsed');if(b)b.textContent=c?'展开':'收起'}
@@ -470,72 +404,93 @@ function drawTraffic(){const svg=$('trafficChart');if(!svg)return;const rateEl=$
     const _lockCheck=setInterval(()=>{if(!locked&&Date.now()-lastActive>LOCK_MS)lockPage()},15000);
     let _poll=setInterval(status,5000);status();
   
+function proxyEsc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 async function proxyToggle(){
   const btn=$('proxyToggleBtn');btn.disabled=true;const old=btn.textContent;btn.textContent='处理中…';
   const sub=$('proxySubUrl').value.trim();
   const mode=$('proxyMode').value;
   try{
-    // save sub
-    if(sub) await post('action=proxy_save&sub_b64='+b64url(sub)+'&mode='+mode);
+    let saveQ='action=proxy_save&mode='+encodeURIComponent(mode);if(sub)saveQ+='&sub_b64='+b64url(sub);
+    const sr=await post(saveQ);if(!sr||!sr.ok)return;
     const running=$('proxyState').dataset.running==='1';
     const r=await post(running?'action=proxy_stop':'action=proxy_start');
-    toast(r&&r.ok?(running?'已停止':'已启动'):'操作失败');
+    if(r&&r.ok)toast(running?'已停止':r.message||'已启动');
   }finally{btn.disabled=false;btn.textContent=old}
-  setTimeout(proxyRefresh,1500);
+  setTimeout(proxyRefresh,1200);
 }
 async function proxyRefresh(){
   try{
-    const r=await fetch('/cgi-bin/status.cgi?proxy=1',{cache:'no-store'});
-    const d=await r.json();
+    const r=await fetch('/cgi-bin/status.cgi?v=143&proxy=1',{cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const body=await r.text();
+    let d;try{d=JSON.parse(body)}catch(_){throw new Error(body.trim().slice(0,100)||'接口无返回内容')}
     const p=d.proxy||{};
     const el=$('proxyState');
     el.dataset.running=p.running?'1':'0';
-    const stMap={running:'● 已连接',waiting_hotspot:'等待热点启动',starting:'正在启动',stopped:'未启动',config_error:'配置错误',core_error:'核心错误',firewall_error:'规则错误',subscription_error:'订阅错误'};
-    el.innerHTML='状态：'+(stMap[p.state]||p.state||'未知')+(p.lastError?'<br>'+p.lastError:'');
-    el.className=p.running?'okbox':'warnbox';
+    const stMap={running:'● 已连接',waiting_hotspot:'等待热点启动',starting:'正在启动',stopped:'未启动',config_error:'配置错误',core_error:'核心错误',core_missing:'核心文件缺失',core_not_executable:'核心权限异常',core_invalid_binary:'核心文件格式错误',core_launch_failed:'核心无法运行',firewall_error:'网络规则错误',subscription_error:'订阅/节点错误'};
+    let extra='';
+    if(p.running){extra='<br><span style="font-size:12px">'+(p.apiReady?'API正常':'API异常')+' · '+(p.providerLoaded?'订阅节点已加载':'订阅节点未加载')+'</span>'}
+    const errMap={subscription_missing_or_invalid:'请先填写有效订阅地址',subscription_loaded_no_nodes:'订阅没有加载到可用节点',config_validation_failed:'Mihomo 配置校验失败',config_write_failed:'代理配置写入失败',mihomo_api_not_ready:'Mihomo 控制接口未就绪',proxy_group_switch_failed:'策略组切换失败',iptables_setup_failed:'透明代理规则建立失败',iptables_resync_failed:'透明代理规则恢复失败',core_missing:'Mihomo 核心文件缺失',core_not_executable:'Mihomo 核心权限异常',core_invalid_binary:'Mihomo 核心文件格式错误',core_launch_failed:'Mihomo 核心无法运行'};
+    const err=p.lastError?(errMap[p.lastError]||p.lastError):'';
+    const detail=p.errorDetail||'';
+    el.innerHTML='状态：'+(stMap[p.state]||p.state||'未知')+extra+(err?'<br><span style="font-size:12px">'+proxyEsc(err)+'</span>':'')+(detail?'<br><span style="font-size:11px;opacity:.8">'+proxyEsc(detail)+'</span>':'');
+    el.className=(p.state==='running')?'okbox':'warnbox';
     $('proxyToggleBtn').textContent=p.running?'停止科学上网':'启动科学上网';
-    if(p.hasSubscription && !$('proxySubUrl').value) $('proxySubUrl').placeholder='已配置订阅';
+    if(p.mode&&['auto','fallback','manual'].includes(p.mode))$('proxyMode').value=p.mode;
+    if(p.hasSubscription&&!$('proxySubUrl').value)$('proxySubUrl').placeholder='已配置订阅';
     if(p.running) proxyLoadNodes();
-  }catch(e){}
+    else $('proxyNodes').textContent='节点列表将在启动后显示';
+  }catch(e){
+    const el=$('proxyState');
+    if(el){el.className='warnbox';el.innerHTML='状态：后台暂不可用<br><span style="font-size:12px">'+proxyEsc(e.message||'Load failed')+'</span>'}
+  }
 }
 async function proxyLoadNodes(){
+  const el=$('proxyNodes');
   try{
     const r=await fetch('/cgi-bin/proxy.cgi?action=proxies',{cache:'no-store'});
     const j=await r.json();
-    if(!j.ok)return;
-    const proxies=j.data;
+    if(!j.ok){el.textContent=j.message||'节点列表加载失败';return}
+    // Mihomo /proxies 的真实结构是 {proxies:{...}}，beta2 误把 data 当成映射导致列表为空。
+    const proxies=(j.data&&j.data.proxies)||j.data||{};
     const g=proxies.GLOBAL;
-    const cur=g.now;
-    const curGroup=proxies[cur];
-    const curNode=curGroup.now;
-    const nodes=curGroup.all||[];
-    const el=$('proxyNodes');
-    el.innerHTML='<div class="label" style="margin-bottom:8px">当前：'+cur+' · '+curNode+'</div>';
+    if(!g){el.textContent='未找到 GLOBAL 策略组';return}
+    const cur=g.now||'AUTO';
+    const curGroup=proxies[cur]||{};
+    const curNode=curGroup.now||cur;
+    const manualGroup=proxies.MANUAL||curGroup;
+    const nodes=Array.isArray(manualGroup.all)?manualGroup.all:[];
+    el.innerHTML='';
+    const head=document.createElement('div');head.className='label';head.style.marginBottom='8px';head.textContent='当前：'+cur+' · '+curNode+' · 共 '+nodes.length+' 个节点';el.appendChild(head);
+    if(!nodes.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='订阅已启动，但未读取到节点；请更新订阅或查看代理日志';el.appendChild(empty);return}
     nodes.forEach(n=>{
-      const info=proxies[n];
-      const alive=info.alive;
-      const delay=info.history&&info.history.length?info.history[info.history.length-1].delay:null;
+      if(['DIRECT','REJECT','REJECT-DROP','PASS','COMPATIBLE'].includes(n))return;
+      const info=proxies[n]||{};
+      const alive=info.alive!==false;
+      const hist=Array.isArray(info.history)?info.history:[];
+      const last=hist.length?hist[hist.length-1]:null;
+      const delay=last&&Number(last.delay)>0?Number(last.delay):null;
       const div=document.createElement('div');
-      div.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid var(--line)';
-      const left=document.createElement('span');
-      left.textContent=n;
-      const right=document.createElement('span');
-      right.style.cssText='font-size:12px;color:var(--muted)';
-      right.textContent=alive?(delay?delay+'ms':'—'):'不可用';
+      div.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line)';
+      const left=document.createElement('span');left.textContent=n;
+      const right=document.createElement('span');right.style.cssText='font-size:12px;color:var(--muted)';right.textContent=alive?(delay?delay+'ms':'—'):'不可用';
       if(n===curNode){left.style.fontWeight='700';right.style.color='var(--ok-fg)'}
-      div.append(left,right);
-      div.style.cursor='pointer';
-      div.onclick=async()=>{
-        await post('action=proxy_set_node&node_b64='+b64url(n));
-        proxyLoadNodes();
-      };
+      if(!alive){left.style.opacity='.55';right.style.color='var(--warn-fg)'}
+      div.append(left,right);div.style.cursor=alive?'pointer':'default';
+      if(alive)div.onclick=async()=>{const rr=await post('action=proxy_set_node&node_b64='+b64url(n));if(rr&&rr.ok){$('proxyMode').value='manual';setTimeout(proxyLoadNodes,300)}};
       el.appendChild(div);
     });
-  }catch(e){}
+  }catch(e){el.textContent='节点列表加载失败：'+e.message}
+}
+async function proxyChangeMode(){
+  if($('proxyState').dataset.running!=='1')return;
+  const mode=$('proxyMode').value;
+  const r=await post('action=proxy_set_mode&mode='+encodeURIComponent(mode));
+  if(r&&r.ok)setTimeout(proxyLoadNodes,300);
 }
 async function proxyRefreshNodes(){proxyLoadNodes()}
-async function proxyHealthcheck(){await post('action=proxy_healthcheck');toast('测速中…');setTimeout(proxyLoadNodes,3000)}
-async function proxyUpdate(){const r=await post('action=proxy_update');toast(r&&r.ok?'订阅已更新':'更新失败');setTimeout(proxyLoadNodes,2000)}
+async function proxyHealthcheck(){const r=await post('action=proxy_healthcheck');if(r&&r.ok){toast('测速中…');setTimeout(proxyLoadNodes,3500)}}
+async function proxyUpdate(){const r=await post('action=proxy_update');if(r&&r.ok){setTimeout(proxyLoadNodes,1200)}}
 </script>
 
 

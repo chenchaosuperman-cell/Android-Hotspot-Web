@@ -87,6 +87,10 @@ NOTIFY_LIMIT=1
 SMS_FWD=0
 SMS_FWD_KEYWORD_B64=
 SMS_FWD_SENDERS_B64=
+PROXY_ENABLE=0
+PROXY_SUB_B64=
+PROXY_MODE=auto
+PROXY_BLOCK_QUIC=1
 EOF
   chmod 0600 "$CONFIG"
 fi
@@ -268,6 +272,52 @@ while true; do
     DESIRED=$(cat "$DESIRED_FILE" 2>/dev/null)
     [ "$DESIRED" = "1" ] || DESIRED=0
     IFACE=$(get_hotspot_iface)
+
+    # 科学上网守护：每 30 秒检查一次。核心/API 异常时 fail-open，避免热点被残留规则锁死。
+    PROXY_SUP_TICK=$(( ${PROXY_SUP_TICK:-0} + 1 ))
+    if [ "$PROXY_SUP_TICK" -ge 2 ]; then
+      PROXY_SUP_TICK=0
+      if [ "${PROXY_ENABLE:-0}" = "1" ]; then
+        if proxy_is_running && proxy_api_ready; then
+          # 核心活着但 provider 没有真实节点时绝不挂透明代理，避免“国内能开、国外全断”。
+          if ! proxy_provider_ready; then
+            proxy_health_write true false 0
+            proxy_teardown_iptables
+            proxy_set_error "subscription_loaded_no_nodes"
+            proxy_write_state "subscription_error"
+          elif [ -n "$IFACE" ]; then
+            proxy_health_write true true "$(proxy_provider_node_count)"
+            if ! proxy_iptables_ok "$IFACE"; then
+              proxy_log "supervisor: resync iptables iface=$IFACE"
+              if proxy_sync_iptables; then
+                proxy_clear_error
+                proxy_write_state "running"
+              else
+                proxy_set_error "iptables_resync_failed"
+                proxy_write_state "firewall_error"
+                proxy_teardown_iptables
+              fi
+            elif [ "$(proxy_read_state)" != "running" ]; then
+              proxy_clear_error
+              proxy_write_state "running"
+            fi
+          else
+            proxy_teardown_iptables
+            proxy_clear_error
+            proxy_write_state "waiting_hotspot"
+          fi
+        else
+          proxy_health_write false false 0
+          proxy_teardown_iptables
+          proxy_log "supervisor: mihomo down, scheduling restart"
+          proxy_start_async >/dev/null 2>&1 || proxy_log "supervisor: could not schedule restart"
+        fi
+      else
+        if proxy_is_running || $IPT -t nat -L MIFI_PROXY >/dev/null 2>&1; then
+          proxy_stop >/dev/null 2>&1
+        fi
+      fi
+    fi
 
     # 定时开关：窗口内保持开启，窗口外关闭（开启时覆盖手动状态）
     # 跨午夜归属（P1-10）：周五 23:00–周六 07:00 的窗口，周六凌晨仍属于周五计划
