@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-MODDIR=/data/adb/modules/xiaomi_mifi_web
+MODDIR=/data/adb/modules/xiaomi14_mifi_web
 if [ ! -r "$MODDIR/lib/common.sh" ]; then
   SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
   MODDIR=${SCRIPT_PATH%/web/cgi-bin/diagnose.cgi}
@@ -57,6 +57,18 @@ SELINUX=$(/system/bin/getenforce 2>/dev/null)
 FW_RULES=$($IPT -L FORWARD -n 2>/dev/null | "$BB" head -20)
 NAT_RULES=$($IPT -t nat -S 2>/dev/null | "$BB" grep -c MASQUERADE)
 
+
+PROXY_RUNNING=false
+proxy_is_running && PROXY_RUNNING=true
+PROXY_SELF_ACTIVE=false
+PROXY_SELF_QUIC=false
+if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_nat_ok; then
+  PROXY_SELF_ACTIVE=true
+  proxy_self_quic_ok && PROXY_SELF_QUIC=true
+fi
+PROXY_SELF_BYPASS=$(cat "$PROXY_SELF_BYPASS_FILE" 2>/dev/null | "$BB" tr -d ' \r\n')
+PROXY_SELF_ERR=$(cat "$PROXY_SELF_ERROR_FILE" 2>/dev/null | "$BB" head -c 120)
+
 # 客户端发现原始数据（双数据源，便于定位“在线设备为0”）
 ARP_RAW=$(cat /proc/net/arp 2>/dev/null | "$BB" head -20)
 NEIGH_RAW=$(/system/bin/ip neigh show dev "$IFACE" 2>/dev/null | "$BB" head -20)
@@ -75,6 +87,10 @@ printf '"desired":%s,"keepalive":%s,"idleShutdown":%s,"schedEnable":%s,' \
 printf '"tether":{"fwd":%s,"nat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_PKTS"
 printf '"httpd":{"pid":%s,"alive":%s},"csrfOk":%s,"rootOk":%s,"cmdOk":%s,"selinux":"%s",' "$HTTP_PID" "$HTTP_ALIVE" "$CSRF_OK" "$ROOT_OK" "$CMD_OK" "$(json_escape "$SELINUX")"
 printf '"forwardRules":"%s","natMasquerade":%s,' "$(json_escape "$FW_RULES")" "$NAT_RULES"
+printf '"proxy":{"enabled":%s,"running":%s,"selfConfigured":%s,"selfActive":%s,"selfQuic":%s,"selfBypass":"%s","selfError":"%s"},' \
+  "$([ "${PROXY_ENABLE:-0}" = "1" ] && echo true || echo false)" "$PROXY_RUNNING" \
+  "$([ "${PROXY_SELF:-0}" = "1" ] && echo true || echo false)" "$PROXY_SELF_ACTIVE" "$PROXY_SELF_QUIC" \
+  "$(json_escape "$PROXY_SELF_BYPASS")" "$(json_escape "$PROXY_SELF_ERR")"
 printf '"clientsFound":%s,"clientList":"%s","arpRaw":"%s","neighRaw":"%s",' \
   "$CLIENTS_COUNT" "$(json_escape "$CLIENTS_FOUND")" "$(json_escape "$ARP_RAW")" "$(json_escape "$NEIGH_RAW")"
 printf '"log":"%s"' "$(json_escape "$LOG_TAIL")"

@@ -1,27 +1,3 @@
-# OS
-.DS_Store
-Thumbs.db
-
-# Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# Build / release
-*.zip
-*.apk
-*.aab
-release/
-dist/
-build/
-
-# Large prebuilt binaries (included in release ZIP, not in source repo)
 bin/
-
-# Temp
-*.tmp
-*.log
-node_modules/
-__pycache__/
+*.zip
+.DS_Store

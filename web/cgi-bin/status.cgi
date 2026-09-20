@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-MODDIR=/data/adb/modules/xiaomi_mifi_web
+MODDIR=/data/adb/modules/xiaomi14_mifi_web
 if [ ! -r "$MODDIR/lib/common.sh" ]; then
   SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
   MODDIR=${SCRIPT_PATH%/web/cgi-bin/status.cgi}
@@ -270,7 +270,7 @@ build_traffic_history() {
 
 printf '{'
 MOD_VERSION=$("$BB" sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | "$BB" head -n1)
-case "$MOD_VERSION" in ''|*[!0-9.]*) MOD_VERSION=-- ;; esac
+ [ -z "$MOD_VERSION" ] && MOD_VERSION=--
 read_device_info
 printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%s,' \
   "$MOD_VERSION" "$(json_escape "$DEVICE_MODEL")" "$(json_escape "$OS_VERSION")" "$RUNNING"

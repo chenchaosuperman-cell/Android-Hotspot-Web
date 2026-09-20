@@ -1,3 +1,50 @@
+# v1.6.0-beta.8
+
+- 修复“全部测速”后节点延迟一直显示 `—`：改为等待 Mihomo MANUAL 策略组测速并直接返回结果。
+- 测速期间按钮显示“测速中…”，完成后节点右侧显示 `xx ms`，失败节点显示“测速超时”。
+- 测速结果不再依赖容易被 CGI 生命周期清理的后台子进程，也不再固定只等待 3.5 秒。
+
+# v1.6.0-beta.7
+
+- 修复科学上网页面引用未定义的 `routeMode` / `scope`，导致保存和启动按钮无响应。
+- 补齐“代理模式”（智能分流/全局代理）与“代理范围”（仅热点/仅本机/两者）控件。
+- 代理范围保存后同步本机代理兼容开关，并在启动和守护阶段真实控制热点、本机规则范围。
+
+# v1.6.0-beta.4
+
+- 重构“消息”Tab：短信转发置顶，转发渠道居中，提醒设置置底。
+- 短信转发、PushPlus、钉钉、低电量、流量阈值、热点异常分别拆为独立卡片，减少设置堆叠。
+- 每张卡片独立保存，只提交本功能字段，避免修改一项时连带提交整页配置。
+- 渠道与短信运行状态分别就近显示，保留最近发送、失败次数与真实失败原因。
+
+# v1.6.0-beta.3
+
+- 修复 Android 16 本机透明代理：移除 Mihomo 全局 `routing-mark`，避免与 Android netd fwmark 路由冲突。
+- 本机 OUTPUT 代理固定使用 root UID 绕过 Mihomo 自身，避免 REDIRECT 回环。
+- 增加 Mihomo HTTP/TLS sniffer，改善本机 DNS 未完整被 53 端口劫持时 Google/海外站点的域名恢复。
+- 不改动已经工作的热点客户端 `PREROUTING -> MIFI_PROXY` 路径。
+
+# v1.6.0-beta.2
+
+- 修复「手机本机也走代理」已开启但页面误判为未生效的问题：状态判定只检查必要 NAT/OUTPUT 透明代理规则，不再把可选 QUIC 阻断作为生效前提。
+- 针对 Android 16 iptables wrapper 增加 `-S` 回退校验，避免 `iptables -C` 在部分环境返回异常造成假阴性。
+- 本机 QUIC 阻断改为 best-effort：即使设备不支持 `filter OUTPUT + REJECT`，TCP/DNS 本机代理仍保持工作，不再整体回滚。
+- 增加更细的本机代理错误码：NAT 链、DNS、TCP REDIRECT、OUTPUT hook、规则校验可分别定位。
+- 状态接口新增 `selfProxyQuic`，前端可区分「TCP/DNS 已生效」和「QUIC 降级不可用」。
+
+## v1.6.0-beta.1（2026-09-20）
+
+### 新增：手机本机也走代理
+- 科学页新增「手机本机也走代理」开关，默认关闭；热点客户端代理逻辑保持不变。
+- 开启后使用独立 `MIFI_PROXY_SELF` NAT OUTPUT 链，将普通 Android App 的 TCP 流量透明转发到 Mihomo `redir-port: 7893`。
+- 本机 TCP/UDP 53 自动重定向到 Mihomo DNS `1053`。
+- Mihomo 配置使用 `routing-mark: 6666`；OUTPUT 链优先按 mark 放行核心自身出站，避免回环且尽量不放过 Android 系统流量；内核不支持 mark match 时降级为 uid 0 兼容模式。
+- REDIRECT 模式下可同步阻止本机 UDP/443，让 Chrome / YouTube 等优先回落到 TCP/HTTPS。
+- 本机代理与热点代理拆成两套独立链；热点关闭、接口变化时不会误拆手机本机代理。
+- service 守护每 30 秒检查并恢复本机代理规则；核心/Provider 异常时自动 fail-open。
+- 状态接口新增 `selfProxy` / `selfProxyActive` / `selfProxyError`，页面可区分「已配置」和「实际生效」。
+- 卸载模块时完整清理 OUTPUT 本机代理链。
+
 ## v1.5.24-beta.5
 
 - 修复科学插件 `Mihomo 配置校验失败`：收敛为更保守、当前文档支持的基础配置，移除首启阶段非必要 DNS/GEO 可选项。

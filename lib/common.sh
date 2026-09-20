@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
-: "${MODDIR:=/data/adb/modules/xiaomi_mifi_web}"
-DATA_DIR=/data/adb/xiaomi_mifi_web
+: "${MODDIR:=/data/adb/modules/xiaomi14_mifi_web}"
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 # 从旧版 xiaomi14_mifi_web 迁移数据
 _OLD_DATA=/data/adb/xiaomi14_mifi_web
 if [ -d "$_OLD_DATA" ] && [ ! -e "$DATA_DIR" ]; then
@@ -19,6 +19,7 @@ IDLE_FILE="$DATA_DIR/idle.countdown"
 IDLE_SINCE="$DATA_DIR/idle.since"
 OP_STATUS="$DATA_DIR/operation.status"
 OP_LOCK="$DATA_DIR/operation.lock"
+CONTROL_REQUEST="$DATA_DIR/control.request"
 STABLE_IP=192.168.43.1
 IPT=/system/bin/iptables
 NOTIFY_QUEUE="$DATA_DIR/notify.queue"
@@ -30,6 +31,8 @@ STOP_REASON_FILE="$DATA_DIR/stop_reason"
 MANAGED_FILE="$DATA_DIR/hotspot_managed"
 # 一键关闭（不保活）写入：当前定时窗口内不再自动开启；窗口结束后由 service.sh 清除
 SKIP_WINDOW_FILE="$DATA_DIR/skip_window"
+# 手动关闭热点标记：本次开机内不再被保活/定时拉起
+MANUAL_OFF_FILE="$DATA_DIR/manual_off"
 PLAN_TH_MARK="$DATA_DIR/plan_th_mark"
 PLAN_PERIOD_FILE="$DATA_DIR/plan_period"
 
@@ -71,19 +74,28 @@ read_device_info() {
     DEVICE_MODEL=$("$GP" ro.product.marketname 2>/dev/null)
     [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL=$("$GP" ro.product.model 2>/dev/null)
     [ -n "$DEVICE_MODEL" ] || DEVICE_MODEL=$("$GP" ro.product.device 2>/dev/null)
-    # 系统：MIUI/HyperOS 名称 → 版本号；Android 版本兜底
-    OS_NAME=$("$GP" ro.mi.os.version.name 2>/dev/null)
-    [ -n "$OS_NAME" ] || OS_NAME=$("$GP" ro.build.version.release 2>/dev/null)
-    OS_VER=$("$GP" ro.mi.os.version 2>/dev/null)
+    # 品牌识别
+    BRAND=$("$GP" ro.product.brand 2>/dev/null | tr "A-Z" "a-z")
+    MANUF=$("$GP" ro.product.manufacturer 2>/dev/null | tr "A-Z" "a-z")
     ANDROID=$("$GP" ro.build.version.release 2>/dev/null)
-    if [ -n "$OS_NAME" ]; then
-      OS_VERSION=$OS_NAME
-      [ -n "$OS_VER" ] && OS_VERSION="$OS_VERSION $OS_VER"
-      if [ -n "$ANDROID" ] && [ "$ANDROID" != "$OS_VER" ]; then
-        OS_VERSION="$OS_VERSION · Android $ANDROID"
+    # 小米系：用 ro.mi.os.version.name
+    IS_XIAOMI=0
+    case "$BRAND" in xiaomi|redmi|poco) IS_XIAOMI=1 ;; esac
+    case "$MANUF" in xiaomi) IS_XIAOMI=1 ;; esac
+    if [ "$IS_XIAOMI" = "1" ]; then
+      OS_NAME=$("$GP" ro.mi.os.version.name 2>/dev/null)
+      OS_VER=$("$GP" ro.mi.os.version 2>/dev/null)
+      if [ -n "$OS_NAME" ]; then
+        OS_VERSION=$OS_NAME
+        [ -n "$OS_VER" ] && OS_VERSION="$OS_VERSION $OS_VER"
       fi
-    elif [ -n "$ANDROID" ]; then
-      OS_VERSION="Android $ANDROID"
+      if [ -n "$ANDROID" ] && { [ -z "$OS_VER" ] || [ "$ANDROID" != "$OS_VER" ]; }; then
+        [ -n "$OS_VERSION" ] && OS_VERSION="$OS_VERSION · Android $ANDROID" || OS_VERSION="Android $ANDROID"
+      fi
+    else
+      # 非小米：显示品牌名 + Android 版本
+      BRAND_DISP=$("$GP" ro.product.brand 2>/dev/null)
+      [ -n "$ANDROID" ] && OS_VERSION="${BRAND_DISP:-Android} $ANDROID" || OS_VERSION=""
     fi
   fi
 }
@@ -178,6 +190,12 @@ cfg_apply_key() {
           case "$value" in auto|fallback|manual) PROXY_MODE=$value ;; esac ;;
         PROXY_BLOCK_QUIC)
           case "$value" in 0|1) PROXY_BLOCK_QUIC=$value ;; esac ;;
+        PROXY_SELF)
+          case "$value" in 0|1) PROXY_SELF=$value ;; esac ;;
+        PROXY_ROUTE_MODE)
+          case "$value" in rule|global) PROXY_ROUTE_MODE=$value ;; esac ;;
+        PROXY_SCOPE)
+          case "$value" in hotspot|self|both) PROXY_SCOPE=$value ;; esac ;;
         SMS_FWD)
           case "$value" in 0|1) SMS_FWD=$value ;; esac ;;
         PORT)
@@ -325,6 +343,9 @@ load_config() {
   PROXY_SUB_B64=${PROXY_SUB_B64:-}
   PROXY_MODE=${PROXY_MODE:-auto}
   PROXY_BLOCK_QUIC=${PROXY_BLOCK_QUIC:-1}
+  PROXY_SELF=${PROXY_SELF:-0}
+  PROXY_ROUTE_MODE=${PROXY_ROUTE_MODE:-rule}
+  PROXY_SCOPE=${PROXY_SCOPE:-both}
 }
 
 get_hotspot_iface() {
@@ -504,7 +525,7 @@ acquire_operation_lock() {
   now=$(/system/bin/date +%s 2>/dev/null || date +%s)
   case "$created" in ''|*[!0-9]*) created=0 ;; esac
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
-  if [ "$created" -eq 0 ] || [ $((now - created)) -gt 120 ]; then
+  if [ "$created" -eq 0 ] || [ $((now - created)) -gt 35 ]; then
     rm -rf "$OP_LOCK"
     mkdir "$OP_LOCK" 2>/dev/null || return 1
     printf '%s\n' "$now" > "$OP_LOCK/created"
@@ -1861,6 +1882,9 @@ SMS_LAST_FILE="$DATA_DIR/sms_last_id"
 SMS_QUEUE="$DATA_DIR/sms.queue"               # 新版为目录；旧版遗留文本文件由 migrate 迁移
 SMS_LOCK_DIR="$DATA_DIR/sms.lock"             # 短信 worker 并发锁（mkdir 原子）
 SMS_SCAN_LOCK="$DATA_DIR/sms_scan.lock"       # 短信扫描锁（原 notify.lock 改名，避免与通知锁混淆）
+SMS_DEDUP_FILE="$DATA_DIR/sms_forward_dedup"      # 短信内容去重记录（fingerprint|timestamp）
+SMS_FRESH_SEC=900        # 只转发最近15分钟收到的短信（防止恢复/导入旧短信重推）
+SMS_DEDUP_SEC=600        # 相同发件人+正文，10分钟内只转发一次
 NOTIFY_LOCK="$DATA_DIR/notify.lock"           # 旧版遗留路径（migrate 清理用）
 TRAFFIC_DAILY="$DATA_DIR/traffic_daily"
 TRAFFIC_BASE="$DATA_DIR/traffic_base"
@@ -1883,6 +1907,46 @@ query_new_sms() {
     # 顺序: id|address|date|body，body 放最后；body 自身含 | 不影响前三个字段解析
     printf '%s|%s|%s|%s\n' "$ID" "$ADDR" "$DATE" "$BODY"
   done
+}
+
+# 短信内容指纹：发件人+正文的 sha256
+sms_fingerprint() {
+  printf '%s\034%s' "$1" "$2" |
+    "$BB" sha256sum 2>/dev/null |
+    "$BB" awk '{print $1}'
+}
+# 检查指纹是否在去重窗口内
+sms_seen_recently() {
+  FP=$1
+  [ -n "$FP" ] || return 1
+  [ -s "$SMS_DEDUP_FILE" ] || return 1
+  NOW=$($DATE_CMD +%s 2>/dev/null || date +%s)
+  OLD=$("$BB" grep "^${FP}|" "$SMS_DEDUP_FILE" 2>/dev/null |
+    "$BB" tail -n 1 |
+    "$BB" cut -d'|' -f2)
+  case "$OLD" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ $((NOW - OLD)) -lt "$SMS_DEDUP_SEC" ]
+}
+# 记录指纹（只保留24小时内的，最多100条）
+sms_remember() {
+  FP=$1
+  [ -n "$FP" ] || return 0
+  NOW=$($DATE_CMD +%s 2>/dev/null || date +%s)
+  TMP="$SMS_DEDUP_FILE.tmp.$$"
+  if [ -s "$SMS_DEDUP_FILE" ]; then
+    "$BB" awk -F'|' -v now="$NOW" '
+      NF == 2 && $2 ~ /^[0-9]+$/ && now - $2 <= 86400
+    ' "$SMS_DEDUP_FILE" > "$TMP" 2>/dev/null
+  else
+    : > "$TMP"
+  fi
+  printf '%s|%s\n' "$FP" "$NOW" >> "$TMP"
+  "$BB" tail -n 100 "$TMP" > "$TMP.keep" 2>/dev/null
+  mv -f "$TMP.keep" "$SMS_DEDUP_FILE"
+  rm -f "$TMP"
+  chmod 0600 "$SMS_DEDUP_FILE" 2>/dev/null
 }
 
 # 短信转发轮询（service 每 15s tick 调用一次）
@@ -1915,6 +1979,30 @@ check_sms_forward() {
     BODY=$(printf '%s\n' "$LINE" | "$BB" sed 's/^[^|]*|[^|]*|[^|]*|//')
     case "$ID" in ''|*[!0-9]*) continue ;; esac
     [ "$ID" -le "$LAST" ] && continue
+    # 旧短信拦截：只转发最近15分钟内的新短信（防止恢复/导入重推）
+    NOW_S=$($DATE_CMD +%s 2>/dev/null || date +%s)
+    case "$DATE" in
+      ''|*[!0-9]*)
+        echo "$(date) sms skip: id=$ID invalid date" >> "$LOG"
+        printf '%s\n' "$ID" > "$SMS_LAST_FILE"
+        chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+        LAST=$ID
+        continue
+      ;;
+    esac
+    if [ "${#DATE}" -ge 13 ]; then
+      SMS_DATE_S=$((DATE / 1000))
+    else
+      SMS_DATE_S=$DATE
+    fi
+    if [ "$SMS_DATE_S" -lt $((NOW_S - SMS_FRESH_SEC)) ] ||
+       [ "$SMS_DATE_S" -gt $((NOW_S + 120)) ]; then
+      echo "$(date) sms skip stale: id=$ID date=$DATE" >> "$LOG"
+      printf '%s\n' "$ID" > "$SMS_LAST_FILE"
+      chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+      LAST=$ID
+      continue
+    fi
     # 关键词过滤（固定字符串匹配，避免正则元字符误匹配）
     if [ -n "${SMS_FWD_KEYWORD:-}" ]; then
       if ! printf '%s' "$BODY" | "$BB" grep -Fq "$SMS_FWD_KEYWORD"; then
@@ -1943,11 +2031,25 @@ check_sms_forward() {
         continue
       fi
     fi
+    # 内容去重：相同发件人+正文10分钟内只转发一次
+    FP=$(sms_fingerprint "$ADDR" "$BODY")
+    if sms_seen_recently "$FP"; then
+      echo "$(date) sms skip duplicate: id=$ID from=$ADDR" >> "$LOG"
+      printf '%s\n' "$ID" > "$SMS_LAST_FILE"
+      chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
+      LAST=$ID
+      continue
+    fi
     # 匹配短信：检测阶段推进游标（避免每轮重复扫描），实际推送交给短信队列 worker。
     # 若已在队列（上次失败待重试）则不重复入队；单文件入队（内容 retry|next），并发安全。
     if [ ! -e "$SMS_QUEUE/$ID.msg" ]; then
       mkdir -p "$SMS_QUEUE" 2>/dev/null
-      printf '0|0\n' > "$SMS_QUEUE/$ID.msg" 2>/dev/null
+      if printf '0|0\n' > "$SMS_QUEUE/$ID.msg" 2>/dev/null; then
+        sms_remember "$FP"
+      else
+        echo "$(date) sms queue write failed: id=$ID" >> "$LOG"
+        continue
+      fi
     fi
     printf '%s\n' "$ID" > "$SMS_LAST_FILE" 2>/dev/null
     chmod 0600 "$SMS_LAST_FILE" 2>/dev/null
@@ -2002,6 +2104,26 @@ sms_notify_worker() {
       case "$DATE" in ''|*[!0-9]*) : ;; *)
         DATE_TXT=$($DATE_CMD -d "@$((DATE / 1000))" '+%m-%d %H:%M' 2>/dev/null || $DATE_CMD '+%m-%d %H:%M')
       ;; esac
+      # Worker 再保护一次：旧消息直接丢弃
+      NOW_W=$($DATE_CMD +%s 2>/dev/null || date +%s)
+      case "$DATE" in
+        ''|*[!0-9]*)
+          echo "$(date) sms worker drop invalid date: id=$SID" >> "$LOG"
+          rm -f "$FILE" 2>/dev/null
+          continue
+        ;;
+      esac
+      if [ "${#DATE}" -ge 13 ]; then
+        SMS_DATE_W=$((DATE / 1000))
+      else
+        SMS_DATE_W=$DATE
+      fi
+      if [ "$SMS_DATE_W" -lt $((NOW_W - SMS_FRESH_SEC)) ] ||
+         [ "$SMS_DATE_W" -gt $((NOW_W + 120)) ]; then
+        echo "$(date) sms worker drop stale: id=$SID date=$DATE" >> "$LOG"
+        rm -f "$FILE" 2>/dev/null
+        continue
+      fi
       # P1-54：双渠道独立发送与状态——PushPlus 成功、钉钉失败时钉钉单独重试，不整体删除任务
       SCHANGED=0
       if [ "$SPP" = "pending" ] || [ "$SPP" = "failed" ]; then
@@ -2160,10 +2282,11 @@ plan_usage_percent() {
   plan_total_mb
   case "$PLAN_TOTAL" in ''|*[!0-9]*) PLAN_TOTAL=0 ;; esac
   PLAN_PERIOD_USED=$((PLAN_PERIOD_BYTES / 1048576))
-  if [ "$PLAN_TOTAL" -le 0 ] 2>/dev/null; then
+  PLAN_TOTAL_BYTES=$((PLAN_TOTAL * 1048576))
+  if [ "$PLAN_TOTAL" -le 0 ] 2>/dev/null || [ "$PLAN_TOTAL_BYTES" -le 0 ] 2>/dev/null; then
     PLAN_PERCENT=-1
   else
-    PLAN_PERCENT=$((PLAN_PERIOD_BYTES * 100 / (PLAN_TOTAL * 1048576)))
+    PLAN_PERCENT=$((PLAN_PERIOD_BYTES * 100 / PLAN_TOTAL_BYTES))
     [ "$PLAN_PERCENT" -gt 100 ] 2>/dev/null && PLAN_PERCENT=100
   fi
 }
@@ -2375,7 +2498,7 @@ read_traffic_stats() {
 }
 
 
-# ---------- Mihomo / Proxy (v1.5.24-beta.3) ----------
+# ---------- Mihomo / Proxy (v1.6.0-beta.3) ----------
 PROXY_DIR="$DATA_DIR/proxy"
 PROXY_BIN="$MODDIR/bin/mihomo"
 PROXY_CFG="$PROXY_DIR/config.yaml"
@@ -2389,6 +2512,8 @@ PROXY_LAST_ERROR="$PROXY_DIR/last_error"
 PROXY_SUB_FILE="$PROXY_DIR/sub_url.txt"
 PROXY_LOCK="$PROXY_DIR/proxy.lock"
 PROXY_IFACE_FILE="$PROXY_DIR/iface"
+PROXY_SELF_ERROR_FILE="$PROXY_DIR/self_error"
+PROXY_SELF_BYPASS_FILE="$PROXY_DIR/self_bypass"
 PROXY_HEALTH_FILE="$PROXY_DIR/health.state"
 PROXY_START_LOCK="$PROXY_DIR/start.lock"
 PROXY_GEO_DB="$PROXY_DIR/geoip.metadb"
@@ -2396,6 +2521,7 @@ PROXY_REDIR_PORT=7893
 PROXY_DNS_PORT=1053
 PROXY_API_HOST="127.0.0.1"
 PROXY_API_PORT=9090
+PROXY_ROUTING_MARK=6666
 PROXY_CORE_VERSION="1.19.31"
 PROXY_CURL=/system/bin/curl
 [ -x "$PROXY_CURL" ] || PROXY_CURL=$(command -v curl 2>/dev/null)
@@ -2580,13 +2706,27 @@ mixed-port: 7890
 redir-port: $PROXY_REDIR_PORT
 allow-lan: true
 bind-address: "*"
-mode: rule
+mode: ${PROXY_ROUTE_MODE:-rule}
 log-level: info
 ipv6: false
 external-controller: $PROXY_API_HOST:$PROXY_API_PORT
 secret: "$secret"
 profile:
   store-selected: true
+
+# Android 本机 DNS/网络栈可能不会让所有域名查询经过 OUTPUT:53。
+# 启用 SNI/HTTP 嗅探，可在 redir-host 下补回域名并覆盖被污染的目标地址。
+sniffer:
+  enable: true
+  force-dns-mapping: true
+  parse-pure-ip: true
+  sniff:
+    HTTP:
+      ports: [80, 8080-8880]
+      override-destination: true
+    TLS:
+      ports: [443, 8443]
+      override-destination: true
 
 dns:
   enable: true
@@ -2639,6 +2779,19 @@ proxy-groups:
       - DIRECT
 
 rules:
+  - DOMAIN,services.googleapis.cn,GLOBAL
+  - DOMAIN-SUFFIX,googleapis.com,GLOBAL
+  - DOMAIN-SUFFIX,googleapis.cn,GLOBAL
+  - DOMAIN-SUFFIX,google.com,GLOBAL
+  - DOMAIN-SUFFIX,gstatic.com,GLOBAL
+  - DOMAIN-SUFFIX,googleusercontent.com,GLOBAL
+  - DOMAIN-SUFFIX,ggpht.com,GLOBAL
+  - DOMAIN-SUFFIX,gvt1.com,GLOBAL
+  - DOMAIN-SUFFIX,gvt2.com,GLOBAL
+  - DOMAIN-SUFFIX,android.com,GLOBAL
+  - DOMAIN-SUFFIX,googleplay.com,GLOBAL
+  - DOMAIN-SUFFIX,xn--ngstr-lra8j.com,GLOBAL
+  - DOMAIN-SUFFIX,googlevideo.com,GLOBAL
   - GEOIP,CN,DIRECT,no-resolve
   - MATCH,GLOBAL
 EOF
@@ -2702,8 +2855,8 @@ proxy_setup_iptables() {
   [ -n "$iface" ] || return 1
   case "$iface" in wlan[1-9]*|ap[0-9]*|softap*) : ;; *) proxy_log "refuse unexpected hotspot iface: $iface"; return 1 ;; esac
 
-  # 先清旧引用，避免热点接口变化后重复挂链。
-  proxy_teardown_iptables >/dev/null 2>&1
+  # 仅重建热点客户端链；手机本机代理链独立管理，避免热点接口变化时把本机代理一起拆掉。
+  proxy_teardown_hotspot_iptables >/dev/null 2>&1
 
   $IPT -t nat -N MIFI_PROXY 2>/dev/null || true
   $IPT -t nat -F MIFI_PROXY 2>/dev/null || return 1
@@ -2716,26 +2869,26 @@ proxy_setup_iptables() {
   $IPT -t nat -A MIFI_PROXY -d 192.168.0.0/16 -j RETURN || return 1
   $IPT -t nat -A MIFI_PROXY -d 224.0.0.0/4 -j RETURN || return 1
   $IPT -t nat -A MIFI_PROXY -p tcp -j REDIRECT --to-ports $PROXY_REDIR_PORT || return 1
-  $IPT -t nat -A PREROUTING -i "$iface" -j MIFI_PROXY || { proxy_teardown_iptables; return 1; }
+  $IPT -t nat -A PREROUTING -i "$iface" -j MIFI_PROXY || { proxy_teardown_hotspot_iptables; return 1; }
 
   if [ "${PROXY_BLOCK_QUIC:-1}" = "1" ]; then
     $IPT -t filter -N MIFI_BLOCK_QUIC 2>/dev/null || true
-    $IPT -t filter -F MIFI_BLOCK_QUIC 2>/dev/null || { proxy_teardown_iptables; return 1; }
-    $IPT -t filter -A MIFI_BLOCK_QUIC -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable || { proxy_teardown_iptables; return 1; }
-    $IPT -t filter -A FORWARD -i "$iface" -j MIFI_BLOCK_QUIC || { proxy_teardown_iptables; return 1; }
+    $IPT -t filter -F MIFI_BLOCK_QUIC 2>/dev/null || { proxy_teardown_hotspot_iptables; return 1; }
+    $IPT -t filter -A MIFI_BLOCK_QUIC -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable || { proxy_teardown_hotspot_iptables; return 1; }
+    $IPT -t filter -A FORWARD -i "$iface" -j MIFI_BLOCK_QUIC || { proxy_teardown_hotspot_iptables; return 1; }
   fi
 
   printf '%s\n' "$iface" > "$PROXY_IFACE_FILE"
   chmod 0600 "$PROXY_IFACE_FILE" 2>/dev/null
-  proxy_log "iptables enabled iface=$iface mode=redirect"
+  proxy_log "hotspot iptables enabled iface=$iface mode=redirect"
   return 0
 }
 
-proxy_teardown_iptables() {
+proxy_teardown_hotspot_iptables() {
   local saved current iface
   saved=$(cat "$PROXY_IFACE_FILE" 2>/dev/null | tr -d ' \r\n')
   current=$(get_hotspot_iface 2>/dev/null)
-  # 兼容 beta2 旧版无 -i 的全局挂载。
+  # 兼容旧版无 -i 的全局挂载。
   while $IPT -t nat -C PREROUTING -j MIFI_PROXY 2>/dev/null; do
     $IPT -t nat -D PREROUTING -j MIFI_PROXY 2>/dev/null || break
   done
@@ -2758,6 +2911,180 @@ proxy_teardown_iptables() {
   rm -f "$PROXY_IFACE_FILE" 2>/dev/null
 }
 
+proxy_self_set_error() {
+  printf '%s\n' "$1" > "$PROXY_SELF_ERROR_FILE" 2>/dev/null
+  chmod 0600 "$PROXY_SELF_ERROR_FILE" 2>/dev/null
+  [ -n "$1" ] && proxy_log "self proxy error: $1"
+}
+
+proxy_self_clear_error() {
+  rm -f "$PROXY_SELF_ERROR_FILE" 2>/dev/null
+}
+
+proxy_teardown_self_iptables() {
+  # 本机 TCP/DNS 透明代理链。
+  while $IPT -t nat -C OUTPUT -j MIFI_PROXY_SELF 2>/dev/null; do
+    $IPT -t nat -D OUTPUT -j MIFI_PROXY_SELF 2>/dev/null || break
+  done
+  $IPT -t nat -F MIFI_PROXY_SELF 2>/dev/null || true
+  $IPT -t nat -X MIFI_PROXY_SELF 2>/dev/null || true
+
+  # REDIRECT 只处理 TCP；本机 UDP/443 主动拒绝，让浏览器/视频应用回落到 TCP/HTTPS。
+  while $IPT -t filter -C OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null; do
+    $IPT -t filter -D OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null || break
+  done
+  $IPT -t filter -F MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
+  $IPT -t filter -X MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
+  rm -f "$PROXY_SELF_BYPASS_FILE" 2>/dev/null
+}
+
+proxy_self_nat_ok() {
+  # 只检查本机透明代理真正必需的 NAT 规则。QUIC 阻断属于可选增强，
+  # 不应因为 filter/REJECT 在某些 Android 内核上不可用，就把整个本机代理判成“未生效”。
+  local bypass rules output_rules
+  output_rules=$($IPT -t nat -S OUTPUT 2>/dev/null)
+  rules=$($IPT -t nat -S MIFI_PROXY_SELF 2>/dev/null) || return 1
+
+  # 优先使用 -C；部分 Android iptables wrapper 对 -C 返回不稳定时，再退回 -S 文本检测。
+  if ! $IPT -t nat -C OUTPUT -j MIFI_PROXY_SELF 2>/dev/null; then
+    printf '%s\n' "$output_rules" | "$BB" grep -q -- '-j MIFI_PROXY_SELF' || return 1
+  fi
+
+  if ! $IPT -t nat -C MIFI_PROXY_SELF -p tcp -j REDIRECT --to-ports $PROXY_REDIR_PORT 2>/dev/null; then
+    printf '%s\n' "$rules" | "$BB" grep -Eq -- "-j REDIRECT .*--to-ports $PROXY_REDIR_PORT|-j REDIRECT .*--to-port $PROXY_REDIR_PORT" || return 1
+  fi
+
+  bypass=$(cat "$PROXY_SELF_BYPASS_FILE" 2>/dev/null | tr -d ' \r\n')
+  case "$bypass" in
+    mark)
+      if ! $IPT -t nat -C MIFI_PROXY_SELF -m mark --mark $PROXY_ROUTING_MARK -j RETURN 2>/dev/null; then
+        printf '%s\n' "$rules" | "$BB" grep -Eq -- "-m mark .*--mark (0x[0-9a-fA-F]+|$PROXY_ROUTING_MARK).* -j RETURN" || return 1
+      fi
+      ;;
+    uid0)
+      if ! $IPT -t nat -C MIFI_PROXY_SELF -m owner --uid-owner 0 -j RETURN 2>/dev/null; then
+        printf '%s\n' "$rules" | "$BB" grep -Eq -- '-m owner .*--uid-owner (0|0-0).* -j RETURN' || return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+proxy_self_quic_ok() {
+  [ "${PROXY_BLOCK_QUIC:-1}" = "1" ] || return 0
+  local out rules
+  out=$($IPT -t filter -S OUTPUT 2>/dev/null)
+  rules=$($IPT -t filter -S MIFI_SELF_BLOCK_QUIC 2>/dev/null) || return 1
+  if ! $IPT -t filter -C OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null; then
+    printf '%s\n' "$out" | "$BB" grep -q -- '-j MIFI_SELF_BLOCK_QUIC' || return 1
+  fi
+  printf '%s\n' "$rules" | "$BB" grep -q -- '--dport 443' || return 1
+  return 0
+}
+
+# 向后兼容旧调用点：本机代理“是否生效”只由必要 NAT 规则决定。
+proxy_self_iptables_ok() {
+  proxy_self_nat_ok
+}
+
+proxy_setup_self_quic() {
+  [ "${PROXY_BLOCK_QUIC:-1}" = "1" ] || return 0
+  local bypass
+  bypass=$(cat "$PROXY_SELF_BYPASS_FILE" 2>/dev/null | tr -d ' \r\n')
+
+  # QUIC 规则是增强项：失败时保留已经工作的 TCP/DNS 本机代理。
+  while $IPT -t filter -C OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null; do
+    $IPT -t filter -D OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null || break
+  done
+  $IPT -t filter -F MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
+  $IPT -t filter -X MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
+  $IPT -t filter -N MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
+  $IPT -t filter -F MIFI_SELF_BLOCK_QUIC 2>/dev/null || return 1
+
+  case "$bypass" in
+    mark) $IPT -t filter -A MIFI_SELF_BLOCK_QUIC -m mark --mark $PROXY_ROUTING_MARK -j RETURN 2>/dev/null || return 1 ;;
+    uid0) $IPT -t filter -A MIFI_SELF_BLOCK_QUIC -m owner --uid-owner 0 -j RETURN 2>/dev/null || return 1 ;;
+    *) return 1 ;;
+  esac
+
+  $IPT -t filter -A MIFI_SELF_BLOCK_QUIC -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable 2>/dev/null || return 1
+  $IPT -t filter -A OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null || return 1
+  return 0
+}
+
+proxy_setup_self_iptables() {
+  proxy_teardown_self_iptables >/dev/null 2>&1
+
+  $IPT -t nat -N MIFI_PROXY_SELF 2>/dev/null || true
+  $IPT -t nat -F MIFI_PROXY_SELF 2>/dev/null || { proxy_self_set_error "self_nat_chain_failed"; proxy_teardown_self_iptables; return 1; }
+
+  # Mihomo 由 KernelSU service 以 root 启动。Android 的 netd 会大量使用 fwmark 选择
+  # 实际蜂窝/Wi-Fi 路由；给 Mihomo 全局设置自定义 routing-mark 可能与 netd 的 fwmark
+  # 语义冲突，表现为本机规则“已生效”但 Mihomo 出站无法真正联网。
+  # 因此 v1.6.0-beta.3 固定使用 uid 0 绕过，避免核心流量再次被 OUTPUT REDIRECT。
+  # 代价是其它 root 进程也保持直连；普通 App UID 仍正常进入 Mihomo。
+  SELF_BYPASS=
+  if $IPT -t nat -A MIFI_PROXY_SELF -m owner --uid-owner 0 -j RETURN 2>/dev/null; then
+    SELF_BYPASS=uid0
+  else
+    proxy_self_set_error "self_bypass_unavailable"
+    proxy_teardown_self_iptables
+    return 1
+  fi
+  printf '%s\n' "$SELF_BYPASS" > "$PROXY_SELF_BYPASS_FILE" 2>/dev/null
+  chmod 0600 "$PROXY_SELF_BYPASS_FILE" 2>/dev/null
+
+  # 本地回环永远直连；DNS 在其它私网 RETURN 前处理，确保局域网 DNS 请求仍可进入 Mihomo。
+  $IPT -t nat -A MIFI_PROXY_SELF -d 127.0.0.0/8 -j RETURN 2>/dev/null || { proxy_self_set_error "self_nat_rule_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -p udp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT 2>/dev/null || { proxy_self_set_error "self_dns_udp_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -p tcp --dport 53 -j REDIRECT --to-ports $PROXY_DNS_PORT 2>/dev/null || { proxy_self_set_error "self_dns_tcp_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -d 10.0.0.0/8 -j RETURN 2>/dev/null || { proxy_self_set_error "self_nat_rule_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -d 172.16.0.0/12 -j RETURN 2>/dev/null || { proxy_self_set_error "self_nat_rule_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -d 192.168.0.0/16 -j RETURN 2>/dev/null || { proxy_self_set_error "self_nat_rule_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -d 169.254.0.0/16 -j RETURN 2>/dev/null || { proxy_self_set_error "self_nat_rule_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -d 224.0.0.0/4 -j RETURN 2>/dev/null || { proxy_self_set_error "self_nat_rule_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A MIFI_PROXY_SELF -p tcp -j REDIRECT --to-ports $PROXY_REDIR_PORT 2>/dev/null || { proxy_self_set_error "self_tcp_redirect_failed"; proxy_teardown_self_iptables; return 1; }
+  $IPT -t nat -A OUTPUT -j MIFI_PROXY_SELF 2>/dev/null || { proxy_self_set_error "self_output_hook_failed"; proxy_teardown_self_iptables; return 1; }
+
+  # 建完后立即做一次独立校验。避免 iptables 命令返回 0、实际规则却被 wrapper/系统拒绝的假成功。
+  if ! proxy_self_nat_ok; then
+    proxy_self_set_error "self_nat_verify_failed"
+    proxy_teardown_self_iptables
+    return 1
+  fi
+
+  # QUIC 阻断只用于促使浏览器回退到 TCP。某些 Android 内核的 filter/REJECT 能力受限，
+  # 这种情况下本机 TCP/DNS 代理仍然有效，所以只记 warning，不再拆掉 NAT 链。
+  if [ "${PROXY_BLOCK_QUIC:-1}" = "1" ]; then
+    if ! proxy_setup_self_quic; then
+      proxy_log "self proxy warning: QUIC block unavailable; TCP/DNS proxy remains active"
+    fi
+  fi
+
+  proxy_self_clear_error
+  proxy_log "self proxy iptables enabled mode=redirect bypass=$SELF_BYPASS quic=$(proxy_self_quic_ok && echo on || echo off)"
+  return 0
+}
+
+proxy_sync_self_iptables() {
+  if [ "${PROXY_SELF:-0}" != "1" ]; then
+    proxy_teardown_self_iptables
+    proxy_self_clear_error
+    return 0
+  fi
+  if proxy_self_iptables_ok; then
+    proxy_self_clear_error
+    return 0
+  fi
+  proxy_setup_self_iptables
+}
+
+proxy_teardown_iptables() {
+  proxy_teardown_hotspot_iptables
+  proxy_teardown_self_iptables
+}
+
 proxy_iptables_ok() {
   local iface="$1"
   [ -n "$iface" ] || return 1
@@ -2770,8 +3097,7 @@ proxy_sync_iptables() {
   local iface
   iface=$(get_hotspot_iface 2>/dev/null)
   if [ -z "$iface" ]; then
-    proxy_teardown_iptables
-    proxy_write_state "waiting_hotspot"
+    proxy_teardown_hotspot_iptables
     return 0
   fi
   if proxy_iptables_ok "$iface"; then
@@ -2877,17 +3203,46 @@ proxy_start() {
     return 1
   }
 
+  # 手机本机代理与热点客户端代理完全独立。本机开关开启时先建立 OUTPUT 链；
+  # 失败只影响本机代理，不破坏已经可用的热点客户端代理。
+  if [ "${PROXY_SELF:-0}" = "1" ]; then
+    if ! proxy_setup_self_iptables; then
+      [ -s "$PROXY_SELF_ERROR_FILE" ] || proxy_self_set_error "self_iptables_setup_failed"
+      proxy_log "self proxy requested but setup failed"
+    fi
+  else
+    proxy_teardown_self_iptables
+    proxy_self_clear_error
+  fi
+
   iface=$(get_hotspot_iface 2>/dev/null)
   if [ -z "$iface" ]; then
     proxy_clear_error
-    proxy_write_state "waiting_hotspot"
-    proxy_log "mihomo ready; waiting hotspot"
+    if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_iptables_ok; then
+      proxy_write_state "running"
+      proxy_log "mihomo ready; self proxy active; waiting hotspot"
+    else
+      proxy_write_state "waiting_hotspot"
+      proxy_log "mihomo ready; waiting hotspot"
+    fi
     return 0
+  fi
+  if [ "${PROXY_SCOPE:-both}" = "self" ]; then
+    proxy_teardown_hotspot_iptables
+    if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_iptables_ok; then
+      proxy_clear_error
+      proxy_write_state "running"
+      proxy_log "proxy started for self only mode=${PROXY_MODE:-auto} nodes=$(proxy_provider_node_count)"
+      return 0
+    fi
+    proxy_set_error "self_iptables_setup_failed"
+    proxy_write_state "firewall_error"
+    return 1
   fi
   if ! proxy_setup_iptables "$iface"; then
     proxy_set_error "iptables_setup_failed"
     proxy_write_state "firewall_error"
-    proxy_teardown_iptables
+    proxy_teardown_hotspot_iptables
     return 1
   fi
   proxy_clear_error
@@ -2970,6 +3325,15 @@ proxy_healthcheck() {
   proxy_api GET "/providers/proxies/airport/healthcheck" "" >/dev/null
 }
 
+proxy_group_delay() {
+  [ -n "$PROXY_CURL" ] && [ -x "$PROXY_CURL" ] || return 1
+  local secret
+  secret=$(proxy_generate_secret)
+  "$PROXY_CURL" -fsS --connect-timeout 2 --max-time 15 \
+    -H "Authorization: Bearer $secret" \
+    "http://$PROXY_API_HOST:$PROXY_API_PORT/group/MANUAL/delay?url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204&timeout=8000" 2>/dev/null
+}
+
 proxy_set_mode() {
   local mode="$1" payload
   case "$mode" in
@@ -2996,7 +3360,7 @@ proxy_set_node() {
 proxy_status_json() {
   # Keep the main status endpoint fast. Live controller/provider checks belong to
   # proxy.cgi and the 30s supervisor, not the 5s global UI poll.
-  local state running iface has_sub last_error error_detail transparent="redirect" api_ready=false provider_ready=false node_count=0
+  local state running iface has_sub last_error error_detail self_error self_bypass transparent="redirect" api_ready=false provider_ready=false node_count=0 self_active=false self_quic=false
   state=$(proxy_read_state)
   running=$(proxy_is_running && echo true || echo false)
   iface=$(get_hotspot_iface 2>/dev/null)
@@ -3009,10 +3373,102 @@ proxy_status_json() {
     api_ready=$PROXY_HEALTH_API
     provider_ready=$PROXY_HEALTH_PROVIDER
     node_count=$PROXY_HEALTH_COUNT
+    if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_nat_ok; then
+      self_active=true
+      proxy_self_quic_ok && self_quic=true
+    fi
   fi
-  printf '{"enabled":%s,"running":%s,"state":"%s","mode":"%s","transparentMode":"%s","coreVersion":"%s","interface":"%s","hasSubscription":%s,"apiReady":%s,"providerLoaded":%s,"providerNodeCount":%s,"lastError":"%s","errorDetail":"%s"}' \
+  self_error=$(cat "$PROXY_SELF_ERROR_FILE" 2>/dev/null | "$BB" head -c 120)
+  self_bypass=$(cat "$PROXY_SELF_BYPASS_FILE" 2>/dev/null | "$BB" head -c 16)
+  printf '{"enabled":%s,"running":%s,"state":"%s","mode":"%s","routeMode":"%s","scope":"%s","transparentMode":"%s","coreVersion":"%s","interface":"%s","hasSubscription":%s,"apiReady":%s,"providerLoaded":%s,"providerNodeCount":%s,"selfProxy":%s,"selfProxyActive":%s,"selfProxyQuic":%s,"selfProxyBypass":"%s","selfProxyError":"%s","lastError":"%s","errorDetail":"%s"}' \
     "$([ "${PROXY_ENABLE:-0}" = "1" ] && echo true || echo false)" \
-    "$running" "$(json_escape "$state")" "$(json_escape "${PROXY_MODE:-auto}")" "$transparent" "$PROXY_CORE_VERSION" \
-    "$(json_escape "$iface")" "$has_sub" "$api_ready" "$provider_ready" "$node_count" "$(json_escape "$last_error")" "$(json_escape "$error_detail")"
+    "$running" "$(json_escape "$state")" "$(json_escape "${PROXY_MODE:-auto}")" "$(json_escape "${PROXY_ROUTE_MODE:-rule}")" "$(json_escape "${PROXY_SCOPE:-both}")" "$transparent" "$PROXY_CORE_VERSION" \
+    "$(json_escape "$iface")" "$has_sub" "$api_ready" "$provider_ready" "$node_count" \
+    "$([ "${PROXY_SELF:-0}" = "1" ] && echo true || echo false)" "$self_active" "$self_quic" "$(json_escape "$self_bypass")" "$(json_escape "$self_error")" \
+    "$(json_escape "$last_error")" "$(json_escape "$error_detail")"
 }
 
+
+
+ensure_management_loopback() {
+  "$BB" ip link set lo up 2>/dev/null
+  if "$BB" ip -4 addr show dev lo 2>/dev/null | "$BB" grep -q "inet $STABLE_IP/"; then
+    return 0
+  fi
+  "$BB" ip addr add "$STABLE_IP/32" dev lo 2>/dev/null
+  if "$BB" ip -4 addr show dev lo 2>/dev/null | "$BB" grep -q "inet $STABLE_IP/"; then
+    echo "$(date) management IP attached to loopback: $STABLE_IP" >> "$LOG"
+    return 0
+  fi
+  echo "$(date) management IP loopback attach failed: $STABLE_IP" >> "$LOG"
+  return 1
+}
+
+remove_management_loopback() {
+  "$BB" ip addr del "$STABLE_IP/32" dev lo 2>/dev/null || true
+}
+
+switch_management_to_hotspot() {
+  HOTSPOT_IFACE=$1
+  [ -n "$HOTSPOT_IFACE" ] || return 1
+  # 已经在热点接口上就不动
+  if "$BB" ip -4 addr show dev "$HOTSPOT_IFACE" 2>/dev/null | "$BB" grep -q "inet $STABLE_IP/"; then
+    return 0
+  fi
+  remove_management_loopback
+  add_management_alias "$HOTSPOT_IFACE"
+  if "$BB" ip -4 addr show dev "$HOTSPOT_IFACE" 2>/dev/null | "$BB" grep -q "inet $STABLE_IP/"; then
+    echo "$(date) management IP attached to hotspot: $HOTSPOT_IFACE" >> "$LOG"
+    return 0
+  fi
+  ensure_management_loopback
+  echo "$(date) management IP hotspot attach failed, restored loopback" >> "$LOG"
+  return 1
+}
+
+wait_softap_stopped() {
+  WAIT_COUNT=0
+  while [ "$WAIT_COUNT" -lt 12 ]; do
+    rm -f "$SOFTAP_CACHE" 2>/dev/null
+    CHECK_IFACE=$(get_hotspot_iface)
+    if [ -z "$CHECK_IFACE" ]; then
+      return 0
+    fi
+    if ! softap_state_ok "$CHECK_IFACE"; then
+      return 0
+    fi
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+    sleep 1
+  done
+  return 1
+}
+
+stop_hotspot_real() {
+  BEFORE_IFACE=$(get_hotspot_iface)
+  rm -f "$SOFTAP_CACHE" 2>/dev/null
+  echo "$(date) hotspot stop: trying wifi stop-softap" >> "$LOG"
+  WIFI_OUT=$( "$BB" timeout 10 /system/bin/cmd wifi stop-softap 2>&1 )
+  WIFI_RC=$?
+  printf '%s wifi stop-softap rc=%s\n%s\n' "$(date)" "$WIFI_RC" "$WIFI_OUT" >> "$LOG"
+  if wait_softap_stopped; then
+    remove_management_alias "$BEFORE_IFACE" 2>/dev/null
+    clear_blacklist "$BEFORE_IFACE" 2>/dev/null
+    ensure_management_loopback
+    echo "$(date) hotspot stop: stopped by wifi service" >> "$LOG"
+    return 0
+  fi
+  rm -f "$SOFTAP_CACHE" 2>/dev/null
+  echo "$(date) hotspot stop: wifi stop-softap ineffective, trying connectivity tether stop" >> "$LOG"
+  TETHER_OUT=$( "$BB" timeout 10 /system/bin/cmd connectivity tether stop 2>&1 )
+  TETHER_RC=$?
+  printf '%s tether stop rc=%s\n%s\n' "$(date)" "$TETHER_RC" "$TETHER_OUT" >> "$LOG"
+  if wait_softap_stopped; then
+    remove_management_alias "$BEFORE_IFACE" 2>/dev/null
+    clear_blacklist "$BEFORE_IFACE" 2>/dev/null
+    ensure_management_loopback
+    echo "$(date) hotspot stop: stopped by connectivity service" >> "$LOG"
+    return 0
+  fi
+  echo "$(date) hotspot stop failed: hotspot still active" >> "$LOG"
+  return 1
+}

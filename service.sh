@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 MODDIR=${0%/*}
-DATA_DIR=/data/adb/xiaomi_mifi_web
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 CONFIG="$DATA_DIR/config.conf"
 HTTP_CONF="$DATA_DIR/httpd.conf"
 LOG="$DATA_DIR/service.log"
@@ -32,7 +32,7 @@ if [ -f "$SUPERVISOR_PIDFILE" ]; then
   OLD_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
   case "$OLD_PID" in ''|*[!0-9]*) OLD_PID=0 ;; esac
   W=0
-  while [ "$OLD_PID" -gt 1 ] && [ -r "/proc/$OLD_PID/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null | "$BB" grep -q 'xiaomi_mifi_web/service.sh'; do
+  while [ "$OLD_PID" -gt 1 ] && [ -r "/proc/$OLD_PID/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null | "$BB" grep -q 'mifi_web/service.sh'; do
     if [ "$W" -ge 10 ]; then kill -9 "$OLD_PID" 2>/dev/null; break; fi
     kill "$OLD_PID" 2>/dev/null
     W=$((W + 1))
@@ -223,7 +223,7 @@ start_httpd() {
 if [ -f "$SUPERVISOR_PIDFILE" ]; then
   OLD_SUPERVISOR=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
   case "$OLD_SUPERVISOR" in ''|*[!0-9]*) OLD_SUPERVISOR=0 ;; esac
-  if [ "$OLD_SUPERVISOR" -gt 1 ] && [ "$OLD_SUPERVISOR" != "$$" ] && [ -r "/proc/$OLD_SUPERVISOR/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_SUPERVISOR/cmdline" | "$BB" grep -q 'xiaomi_mifi_web.*/service.sh'; then
+  if [ "$OLD_SUPERVISOR" -gt 1 ] && [ "$OLD_SUPERVISOR" != "$$" ] && [ -r "/proc/$OLD_SUPERVISOR/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_SUPERVISOR/cmdline" | "$BB" grep -q 'mifi_web.*service.sh'; then
     kill "$OLD_SUPERVISOR" 2>/dev/null
   fi
 fi
@@ -250,6 +250,14 @@ fi
 chmod 0600 "$DESIRED_FILE"
 start_httpd
 
+# 初始化管理地址：热点在则绑热点，否则绑 lo
+_INIT_IFACE=$(get_hotspot_iface)
+if [ -n "$_INIT_IFACE" ] && softap_state_ok "$_INIT_IFACE"; then
+  switch_management_to_hotspot "$_INIT_IFACE"
+else
+  ensure_management_loopback
+fi
+
 # Keep both the LAN admin page and the desired hotspot state alive.
 # HyperOS reports a 600-second idle SoftAP shutdown timeout; the watchdog
 # restarts it when keepalive is enabled. Schedule and idle shutdown are
@@ -258,6 +266,37 @@ TICK=0
 IDLE_SECS=0
 while true; do
   sleep 5
+
+  # 处理 CGI 提交的控制任务（由常驻进程执行，避免 CGI 子进程被杀）
+  if [ -s "$CONTROL_REQUEST" ]; then
+    CONTROL_ACTION=$("$BB" head -n 1 "$CONTROL_REQUEST" 2>/dev/null)
+    rm -f "$CONTROL_REQUEST"
+    case "$CONTROL_ACTION" in
+      stop)
+        echo "$(date) supervisor: processing hotspot stop request" >> "$LOG"
+        if stop_hotspot_real; then
+          printf '0\n' > "$DESIRED_FILE"
+          chmod 0600 "$DESIRED_FILE"
+          printf 'manual\n' > "$STOP_REASON_FILE"
+          chmod 0600 "$STOP_REASON_FILE"
+          : > "$MANUAL_OFF_FILE"
+          chmod 0600 "$MANUAL_OFF_FILE"
+          : > "$SKIP_WINDOW_FILE"
+          write_operation success "热点已实际关闭，本次开机内不会自动拉起"
+        else
+          printf '1\n' > "$DESIRED_FILE"
+          chmod 0600 "$DESIRED_FILE"
+          rm -f "$MANUAL_OFF_FILE" "$SKIP_WINDOW_FILE" "$STOP_REASON_FILE"
+          write_operation error "热点关闭失败：系统仍检测到热点运行"
+        fi
+        release_operation_lock
+        ;;
+      *)
+        write_operation error "未知控制任务"
+        release_operation_lock
+        ;;
+    esac
+  fi
 
   HTTP_PID=$(cat "$PIDFILE" 2>/dev/null)
   if [ -z "$HTTP_PID" ] || ! kill -0 "$HTTP_PID" 2>/dev/null; then
@@ -272,6 +311,11 @@ while true; do
     DESIRED=$(cat "$DESIRED_FILE" 2>/dev/null)
     [ "$DESIRED" = "1" ] || DESIRED=0
     IFACE=$(get_hotspot_iface)
+    if [ -n "$IFACE" ] && softap_state_ok "$IFACE"; then
+      switch_management_to_hotspot "$IFACE"
+    else
+      ensure_management_loopback
+    fi
 
     # 科学上网守护：每 30 秒检查一次。核心/API 异常时 fail-open，避免热点被残留规则锁死。
     PROXY_SUP_TICK=$(( ${PROXY_SUP_TICK:-0} + 1 ))
@@ -285,26 +329,55 @@ while true; do
             proxy_teardown_iptables
             proxy_set_error "subscription_loaded_no_nodes"
             proxy_write_state "subscription_error"
-          elif [ -n "$IFACE" ]; then
+          else
             proxy_health_write true true "$(proxy_provider_node_count)"
-            if ! proxy_iptables_ok "$IFACE"; then
-              proxy_log "supervisor: resync iptables iface=$IFACE"
-              if proxy_sync_iptables; then
+
+            # 手机本机代理独立于热点接口。开关打开时守护 OUTPUT 链，关闭时确保彻底移除。
+            if [ "${PROXY_SELF:-0}" = "1" ]; then
+              if ! proxy_self_iptables_ok; then
+                proxy_log "supervisor: resync self proxy iptables"
+                proxy_sync_self_iptables >/dev/null 2>&1 || proxy_self_set_error "self_iptables_resync_failed"
+              else
+                proxy_self_clear_error
+              fi
+            else
+              proxy_teardown_self_iptables
+              proxy_self_clear_error
+            fi
+
+            if [ "${PROXY_SCOPE:-both}" = "self" ]; then
+              proxy_teardown_hotspot_iptables
+              if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_iptables_ok; then
                 proxy_clear_error
                 proxy_write_state "running"
               else
-                proxy_set_error "iptables_resync_failed"
+                proxy_set_error "self_iptables_resync_failed"
                 proxy_write_state "firewall_error"
-                proxy_teardown_iptables
               fi
-            elif [ "$(proxy_read_state)" != "running" ]; then
+            elif [ -n "$IFACE" ]; then
+              if ! proxy_iptables_ok "$IFACE"; then
+                proxy_log "supervisor: resync hotspot iptables iface=$IFACE"
+                if proxy_sync_iptables; then
+                  proxy_clear_error
+                  proxy_write_state "running"
+                else
+                  proxy_set_error "iptables_resync_failed"
+                  proxy_write_state "firewall_error"
+                  proxy_teardown_hotspot_iptables
+                fi
+              elif [ "$(proxy_read_state)" != "running" ]; then
+                proxy_clear_error
+                proxy_write_state "running"
+              fi
+            else
+              proxy_teardown_hotspot_iptables
               proxy_clear_error
-              proxy_write_state "running"
+              if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_iptables_ok; then
+                proxy_write_state "running"
+              else
+                proxy_write_state "waiting_hotspot"
+              fi
             fi
-          else
-            proxy_teardown_iptables
-            proxy_clear_error
-            proxy_write_state "waiting_hotspot"
           fi
         else
           proxy_health_write false false 0
@@ -313,7 +386,7 @@ while true; do
           proxy_start_async >/dev/null 2>&1 || proxy_log "supervisor: could not schedule restart"
         fi
       else
-        if proxy_is_running || $IPT -t nat -L MIFI_PROXY >/dev/null 2>&1; then
+        if proxy_is_running || $IPT -t nat -L MIFI_PROXY >/dev/null 2>&1 || $IPT -t nat -L MIFI_PROXY_SELF >/dev/null 2>&1; then
           proxy_stop >/dev/null 2>&1
         fi
       fi
@@ -331,6 +404,11 @@ while true; do
           echo 1 > "$DESIRED_FILE"
           if start_hotspot; then
             IFACE=$(get_hotspot_iface)
+    if [ -n "$IFACE" ] && softap_state_ok "$IFACE"; then
+      switch_management_to_hotspot "$IFACE"
+    else
+      ensure_management_loopback
+    fi
             DESIRED=1
           else
             IFACE=
@@ -370,8 +448,22 @@ while true; do
       echo "$(date) SoftAP is down while desired; restarting" >> "$LOG"
       if start_hotspot; then
         IFACE=$(get_hotspot_iface)
+    if [ -n "$IFACE" ] && softap_state_ok "$IFACE"; then
+      switch_management_to_hotspot "$IFACE"
+    else
+      ensure_management_loopback
+    fi
         echo "$(date) keepalive: hotspot recovered" >> "$LOG"
-        [ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && notify_all_async "热点已自动恢复" "时间: $(date '+%m-%d %H:%M')" 2>/dev/null &
+        # 10分钟内不重复发"热点已自动恢复"通知
+        RECOVER_NOTIFY_FILE="$DATA_DIR/recover_notify_ts"
+        NOW_S=$($DATE_CMD +%s 2>/dev/null || date +%s)
+        LAST_RECOVER=$(cat "$RECOVER_NOTIFY_FILE" 2>/dev/null)
+        case "$LAST_RECOVER" in ''|*[!0-9]*) LAST_RECOVER=0 ;; esac
+        if [ $((NOW_S - LAST_RECOVER)) -gt 600 ]; then
+          printf '%s\n' "$NOW_S" > "$RECOVER_NOTIFY_FILE"
+          chmod 0600 "$RECOVER_NOTIFY_FILE" 2>/dev/null
+          [ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && notify_all_async "热点已自动恢复" "时间: $(date '+%m-%d %H:%M')" 2>/dev/null &
+        fi
       else
         IFACE=
         DESIRED=0

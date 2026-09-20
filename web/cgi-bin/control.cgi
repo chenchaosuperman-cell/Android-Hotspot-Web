@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-MODDIR=/data/adb/modules/xiaomi_mifi_web
+MODDIR=/data/adb/modules/xiaomi14_mifi_web
 if [ ! -r "$MODDIR/lib/common.sh" ]; then
   SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null)
   MODDIR=${SCRIPT_PATH%/web/cgi-bin/control.cgi}
@@ -92,6 +92,9 @@ save_config() {
     printf 'PROXY_SUB_B64=%s\n' "${PROXY_SUB_B64:-}"
     printf 'PROXY_MODE=%s\n' "${PROXY_MODE:-auto}"
     printf 'PROXY_BLOCK_QUIC=%s\n' "${PROXY_BLOCK_QUIC:-1}"
+    printf 'PROXY_SELF=%s\n' "${PROXY_SELF:-0}"
+    printf 'PROXY_ROUTE_MODE=%s\n' "${PROXY_ROUTE_MODE:-rule}"
+    printf 'PROXY_SCOPE=%s\n' "${PROXY_SCOPE:-both}"
     # P0-64：保留内部迁移标记，避免保存配置后升级迁移被重复执行
     printf 'PORT80_MIGRATED=%s\n' "${PORT80_MIGRATED:-0}"
     printf 'MIGRATE_REMOVED=%s\n' "${MIGRATE_REMOVED:-0}"
@@ -150,6 +153,7 @@ restart_hotspot_async() {
     STOP_OUT=$(/system/bin/cmd wifi stop-softap 2>&1)
     printf '%s stop-softap\n%s\n' "$(date)" "$STOP_OUT" >> "$LOG"
     sleep 1
+    # Keep loopback management address until hotspot is ready
     OUT=$(run_softap "$SSID" "$SECURITY" "$PASS" "$BAND" "$CHANNEL" "$MAX_CLIENTS" 2>&1)
     RC=$?
     printf '%s\n' "$OUT" >> "$LOG"
@@ -168,7 +172,7 @@ restart_hotspot_async() {
       PARAM_ERR=$(verify_hotspot_params "$SSID" "$SECURITY" "$BAND" "$CHANNEL")
       if [ -z "$PARAM_ERR" ]; then
         OK=1
-        add_management_alias "$VERIFY_IFACE"
+        switch_management_to_hotspot "$VERIFY_IFACE"
         flush_stats_chain
         ensure_stats_chain "$VERIFY_IFACE"
         apply_blacklist "$VERIFY_IFACE"
@@ -190,6 +194,7 @@ restart_hotspot_async() {
       write_operation error "热点启动失败：$OUT"
     fi
     if [ "$OK" != "1" ]; then
+      ensure_management_loopback
       printf '0\n' > "$DESIRED_FILE"
       chmod 0600 "$DESIRED_FILE"
       printf 'error\n' > "$STOP_REASON_FILE" 2>/dev/null
@@ -310,37 +315,33 @@ case "$ACTION" in
       printf '{"ok":false,"message":"已有操作正在执行，请稍后再试"}'
       exit 0
     fi
-    AP_IFACE=$(get_hotspot_iface)
-    # 手动关闭：本次开机保持关闭（MANUAL_OFF），保活/定时/空闲都不再自动拉起；短信转发/通知继续。
-    # 重启手机后 MANUAL_OFF 自动清除，再按 AUTOSTART 决定是否开启；手动开启即解除。
     printf '0\n' > "$DESIRED_FILE"
     chmod 0600 "$DESIRED_FILE"
     printf 'manual\n' > "$STOP_REASON_FILE" 2>/dev/null
+    chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
     : > "$MANUAL_OFF_FILE" 2>/dev/null
     chmod 0600 "$MANUAL_OFF_FILE" 2>/dev/null
     : > "$SKIP_WINDOW_FILE" 2>/dev/null
-    chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
     write_operation working "正在关闭热点"
-    sleep 1
-    OUT=$(/system/bin/cmd wifi stop-softap 2>&1)
-    RC=$?
-    remove_management_alias "$AP_IFACE" 2>/dev/null
-    clear_blacklist "$AP_IFACE" 2>/dev/null
-    printf '%s stop-softap rc=%s\n' "$(date)" "$RC" >> "$LOG"
-    if [ "$RC" -eq 0 ]; then
-      write_operation success "热点已关闭（手动关闭，不保活）"
-      printf '{"ok":true,"message":"热点已关闭；本次开机内保活/定时不会自动拉起，短信转发与消息通知仍运行"}'
-    else
-      write_operation error "热点关闭失败：$OUT"
-      printf '{"ok":false,"message":"热点关闭失败：%s"}' "$OUT"
+    REQ_TMP="$CONTROL_REQUEST.$$"
+    if ! printf 'stop\n' > "$REQ_TMP" || ! mv -f "$REQ_TMP" "$CONTROL_REQUEST"; then
+      rm -f "$REQ_TMP"
+      release_operation_lock
+      write_operation error "关闭任务提交失败"
+      printf '{"ok":false,"message":"关闭任务提交失败"}'
+      exit 0
     fi
-    release_operation_lock
+    chmod 0600 "$CONTROL_REQUEST"
+    printf '{"ok":true,"message":"关闭任务已提交"}'
     ;;
   proxy_save)
     SUB_B64=$(get_param sub_b64)
     MODE=$(get_param mode)
     ENABLE=$(get_param enable)
     BLOCK_QUIC=$(get_param block_quic)
+    SELF_PROXY=$(get_param self)
+    ROUTE_MODE=$(get_param proxyRouteMode)
+    PROXY_SCOPE_V=$(get_param proxyScope)
     if [ -n "$SUB_B64" ]; then
       valid_b64url "$SUB_B64" || { printf '{"ok":false,"message":"订阅地址编码无效"}'; exit 0; }
       SUB_URL=$(b64url_decode "$SUB_B64" 2>/dev/null)
@@ -353,6 +354,16 @@ case "$ACTION" in
     [ -n "$MODE" ] && case "$MODE" in auto|fallback|manual) PROXY_MODE="$MODE" ;; *) printf '{"ok":false,"message":"代理模式无效"}'; exit 0 ;; esac
     [ -n "$ENABLE" ] && case "$ENABLE" in 0|1) PROXY_ENABLE="$ENABLE" ;; *) printf '{"ok":false,"message":"代理开关参数无效"}'; exit 0 ;; esac
     [ -n "$BLOCK_QUIC" ] && case "$BLOCK_QUIC" in 0|1) PROXY_BLOCK_QUIC="$BLOCK_QUIC" ;; *) printf '{"ok":false,"message":"QUIC 参数无效"}'; exit 0 ;; esac
+    [ -n "$SELF_PROXY" ] && case "$SELF_PROXY" in 0|1) PROXY_SELF="$SELF_PROXY" ;; *) printf '{"ok":false,"message":"本机代理参数无效"}'; exit 0 ;; esac
+    [ -n "$ROUTE_MODE" ] && case "$ROUTE_MODE" in rule|global) PROXY_ROUTE_MODE="$ROUTE_MODE" ;; *) printf '{"ok":false,"message":"代理模式无效"}'; exit 0 ;; esac
+    if [ -n "$PROXY_SCOPE_V" ]; then
+      case "$PROXY_SCOPE_V" in
+        hotspot) PROXY_SCOPE=hotspot; PROXY_SELF=0 ;;
+        self) PROXY_SCOPE=self; PROXY_SELF=1 ;;
+        both) PROXY_SCOPE=both; PROXY_SELF=1 ;;
+        *) printf '{"ok":false,"message":"代理范围无效"}'; exit 0 ;;
+      esac
+    fi
     save_config || { printf '{"ok":false,"message":"代理配置保存失败"}'; exit 0; }
     printf '{"ok":true,"message":"订阅已保存"}'
     ;;
@@ -373,6 +384,56 @@ case "$ACTION" in
     save_config || { printf '{"ok":false,"message":"代理配置保存失败"}'; exit 0; }
     proxy_stop
     printf '{"ok":true,"message":"科学上网已停止"}'
+    ;;
+  proxy_set_self)
+    SELF_PROXY=$(get_param self)
+    ROUTE_MODE=$(get_param proxyRouteMode)
+    PROXY_SCOPE_V=$(get_param proxyScope)
+    case "$SELF_PROXY" in 0|1) : ;; *) printf '{"ok":false,"message":"本机代理参数无效"}'; exit 0 ;; esac
+    if [ "$SELF_PROXY" = "1" ]; then
+      # 核心未启动/Provider 未就绪时先记住开关；守护进程会在代理就绪后自动应用。
+      SELF_APPLIED=0
+      if proxy_is_running && proxy_api_ready && proxy_provider_ready; then
+        PROXY_SELF=1
+        if ! proxy_setup_self_iptables; then
+          PROXY_SELF=0
+          proxy_teardown_self_iptables
+          save_config >/dev/null 2>&1 || true
+          ERR=$(cat "$PROXY_SELF_ERROR_FILE" 2>/dev/null | "$BB" head -c 120)
+          case "$ERR" in
+            self_bypass_unavailable) MSG="系统内核缺少本机透明代理所需的 mark/owner 规则" ;;
+            self_nat_chain_failed) MSG="无法创建本机 NAT 链" ;;
+            self_dns_udp_failed|self_dns_tcp_failed) MSG="本机 DNS 透明代理规则建立失败" ;;
+            self_tcp_redirect_failed) MSG="本机 TCP 重定向规则建立失败" ;;
+            self_output_hook_failed) MSG="Android OUTPUT 规则挂载失败" ;;
+            self_nat_verify_failed) MSG="本机代理规则建立后校验失败" ;;
+            *) MSG="本机网络规则建立失败" ;;
+          esac
+          printf '{"ok":false,"message":"%s"}' "$(json_escape "$MSG")"
+          exit 0
+        fi
+        SELF_APPLIED=1
+      fi
+      PROXY_SELF=1
+      save_config || { proxy_teardown_self_iptables; printf '{"ok":false,"message":"本机代理设置保存失败"}'; exit 0; }
+      if [ "$SELF_APPLIED" = "1" ]; then
+        if proxy_self_quic_ok; then
+          printf '{"ok":true,"message":"手机本机代理已开启"}'
+        else
+          printf '{"ok":true,"message":"本机 TCP / DNS 代理已开启（QUIC 降级规则不可用）"}'
+        fi
+      elif proxy_is_running; then
+        printf '{"ok":true,"message":"已保存，代理节点就绪后自动生效"}'
+      else
+        printf '{"ok":true,"message":"已保存，启动科学上网后生效"}'
+      fi
+    else
+      PROXY_SELF=0
+      proxy_teardown_self_iptables
+      proxy_self_clear_error
+      save_config || { printf '{"ok":false,"message":"本机代理设置保存失败"}'; exit 0; }
+      printf '{"ok":true,"message":"手机本机代理已关闭"}'
+    fi
     ;;
   proxy_set_mode)
     MODE=$(get_param mode)
@@ -500,7 +561,7 @@ case "$ACTION" in
       case "$k" in
         SECURITY) case "$v" in open|wpa2|wpa3|wpa3_transition) return 0 ;; esac ;;
         BAND) case "$v" in 2|5|any) return 0 ;; esac ;;
-        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC)
+        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)
           case "$v" in 0|1) return 0 ;; esac ;;
         PORT) case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -ge 1024 ] && [ "$v" -le 65535 ] && return 0 ;; esac ;;
         CHANNEL) case "$v" in ''|*[!0-9]*) : ;; *) return 0 ;; esac ;;
@@ -528,7 +589,7 @@ case "$ACTION" in
     printf '%s\n' "$PLAIN" > "$TMP_CFG"
     # 只允许明确白名单字段（不直接 source 上传内容），逐行读取赋值；
     # 排除含 shell 元字符的任意内容，避免导入任意变量进入运行环境
-    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC)=[^;&|`$\\]*$'
+    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
     "$BB" grep -E "$ALLOWED" "$TMP_CFG" > "$TMP_CFG.clean" 2>/dev/null || true
     if [ ! -s "$TMP_CFG.clean" ]; then
       rm -f "$TMP_CFG" "$TMP_CFG.clean"

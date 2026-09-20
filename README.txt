@@ -1,4 +1,4 @@
-Xiaomi 14 MiFi Web Control v1.5.20
+Xiaomi 14 MiFi Web Control v1.6.0-beta.4
 ==================================
 
 适用环境：
@@ -22,6 +22,25 @@ Xiaomi 14 MiFi Web Control v1.5.20
 - 频段：2.4GHz
 - 开机自动启动：开启
 - Web端口：8080
+
+v1.6.0-beta.4 更新
+- “通知”Tab 调整为“消息”，短信转发放在最上方。
+- PushPlus 与钉钉各自独立成卡；低电量、流量阈值、热点异常提醒分别独立成卡。
+- 每项设置独立保存，状态与失败原因直接显示在对应卡片内。
+
+v1.6.0-beta.3 更新
+- 修复手机本机代理开启后规则显示生效、Google/海外网站仍打不开的问题。
+- 移除 Mihomo 全局 routing-mark，避免与 Android 16 / netd 的 fwmark 路由选择冲突。
+- 本机代理固定以 uid 0 绕过 Mihomo 自身，防止 OUTPUT REDIRECT 回环。
+- 增加 HTTP/TLS Sniffer，在 Android 本机 DNS 未完整经过 53 端口时也能从 SNI/HTTP Host 恢复域名。
+- 热点客户端代理逻辑保持不变。
+
+v1.6.0-beta.2 更新
+- 科学页新增“手机本机也走代理”开关，默认关闭。
+- 开启后手机普通 App 的 TCP / DNS 与热点客户端一样进入 Mihomo；热点代理与本机代理可独立启停。
+- Mihomo 自身出站优先通过 routing-mark 绕过 OUTPUT 透明代理，避免代理回环；不支持 mark 的内核自动使用 uid0 兼容模式。
+- REDIRECT 模式下本机 UDP/443 可自动阻止 QUIC，让 Google / YouTube 等回落到 TCP/HTTPS。
+- 开机、核心异常、热点接口变化时会自动恢复或清理本机代理规则，保持 fail-open。
 
 v1.5.20 更新
 - 首页重构：热点控制单主按钮 + 本账期流量主卡 + 紧凑状态栏。

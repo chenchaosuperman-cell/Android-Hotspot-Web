@@ -1,6 +1,6 @@
 #!/system/bin/sh
 
-DATA_DIR=/data/adb/xiaomi_mifi_web
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 
 # 先读黑名单再清理 iptables：卸载后残留的 MAC DROP 规则会让被拉黑设备继续断网
 # P1-90：卸载脚本同样不 source 配置文件（避免执行注入内容），只提取黑名单字段
@@ -79,6 +79,17 @@ done
 /system/bin/iptables -t nat -X MIFI_PROXY 2>/dev/null || true
 /system/bin/iptables -t filter -F MIFI_BLOCK_QUIC 2>/dev/null || true
 /system/bin/iptables -t filter -X MIFI_BLOCK_QUIC 2>/dev/null || true
+# v1.6：清理手机本机代理 OUTPUT 链。
+while /system/bin/iptables -t nat -C OUTPUT -j MIFI_PROXY_SELF 2>/dev/null; do
+  /system/bin/iptables -t nat -D OUTPUT -j MIFI_PROXY_SELF 2>/dev/null || break
+done
+/system/bin/iptables -t nat -F MIFI_PROXY_SELF 2>/dev/null || true
+/system/bin/iptables -t nat -X MIFI_PROXY_SELF 2>/dev/null || true
+while /system/bin/iptables -t filter -C OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null; do
+  /system/bin/iptables -t filter -D OUTPUT -j MIFI_SELF_BLOCK_QUIC 2>/dev/null || break
+done
+/system/bin/iptables -t filter -F MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
+/system/bin/iptables -t filter -X MIFI_SELF_BLOCK_QUIC 2>/dev/null || true
 if [ -r "$DATA_DIR/proxy/mihomo.pid" ]; then
   MPID=$(cat "$DATA_DIR/proxy/mihomo.pid" 2>/dev/null)
   case "$MPID" in ''|*[!0-9]*) MPID=0 ;; esac

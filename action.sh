@@ -9,7 +9,7 @@
 #   action.sh                   (no args) show info + restart service (legacy)
 
 MODDIR=${0%/*}
-DATA_DIR=/data/adb/xiaomi_mifi_web
+DATA_DIR=/data/adb/xiaomi14_mifi_web
 STABLE_IP=192.168.43.1
 PORT=8080
 DESIRED_FILE="$DATA_DIR/desired_state"
