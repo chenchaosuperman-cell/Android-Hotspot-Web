@@ -136,7 +136,9 @@ header_json() {
 }
 
 json_escape() {
-  printf '%s' "$1" | "$BB" tr '\r\n' '  ' | "$BB" sed 's/\\/\\\\/g; s/"/\\"/g; s/[[:cntrl:]]//g'
+  # v1.7.2-beta.1：单次 awk 完成原 tr+sed（status.cgi 每次轮询调用 70+ 次，
+  # 原实现每调用 fork 2 个 busybox 子进程，真机上占状态接口数秒开销）
+  printf '%s' "$1" | "$BB" awk '{s=$0; gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); gsub(/[[:cntrl:]]/,"",s); printf "%s", s}'
 }
 
 # 读取设备型号与系统版本（按可用属性链回退，属性缺失时保持空字符串）
@@ -874,7 +876,7 @@ get_sim_state() {
   SIM_DATA=0
   SIM_SIGNAL=
   SIM_CACHE="$DATA_DIR/sim.cache"
-  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  NOW_S=${NOW_S:-$(/system/bin/date +%s 2>/dev/null || date +%s)}
   if [ -r "$SIM_CACHE" ]; then
     CACHE_MT=$("$BB" stat -c %Y "$SIM_CACHE" 2>/dev/null)
     case "$CACHE_MT" in ''|*[!0-9]*) CACHE_MT=0 ;; esac
@@ -884,9 +886,19 @@ get_sim_state() {
       return 0
     fi
   fi
+  # v1.7.2-beta.1：CGI 只读模式——sim.cache 由 supervisor 每 tick 后台预热（30s 限频），
+  # CGI 未命中缓存直接返回空字段，绝不执行 dumpsys/grep 重建（真机上此路径曾卡 3s+ 拖垮状态接口）。
+  if [ "${CGI_READONLY:-0}" = "1" ]; then
+    return 0
+  fi
   DMP_FILE="$TELEPHONY_SNAPSHOT"
-  ensure_telephony_snapshot >/dev/null 2>&1 || true
-  if [ -s "$DMP_FILE" ]; then
+  SNAP_AGE=999
+  if [ -r "$DMP_FILE" ]; then
+    SNAP_MT=$("$BB" stat -c %Y "$DMP_FILE" 2>/dev/null)
+    case "$SNAP_MT" in ''|*[!0-9]*) SNAP_MT=0 ;; esac
+    [ "$SNAP_MT" -gt 0 ] && SNAP_AGE=$((NOW_S - SNAP_MT))
+  fi
+  if [ -s "$DMP_FILE" ] && [ "$SNAP_AGE" -ge 0 ] && [ "$SNAP_AGE" -lt 60 ] 2>/dev/null; then
     SIM_OPERATOR=$("$BB" grep -o 'mOperatorAlphaLong=[^,]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mOperatorAlphaLong=//; s/[[:space:]]*$//')
     SIM_DATA=$("$BB" grep -o 'mDataConnectionState=[0-9]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mDataConnectionState=//')
     [ -z "$SIM_DATA" ] && SIM_DATA=0
@@ -1049,8 +1061,29 @@ softap_state_snapshot() {
 softap_state_ok() {
   iface=$1
   [ -n "$iface" ] || return 1
-  IP_ADDR=$(get_iface_ip "$iface")
+  # v1.7.2-beta.1：接受调用方已算好的 IP（status.cgi 已一次 ip 调用取得），避免再 fork ip
+  IP_ADDR=$2
+  [ -n "$IP_ADDR" ] || IP_ADDR=$(get_iface_ip "$iface")
   [ -n "$IP_ADDR" ] || return 1
+  # v1.7.2-beta.1：CGI 只读——只用现有 softap.cache 判定（supervisor 每 tick 刷新），
+  # 缓存缺失/过期时若接口已有 IP 视为运行；绝不触发 dumpsys wifi（真机 1s+ 卡顿）。
+  if [ "${CGI_READONLY:-0}" = "1" ]; then
+    NOW_S=${NOW_S:-$(/system/bin/date +%s 2>/dev/null || date +%s)}
+    SNAP_AGE=999
+    if [ -r "$SOFTAP_CACHE" ]; then
+      SNAP_MT=$("$BB" stat -c %Y "$SOFTAP_CACHE" 2>/dev/null)
+      case "$SNAP_MT" in ''|*[!0-9]*) SNAP_MT=0 ;; esac
+      [ "$SNAP_MT" -gt 0 ] && SNAP_AGE=$((NOW_S - SNAP_MT))
+      . "$SOFTAP_CACHE" 2>/dev/null || true
+    fi
+    if [ "$SNAP_AGE" -ge 0 ] && [ "$SNAP_AGE" -lt 45 ] 2>/dev/null; then
+      case "$SNAP_AP_STATE" in
+        ENABLED) return 0 ;;
+        DISABLED) return 1 ;;
+      esac
+    fi
+    return 0
+  fi
   softap_state_snapshot
   case "$SNAP_AP_STATE" in
     ENABLED) return 0 ;;
@@ -1134,8 +1167,9 @@ rotate_log() {
 # ---------- 蜂窝流量统计（开机以来 rmnet 累计，只读 /proc/net/dev） ----------
 # 输出: CELL_RX CELL_TX（字节）
 get_cell_stats() {
-  CELL_RX=$(cat /proc/net/dev 2>/dev/null | "$BB" awk '/^[[:space:]]*rmnet/{rx+=$2; tx+=$10} END{print rx+0}')
-  CELL_TX=$(cat /proc/net/dev 2>/dev/null | "$BB" awk '/^[[:space:]]*rmnet/{rx+=$2; tx+=$10} END{print tx+0}')
+  # v1.7.2-beta.1：一次 cat 同时算 rx/tx，避免两次 cat|awk 管道（真机每次轮询重复执行）
+  CELL_RX=$("$BB" awk '/^[[:space:]]*rmnet/{rx+=$2; tx+=$10} END{print rx" "tx}' /proc/net/dev 2>/dev/null)
+  case "$CELL_RX" in *" "*) CELL_TX=${CELL_RX#* }; CELL_RX=${CELL_RX%% *} ;; *) CELL_TX=0; CELL_RX=0 ;; esac
   case "$CELL_RX" in ''|*[!0-9]*) CELL_RX=0 ;; esac
   case "$CELL_TX" in ''|*[!0-9]*) CELL_TX=0 ;; esac
 }
@@ -1147,7 +1181,7 @@ get_battery_cached() {
   CHARGING=false
   BATTERY_STATUS=0
   B_CACHE="$DATA_DIR/battery.cache"
-  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  NOW_S=${NOW_S:-$(/system/bin/date +%s 2>/dev/null || date +%s)}
   if [ -r "$B_CACHE" ]; then
     B_MT=$("$BB" stat -c %Y "$B_CACHE" 2>/dev/null)
     case "$B_MT" in ''|*[!0-9]*) B_MT=0 ;; esac
@@ -1155,6 +1189,14 @@ get_battery_cached() {
       . "$B_CACHE" 2>/dev/null || true
       return 0
     fi
+    # v1.7.2-beta.1：CGI 只读——缓存过期也直接沿用旧值（supervisor 每 tick 后台刷新），
+    # 绝不执行 dumpsys battery（真机 1s+），避免页面状态接口卡顿。
+    if [ "${CGI_READONLY:-0}" = "1" ]; then
+      . "$B_CACHE" 2>/dev/null || true
+      return 0
+    fi
+  elif [ "${CGI_READONLY:-0}" = "1" ]; then
+    return 0
   fi
   B_DUMP="$DATA_DIR/battery.tmp.$$"
   "$BB" timeout 3 /system/bin/dumpsys battery > "$B_DUMP" 2>/dev/null || : > "$B_DUMP"
@@ -1295,7 +1337,7 @@ accumulate_usage() {
   CUR=$(( $(get_chain_bytes mifi_up) + $(get_chain_bytes mifi_dn) ))
   SNAP=$(cat "$USAGE_SNAP" 2>/dev/null | "$BB" tr -d ' ')
   case "$SNAP" in ''|*[!0-9]*) SNAP=0 ;; esac
-  ACC=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  ACC=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
   case "$ACC" in ''|*[!0-9]*) ACC=0 ;; esac
   if [ "$CUR" -lt "$SNAP" ]; then
     # P1-38：统计链被系统清除/计数器重置时记录原因与时间（避免静默丢段），从当前值重新开始
@@ -1314,7 +1356,7 @@ accumulate_usage() {
 
 # 读取累计用量（MB）与是否超限
 read_usage() {
-  USAGE_BYTES=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  USAGE_BYTES=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
   case "$USAGE_BYTES" in ''|*[!0-9]*) USAGE_BYTES=0 ;; esac
   USAGE_MB=$((USAGE_BYTES / 1048576))
   USAGE_OVER=false
@@ -2391,7 +2433,7 @@ plan_period_bytes() {
     BBY=$("$BB" cut -d'|' -f2 "$TRAFFIC_BASE" 2>/dev/null)
     case "$BBY" in ''|*[!0-9]*) BBY=0 ;; esac
     if [ "$BD" = "$TODAY" ]; then
-      CUR=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+      CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
       case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
       [ "$CUR" -ge "$BBY" ] 2>/dev/null && PLAN_PERIOD_BYTES=$((PLAN_PERIOD_BYTES + CUR - BBY))
     fi
@@ -2465,7 +2507,7 @@ client_stats_read() {
 get_signal_info() {
   SIG_NETWORK=; SIG_OPERATOR=; SIG_SIM=; SIG_BAND=; SIG_PCI=; SIG_RSRP=; SIG_RSRQ=; SIG_SINR=
   SIG_CACHE="$DATA_DIR/sig.cache"
-  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  NOW_S=${NOW_S:-$(/system/bin/date +%s 2>/dev/null || date +%s)}
   # P1-80：信号面板 5 秒轮询不应每次执行大型 dumpsys；缓存 60 秒，有效期内直接读取
   if [ -r "$SIG_CACHE" ]; then
     CACHE_MT=$("$BB" stat -c %Y "$SIG_CACHE" 2>/dev/null)
@@ -2478,9 +2520,19 @@ get_signal_info() {
     fi
   fi
   # 与 get_sim_state 共享有限时 telephony 快照；不重复执行 dumpsys。
+  # v1.7.2-beta.1：CGI 只读模式——sig.cache 由 supervisor 每 tick 后台预热（60s 限频），
+  # 未命中直接返回空字段，绝不执行 grep 大快照重建。
+  if [ "${CGI_READONLY:-0}" = "1" ]; then
+    return 0
+  fi
   DMP_FILE="$TELEPHONY_SNAPSHOT"
-  ensure_telephony_snapshot >/dev/null 2>&1 || true
-  if [ -s "$DMP_FILE" ]; then
+  SNAP_AGE=999
+  if [ -r "$DMP_FILE" ]; then
+    SNAP_MT=$("$BB" stat -c %Y "$DMP_FILE" 2>/dev/null)
+    case "$SNAP_MT" in ''|*[!0-9]*) SNAP_MT=0 ;; esac
+    [ "$SNAP_MT" -gt 0 ] && SNAP_AGE=$((NOW_S - SNAP_MT))
+  fi
+  if [ -s "$DMP_FILE" ] && [ "$SNAP_AGE" -ge 0 ] && [ "$SNAP_AGE" -lt 60 ] 2>/dev/null; then
     SIG_OPERATOR=$("$BB" grep -o 'mOperatorAlphaLong=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mOperatorAlphaLong=//')
     [ -n "$SIG_OPERATOR" ] || SIG_OPERATOR=$("$BB" grep -o 'mNetworkOperatorName=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mNetworkOperatorName=//')
     [ -n "$SIG_OPERATOR" ] || SIG_OPERATOR=$(getprop gsm.operator.alpha 2>/dev/null)
@@ -2555,7 +2607,7 @@ read_admin_password() {
 # ---------- 流量按日/月度统计 ----------
 # TRAFFIC_BASE: "YYYYMMDD|bytes"（当日开始基准）；TRAFFIC_DAILY: 每行 "YYYYMMDD|MB"（保留 11 天）
 accumulate_daily() {
-  CUR=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
   case "$CUR" in ''|*[!0-9]*) return 0 ;; esac
   TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
   case "$TODAY" in ''|*[!0-9]*) return 0 ;; esac
@@ -2597,7 +2649,7 @@ read_traffic_stats() {
   TRAFFIC_TODAY_VALID=false
   TRAFFIC_MONTH_VALID=false
   TRAFFIC_DAYS=
-  CUR=$(cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
+  CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
   case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
   BASE_DATE=
   BASE_BYTES=0
@@ -3506,7 +3558,8 @@ proxy_status_json() {
   local state running iface has_sub last_error error_detail self_error self_bypass transparent="redirect" api_ready=false provider_ready=false node_count=0 self_active=false self_quic=false
   state=$(proxy_read_state)
   running=$(proxy_is_running && echo true || echo false)
-  iface=$(get_hotspot_iface 2>/dev/null)
+  # v1.7.2-beta.1：接受调用方已算好的 iface，避免 status.cgi 内重复 ip addr
+  iface=${1:-$(get_hotspot_iface 2>/dev/null)}
   [ -n "$iface" ] || iface=""
   has_sub=$( { [ -s "$PROXY_SUB_FILE" ] || [ -n "${PROXY_SUB_B64:-}" ]; } && echo true || echo false)
   last_error=$(cat "$PROXY_LAST_ERROR" 2>/dev/null)

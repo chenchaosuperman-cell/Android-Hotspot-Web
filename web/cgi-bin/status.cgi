@@ -14,14 +14,24 @@ fi
 header_json
 load_config
 
+# v1.7.2-beta.1：CGI 只读模式——sim/sig/telephony 快照由 supervisor 后台预热，
+# CGI 命中缓存即用、未命中返回空字段，绝不执行 dumpsys 或大文件 grep 重建。
+CGI_READONLY=1
+
 IFACE=$(get_hotspot_iface)
-# 原生热点网关：排除模块固定管理别名，避免 get_iface_ip 读到 192.168.43.1 造成 NAT 网段误判
-NATIVE_IP=$(get_native_hotspot_ip "$IFACE")
-[ -z "$NATIVE_IP" ] && NATIVE_IP=$(get_iface_ip "$IFACE")
-IP=$(get_management_ip "$IFACE")
+# v1.7.2-beta.1：一次 ip 调用取全部 IPv4 地址，避免 get_native_hotspot_ip/get_iface_ip/get_management_ip
+# 各自 fork ip 子进程（真机每次 ~0.15s，4-5 次合计约 1s，全部压在状态接口关键路径上）。
+IP_LINES=$(/system/bin/ip -o -4 addr show dev "$IFACE" 2>/dev/null)
+# 原生热点网关：排除模块固定管理别名，避免读到 192.168.43.1 造成 NAT 网段误判
+NATIVE_IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk -v stable="$STABLE_IP" '{split($4,a,"/"); if (a[1] != stable) {print a[1]; exit}}')
+[ -z "$NATIVE_IP" ] && NATIVE_IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk '{split($4,a,"/"); print a[1]; exit}')
+case "$IP_LINES" in
+  *" $STABLE_IP/"*) IP=$STABLE_IP ;;
+  *) IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk '{split($4,a,"/"); print a[1]; exit}') ;;
+esac
 SSID=$(b64url_decode "$SSID_B64")
 RUNNING=false
-if [ -n "$IFACE" ] && [ -n "$IP" ] && softap_state_ok "$IFACE"; then
+if [ -n "$IFACE" ] && [ -n "$IP" ] && softap_state_ok "$IFACE" "$IP"; then
   RUNNING=true
 else
   RUNNING=false
@@ -153,32 +163,48 @@ EOF
 
 build_clients() {
   FIRST=1
+  # v1.7.2-beta.1：预读小文件 + 纯 shell 参数展开，消除每设备 15+ 次 fork。
+  # Android 上 fork 开销大，旧 grep|head|cut 管道实现曾使 status.cgi 冷启动 10s+ 超时。
+  NL=$(printf '\n.'); NL=${NL%.}  # 命令替换会删光尾部换行，借 . 占位保留一个
+  U_STR=$("$BB" cat "$CLIENT_USAGE_FILE" 2>/dev/null)
+  N_STR=$("$BB" cat "$DEVICE_NOTES" 2>/dev/null)
+  R_STR=$("$BB" cat "$RATE_FILE" 2>/dev/null)
+  S_STR=$("$BB" cat "$CLIENT_STATS_FILE" 2>/dev/null)
   list_clients "$IFACE" | while IFS='|' read -r CLIENT_IP CLIENT_MAC CLIENT_STATE; do
     [ -z "$CLIENT_IP" ] && continue
-    RU=$(get_client_usage "$CLIENT_MAC")
-    RX=$(printf '%s\n' "$RU" | "$BB" cut -d'|' -f1)
-    TX=$(printf '%s\n' "$RU" | "$BB" cut -d'|' -f2)
-    [ -z "$RX" ] && RX=0
-    [ -z "$TX" ] && TX=0
+    RX=0; TX=0
+    case "$U_STR" in
+      *"$CLIENT_MAC|"*)
+        _u=${U_STR##*"$CLIENT_MAC|"}
+        _u=${_u%%$NL*}
+        RX=${_u%%|*}
+        _t=${_u#*|}
+        TX=${_t%%|*}
+        ;;
+    esac
+    case "$RX" in ''|*[!0-9]*) RX=0 ;; esac
+    case "$TX" in ''|*[!0-9]*) TX=0 ;; esac
     if [ "$FIRST" = "0" ]; then printf ','; fi
     FIRST=0
     VENDOR=$(mac_vendor "$("$BB" printf '%s' "$CLIENT_MAC" | "$BB" tr 'a-f' 'A-F')")
-    NOTE=$(get_device_note "$CLIENT_MAC")
-    RATE=$(get_rate_limit "$CLIENT_MAC")
+    NOTE=""
+    case "$N_STR" in
+      *"$CLIENT_MAC|"*) NOTE=${N_STR##*"$CLIENT_MAC|"}; NOTE=${NOTE%%$NL*} ;;
+    esac
+    RATE=0
+    case "$R_STR" in
+      *"$CLIENT_MAC|"*) RATE=${R_STR##*"$CLIENT_MAC|"}; RATE=${RATE%%$NL*}; RATE=${RATE%%|*} ;;
+    esac
     case "$RATE" in ''|*[!0-9]*) RATE=0 ;; esac
-    HIST=$(client_stats_read "$CLIENT_MAC")
-    HF=$("$BB" cut -d'|' -f1 <<EOF
-$HIST
-EOF
-)
-    HL=$("$BB" cut -d'|' -f2 <<EOF
-$HIST
-EOF
-)
-    HO=$("$BB" cut -d'|' -f3 <<EOF
-$HIST
-EOF
-)
+    HF=0; HL=0; HO=0
+    case "$S_STR" in
+      *"$CLIENT_MAC|"*)
+        _s=${S_STR##*"$CLIENT_MAC|"}
+        _s=${_s%%$NL*}
+        HF=${_s%%|*}; _s2=${_s#*|}
+        HL=${_s2%%|*}; HO=${_s2#*|}
+        ;;
+    esac
     case "$HF" in ''|*[!0-9]*) HF=0 ;; esac
     case "$HL" in ''|*[!0-9]*) HL=0 ;; esac
     case "$HO" in ''|*[!0-9]*) HO=0 ;; esac
@@ -190,30 +216,33 @@ EOF
 # 历史设备列表（known_macs ∪ device_notes），含在线标记与备注
 build_history() {
   FIRST=1
+  # v1.7.2-beta.1：与 build_clients 同策略——预读小文件 + 纯 shell 匹配，避免逐 MAC fork
+  NL=$(printf '\n.'); NL=${NL%.}  # 命令替换会删光尾部换行，借 . 占位保留一个
   # P1-46：仅活跃邻居状态（REACHABLE/DELAY/PROBE）标记在线，避免 ARP 残留导致历史设备误显示在线
   ONLINE_MACS=$(list_clients "$IFACE" 2>/dev/null | "$BB" awk -F'|' '$3=="REACHABLE"||$3=="DELAY"||$3=="PROBE"{print $2}')
+  N_STR=$("$BB" cat "$DEVICE_NOTES" 2>/dev/null)
+  S_STR=$("$BB" cat "$CLIENT_STATS_FILE" 2>/dev/null)
   ALL_MACS=$(cat "$KNOWN_MACS" 2>/dev/null)
-  if [ -f "$DEVICE_NOTES" ]; then
-    ALL_MACS=$(printf '%s\n%s\n' "$ALL_MACS" "$("$BB" cut -d'|' -f1 "$DEVICE_NOTES" 2>/dev/null)")
+  if [ -n "$N_STR" ]; then
+    ALL_MACS=$(printf '%s\n%s\n' "$ALL_MACS" "$(printf '%s\n' "$N_STR" | "$BB" cut -d'|' -f1)")
   fi
   printf '%s\n' "$ALL_MACS" | "$BB" awk 'NF' | sort -u | while IFS= read -r MAC; do
     valid_mac "$MAC" || continue
-    NOTE=$(get_device_note "$MAC")
+    NOTE=""
+    case "$N_STR" in
+      *"$MAC|"*) NOTE=${N_STR##*"$MAC|"}; NOTE=${NOTE%%$NL*} ;;
+    esac
     ONL=false
     case " $ONLINE_MACS " in *" $MAC "*) ONL=true ;; esac
-    HIST=$(client_stats_read "$MAC")
-    HF=$("$BB" cut -d'|' -f1 <<EOF
-$HIST
-EOF
-)
-    HL=$("$BB" cut -d'|' -f2 <<EOF
-$HIST
-EOF
-)
-    HO=$("$BB" cut -d'|' -f3 <<EOF
-$HIST
-EOF
-)
+    HF=0; HL=0; HO=0
+    case "$S_STR" in
+      *"$MAC|"*)
+        _s=${S_STR##*"$MAC|"}
+        _s=${_s%%$NL*}
+        HF=${_s%%|*}; _s2=${_s#*|}
+        HL=${_s2%%|*}; HO=${_s2#*|}
+        ;;
+    esac
     case "$HF" in ''|*[!0-9]*) HF=0 ;; esac
     case "$HL" in ''|*[!0-9]*) HL=0 ;; esac
     case "$HO" in ''|*[!0-9]*) HO=0 ;; esac
@@ -283,7 +312,7 @@ printf '"autostart":%s,"iface":"%s","ip":"%s","nativeIp":"%s","port":%s,"battery
   "$([ "$AUTOSTART" = "1" ] && echo true || echo false)" "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$NATIVE_IP")" "$PORT" "$BATTERY" "$CHARGING"
 printf '"desired":%s,"csrf":"%s","operation":{"state":"%s","time":%s,"message":"%s"},' \
   "$([ "$DESIRED" = "1" ] && echo true || echo false)" "$(json_escape "$CSRF")" "$(json_escape "$OP_STATE")" "$OP_TIME" "$(json_escape "$OP_MESSAGE")"
-CFG_SAVED=$(cat "$DATA_DIR/config.saved" 2>/dev/null | "$BB" tr -d '\r\n')
+CFG_SAVED=$("$BB" tr -d '\r\n' < "$DATA_DIR/config.saved" 2>/dev/null)
 printf '"cfgSaved":"%s",' "$(json_escape "$CFG_SAVED")"
 printf '"activeClientCount":%s,"connectedClientCount":%s,"manualOff":%s,' "$(count_online_clients "$IFACE")" "$(count_connected_clients "$IFACE")" "$([ -f "$MANUAL_OFF_FILE" ] && echo true || echo false)"
 printf '"tether":{"fwd":%s,"nat":%s,"hotspotNat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_HOTSPOT_NAT" "$TETHER_PKTS"
@@ -295,7 +324,7 @@ printf '"usage":{"bytes":%s,"mb":%s,"limitMb":%s,"limitAction":"%s","over":%s},'
 # 信号面板与自动关闭原因
 get_signal_info
 case "$SIG_RSRP" in ''|*[!0-9-]*) SIG_RSRP=0; SIG_LEVEL= ;; *) SIG_LEVEL=$(signal_level "$SIG_RSRP") ;; esac
-STOP_REASON=$(cat "$STOP_REASON_FILE" 2>/dev/null | "$BB" tr -d ' \r\n')
+STOP_REASON=$("$BB" tr -d ' \r\n' < "$STOP_REASON_FILE" 2>/dev/null)
 case "$STOP_REASON" in '') STOP_REASON= ;; esac
 count_sms_stats
   printf '"smsQueued":%s,"smsRetrying":%s,' "$SMS_QUEUED" "$SMS_RETRYING"
@@ -312,7 +341,7 @@ printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"hotspotEvt":%s,"thresho
   "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
 printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s},' \
   "$(health_json pp)" "$(health_json dt)" "$(health_json sms)"
-printf '"proxy":%s,' "$(proxy_status_json)"
+printf '"proxy":%s,' "$(proxy_status_json "$IFACE")"
   printf '"signal":{"network":"%s","operator":"%s","sim":"%s","band":"%s","pci":%s,"rsrp":%s,"rsrq":%s,"sinr":%s,"level":"%s"},' \
   "$(json_escape "$SIG_NETWORK")" "$(json_escape "$SIG_OPERATOR")" "$(json_escape "$SIG_SIM")" "$(json_escape "$SIG_BAND")" "${SIG_PCI:-0}" "${SIG_RSRP:-0}" "${SIG_RSRQ:-0}" "${SIG_SINR:-0}" "$(json_escape "$SIG_LEVEL")"
 printf '"auto":{"desired":%s,"keepalive":%s,"idleMin":%s,"sched":%s,"stopReason":"%s","limitAction":"%s"},' \

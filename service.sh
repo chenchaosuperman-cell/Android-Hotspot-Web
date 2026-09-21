@@ -277,6 +277,16 @@ TICK=0
 IDLE_SECS=0
 while true; do
   sleep 5
+  # v1.7.2-beta.1：常驻预热系统快照。dumpsys wifi/telephony 在真机上可能卡数秒，
+  # 由 supervisor 每 tick 采集（softap 15s / telephony 60s 缓存限频），
+  # status.cgi 只读缓存文件，避免 CGI 子进程同步执行慢 dumpsys 导致页面 8s 超时。
+  softap_state_snapshot >/dev/null 2>&1
+  ensure_telephony_snapshot >/dev/null 2>&1
+  # 预热 sim/sig/battery 缓存（内部 15s/30s/60s 限频），status.cgi 只读命中即可，永不在页面进程里重建。
+  # 后台异步执行：真机上 dumpsys 重建可能耗时数秒，若同步执行会拖慢 supervisor 的 keepalive/watchdog tick。
+  get_battery_cached >/dev/null 2>&1
+  (get_sim_state >/dev/null 2>&1 &)
+  (get_signal_info >/dev/null 2>&1 &)
   # Web 管理页访问控制保活（每轮校验，被框架清空后自动重建）
   ensure_web_fw
 
