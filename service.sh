@@ -285,6 +285,7 @@ while true; do
   # 预热 sim/sig/battery 缓存（内部 15s/30s/60s 限频），status.cgi 只读命中即可，永不在页面进程里重建。
   # 后台异步执行：真机上 dumpsys 重建可能耗时数秒，若同步执行会拖慢 supervisor 的 keepalive/watchdog tick。
   get_battery_cached >/dev/null 2>&1
+  get_thermal_info >/dev/null 2>&1
   (get_sim_state >/dev/null 2>&1 &)
   (get_signal_info >/dev/null 2>&1 &)
   # Web 管理页访问控制保活（每轮校验，被框架清空后自动重建）

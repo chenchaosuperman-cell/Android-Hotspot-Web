@@ -66,6 +66,7 @@ fi
 
 check_tethering "$IFACE"
 get_sysinfo
+get_thermal_info
 get_sim_state
 get_cell_stats
 read_usage
@@ -125,22 +126,11 @@ case "$IDLE_LEFT" in ''|*[!0-9]*) IDLE_LEFT=0 ;; esac
 health_json() {
   CH=$1
   H=$(read_health "$CH")
-  HS=$("$BB" cut -d'|' -f1 <<EOF
-$H
-EOF
-)
-  HO=$("$BB" cut -d'|' -f2 <<EOF
-$H
-EOF
-)
-  HE=$("$BB" cut -d'|' -f3 <<EOF
-$H
-EOF
-)
-  HF=$("$BB" cut -d'|' -f4 <<EOF
-$H
-EOF
-)
+  # v1.7.2-beta.1：纯 shell 按 | 拆分，替代 4 次 cut 子进程（每次状态轮询调用 3 次 health_json）
+  HS=${H%%|*}
+  _HR1=${H#*|}; HO=${_HR1%%|*}
+  _HR2=${_HR1#*|}; HE=${_HR2%%|*}
+  HF=${_HR2#*|}
   case "$HS" in ''|*[!0-9]*) HS=0 ;; esac
   case "$HO" in ''|*[!0-9]*) HO=0 ;; esac
   case "$HF" in ''|*[!0-9]*) HF=0 ;; esac
@@ -318,6 +308,8 @@ printf '"activeClientCount":%s,"connectedClientCount":%s,"manualOff":%s,' "$(cou
 printf '"tether":{"fwd":%s,"nat":%s,"hotspotNat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_HOTSPOT_NAT" "$TETHER_PKTS"
 printf '"sys":{"memTotal":%s,"memAvail":%s,"load":"%s","uptime":"%s","storTotal":%s,"storAvail":%s,"thermal":"%s"},' \
   "${SYS_MEM_TOTAL:-0}" "${SYS_MEM_AVAIL:-0}" "$(json_escape "$SYS_LOAD")" "$(json_escape "$SYS_UPTIME")" "${SYS_STOR_TOTAL:-0}" "${SYS_STOR_AVAIL:-0}" "$(json_escape "$SYS_THERMAL")"
+# v1.7.2-beta.1：温度细分为电池/CPU/最高/状态，不再只给一个笼统的 SoC 温度
+printf '"thermal":{"battery":%s,"cpu":%s,"max":%s,"status":"%s"},' "${THERM_BATTERY:-0}" "${THERM_CPU:-0}" "${THERM_MAX:-0}" "${THERM_STATUS:-normal}"
 printf '"sim":{"operator":"%s","data":%s,"signal":"%s"},' "$(json_escape "$SIM_OPERATOR")" "${SIM_DATA:-0}" "$(json_escape "$SIM_SIGNAL")"
 printf '"cell":{"rx":%s,"tx":%s},' "$CELL_RX" "$CELL_TX"
 printf '"usage":{"bytes":%s,"mb":%s,"limitMb":%s,"limitAction":"%s","over":%s},' "$USAGE_BYTES" "$USAGE_MB" "${DATA_PLAN_MB:-0}" "${DATA_LIMIT_ACTION:-stop}" "$USAGE_OVER"

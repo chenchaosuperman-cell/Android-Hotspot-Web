@@ -834,6 +834,88 @@ get_sysinfo() {
   done
 }
 
+# ---------- 温度（thermal_zone 15 秒缓存，区分电池/CPU/最高/状态） ----------
+# 小米 14 / HyperOS 的 /sys/class/thermal/thermal_zone* 提供毫摄氏度值（如 29700 = 29.7°C）。
+# 纯 shell 循环读取（内建 read，不 fork 子进程），真机 101 个 zone 读取 <1s。
+THERM_CACHE="$DATA_DIR/thermal.cache"
+get_thermal_info() {
+  THERM_BATTERY=
+  THERM_CPU=0
+  THERM_GPU=0
+  THERM_MAX=0
+  THERM_STATUS=normal
+  NOW_S=${NOW_S:-$(/system/bin/date +%s 2>/dev/null || date +%s)}
+  C_MT=0
+  if [ -r "$THERM_CACHE" ]; then
+    C_MT=$("$BB" stat -c %Y "$THERM_CACHE" 2>/dev/null)
+    case "$C_MT" in ''|*[!0-9]*) C_MT=0 ;; esac
+    if [ "$C_MT" -gt 0 ] && [ $((NOW_S - C_MT)) -ge 0 ] && [ $((NOW_S - C_MT)) -lt 15 ]; then
+      while IFS='=' read -r K V; do
+        case "$K" in
+          THERM_BATTERY) case "$V" in ''|*[!0-9]*) : ;; *) THERM_BATTERY=$V ;; esac ;;
+          THERM_CPU) case "$V" in ''|*[!0-9]*) : ;; *) THERM_CPU=$V ;; esac ;;
+          THERM_MAX) case "$V" in ''|*[!0-9]*) : ;; *) THERM_MAX=$V ;; esac ;;
+          THERM_STATUS) case "$V" in normal|warm|hot) THERM_STATUS=$V ;; esac ;;
+        esac
+      done < "$THERM_CACHE"
+      return 0
+    fi
+    # v1.7.2-beta.1：CGI 只读——缓存过期也沿用旧值（supervisor 每 tick 后台刷新），
+    # 绝不重新遍历 thermal_zone，避免拖慢状态接口。
+    if [ "${CGI_READONLY:-0}" = "1" ]; then
+      while IFS='=' read -r K V; do
+        case "$K" in
+          THERM_BATTERY) case "$V" in ''|*[!0-9]*) : ;; *) THERM_BATTERY=$V ;; esac ;;
+          THERM_CPU) case "$V" in ''|*[!0-9]*) : ;; *) THERM_CPU=$V ;; esac ;;
+          THERM_MAX) case "$V" in ''|*[!0-9]*) : ;; *) THERM_MAX=$V ;; esac ;;
+          THERM_STATUS) case "$V" in normal|warm|hot) THERM_STATUS=$V ;; esac ;;
+        esac
+      done < "$THERM_CACHE"
+      return 0
+    fi
+  elif [ "${CGI_READONLY:-0}" = "1" ]; then
+    return 0
+  fi
+  # 采集：type=battery 电池、cpu*/soc* CPU/SoC、gpuss-*/gpu* GPU，各取最高
+  BT=0; CT=0; GX=0
+  for z in /sys/class/thermal/thermal_zone*; do
+    IFS= read -r T < "$z/type" 2>/dev/null || continue
+    case "$T" in
+      battery)
+        IFS= read -r V < "$z/temp" 2>/dev/null
+        case "$V" in ''|*[!0-9]*) V=0 ;; esac
+        BT=$((V / 1000)) ;;
+      cpu*|soc*)
+        IFS= read -r V < "$z/temp" 2>/dev/null
+        case "$V" in ''|*[!0-9]*) V=0 ;; esac
+        [ "$((V / 1000))" -gt "$CT" ] 2>/dev/null && CT=$((V / 1000)) ;;
+      gpuss-*|gpu*)
+        IFS= read -r V < "$z/temp" 2>/dev/null
+        case "$V" in ''|*[!0-9]*) V=0 ;; esac
+        [ "$((V / 1000))" -gt "$GX" ] 2>/dev/null && GX=$((V / 1000)) ;;
+    esac
+  done
+  case "$BT" in ''|*[!0-9]*) BT=0 ;; esac
+  MX=$BT
+  [ "$CT" -gt "$MX" ] 2>/dev/null && MX=$CT
+  [ "$GX" -gt "$MX" ] 2>/dev/null && MX=$GX
+  THERM_BATTERY=$BT
+  THERM_CPU=$CT
+  THERM_MAX=$MX
+  if [ "$MX" -ge 55 ] 2>/dev/null; then
+    THERM_STATUS=hot
+  elif [ "$MX" -ge 45 ] 2>/dev/null; then
+    THERM_STATUS=warm
+  else
+    THERM_STATUS=normal
+  fi
+  TMP="$THERM_CACHE.tmp.$$"
+  printf 'THERM_BATTERY=%s\nTHERM_CPU=%s\nTHERM_MAX=%s\nTHERM_STATUS=%s\n' "$BT" "$CT" "$MX" "$THERM_STATUS" > "$TMP" 2>/dev/null
+  chmod 0600 "$TMP" 2>/dev/null
+  mv -f "$TMP" "$THERM_CACHE" 2>/dev/null
+  rm -f "$TMP" 2>/dev/null
+}
+
 # ---------- SIM / 蜂窝状态（尽力而为，解析失败显示 --） ----------
 # status.cgi 会同时读取 SIM 与信号信息。两者共享同一份 telephony 快照，
 # 避免冷启动时重复执行大型 dumpsys；采集超时则沿用旧快照，绝不阻塞首页。
@@ -1718,7 +1800,12 @@ health_note() {
 
 # 读取渠道健康：输出 last_send|last_ok|err|fails
 read_health() {
-  "$BB" grep "^$1|" "$NOTIFY_HEALTH_FILE" 2>/dev/null | "$BB" head -n 1 | "$BB" cut -d'|' -f2-
+  # v1.7.2-beta.1：纯 shell 匹配（文件小），避免 grep|head|cut 三个子进程
+  while IFS= read -r _HL; do
+    case "$_HL" in
+      "$1"|*) printf '%s' "${_HL#*|}"; return 0 ;;
+    esac
+  done < "$NOTIFY_HEALTH_FILE" 2>/dev/null
 }
 
 send_pushplus() {
@@ -2382,12 +2469,14 @@ plan_period_bytes() {
   PLAN_PERIOD_DAY=
   PD_ORIG=${DATA_PLAN_DAY:-1}
   case "$PD_ORIG" in ''|*[!0-9]*) PD_ORIG=1 ;; esac
-  TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
+  TODAY=${DATE_TODAY:-$($DATE_CMD +%Y%m%d 2>/dev/null)}
+  DATE_TODAY=$TODAY
   case "$TODAY" in ''|*[!0-9]*) return 1 ;; esac
   PD=$PD_ORIG
   # P1-29(1.5.11)：账期起始日若超出当月天数（如 31 日在 2 月），取当月最后一天。
   # 用纯 shell 计算月天数，避免依赖 date -d（macOS/部分 toybox 语法不一致）。
-  CM=$($DATE_CMD +%Y%m 2>/dev/null)
+  CM=${DATE_YM:-$($DATE_CMD +%Y%m 2>/dev/null)}
+  DATE_YM=$CM
   case "$CM" in ''|*[!0-9]*) CM=0 ;; esac
   LAST_DOM=$(last_day_of_month "$CM")
   case "$LAST_DOM" in ''|*[!0-9]*) LAST_DOM=31 ;; esac
@@ -2609,7 +2698,8 @@ read_admin_password() {
 accumulate_daily() {
   CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
   case "$CUR" in ''|*[!0-9]*) return 0 ;; esac
-  TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
+  TODAY=${DATE_TODAY:-$($DATE_CMD +%Y%m%d 2>/dev/null)}
+  DATE_TODAY=$TODAY
   case "$TODAY" in ''|*[!0-9]*) return 0 ;; esac
   BASE_DATE=
   BASE_BYTES=0
@@ -2658,7 +2748,8 @@ read_traffic_stats() {
     BASE_BYTES=$("$BB" cut -d'|' -f2 "$TRAFFIC_BASE" 2>/dev/null)
     case "$BASE_BYTES" in ''|*[!0-9]*) BASE_BYTES=0 ;; esac
   fi
-  TODAY=$($DATE_CMD +%Y%m%d 2>/dev/null)
+  TODAY=${DATE_TODAY:-$($DATE_CMD +%Y%m%d 2>/dev/null)}
+  DATE_TODAY=$TODAY
   THIS_MONTH=$($DATE_CMD +%Y%m 2>/dev/null)
   if [ -n "$BASE_DATE" ] && [ "$BASE_DATE" = "$TODAY" ]; then
     if [ "$CUR" -ge "$BASE_BYTES" ]; then
