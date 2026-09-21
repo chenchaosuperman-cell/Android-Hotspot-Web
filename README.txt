@@ -1,4 +1,4 @@
-Xiaomi 14 MiFi Web Control v1.7.2-beta
+Xiaomi 14 MiFi Web Control v1.7.2-beta.1
 ==================================
 
 适用环境：
@@ -23,6 +23,12 @@ Xiaomi 14 MiFi Web Control v1.7.2-beta
 - 频段：2.4GHz
 - 开机自动启动：开启
 - Web端口：8080
+
+v1.7.2-beta.1 更新
+- 修复开机后 Web 一直显示“正在获取设备数据”：dumpsys wifi 直写文件不过 Shell 变量（根治 Argument list too long）；
+  蜂窝信息统一 60 秒快照；status.cgi 内全部 dumpsys/cmd 加超时；前端 8 秒请求超时，3 次失败显示“状态接口响应超时”。
+- 状态接口性能：CGI 只读缓存门 + json_escape 单进程 awk + 子进程削减，冷启动 5.6~6.1 秒返回完整 JSON。
+- 温度细分：首页底部新增「手机温度」卡片（电池 / CPU / 最高 + 正常/偏高/过热状态），替代原单值显示。
 
 v1.7.2 更新
 - Web 防火墙修正：只放行本机(lo)、真实热点接口与 USB 共享接口，不再放行全部 wlan0-4/eth0；

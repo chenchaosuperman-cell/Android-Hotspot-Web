@@ -1,3 +1,28 @@
+# v1.7.2-beta.1（2026-09-21）
+
+- **修复开机后热点正常、Web 页面一直显示“正在获取设备数据”（status.cgi 冷启动卡死）**（真机故障）。
+  - `softap_state_snapshot()`：`dumpsys wifi` 输出直写 `softap.cache.out` 文件，不再经过 Shell 变量，
+    根治 `Argument list too long`；后续全部从缓存文件流式解析。
+  - 蜂窝信息统一快照：`get_sim_state()` 与 `get_signal_info()` 共用 `telephony.registry` 60 秒快照
+    （`timeout 5` 采集 → 临时文件 → 原子替换），失败沿用旧快照，无旧快照返回空字段。
+  - status.cgi 内所有 `dumpsys`/`cmd` 及可能阻塞的系统读取全部带 3～5 秒超时；
+    信号、温度、SIM 等非核心数据失败返回空值，热点状态与 CSRF 仍正常返回。
+  - 前端 `fetch('/cgi-bin/status.cgi')` 增加 8 秒 `AbortController` 超时，
+    连续 3 次失败后停止高频重试并显示“状态接口响应超时”与重新连接/诊断入口，不再无限转圈。
+- **CGI 只读缓存门（性能关键）**：sim/sig/battery/softap/thermal 缓存过期时 CGI 沿用旧值或返回空字段，
+  绝不重新触发 `dumpsys`；supervisor 主循环后台预热全部缓存。
+- **状态接口子进程削减**：`json_escape()` 改单进程 awk（替代 tr+sed 双管道）、`ip addr` 合并为一次
+  `ip -o -4 addr show`、`read_health`/`health_json` 改纯 shell 拆分、账期日期缓存复用。
+  真机回归：冷启动（清空全部缓存）3 次 5.6～6.1s 返回完整 JSON；10 连 curl 10/10 完整无截断、
+  无 `Argument list too long`。
+- **温度细分显示**：遍历 `/sys/class/thermal/thermal_zone*` 采集电池/CPU/SoC/GPU 最高温
+  （毫摄氏度换算，过滤异常值），15 秒缓存 + CGI 只读门；status.cgi 输出
+  `thermal{battery,cpu,max,status}`。
+  - 首页底部新增「手机温度」卡片：电池 / CPU / 最高 三格展示 + 温度状态标签
+    （正常=绿、偏高=黄、过热=红）；阈值：最高 ≥55°C 过热、≥45°C 偏高、其余正常。
+  - 原「技术状态与高级信息」内温度行移除，负载行不再重复显示 CPU 温度后缀。
+- **service.sh 开机自启条件修正**：`_UP_SEC < 120` 判断与注释、代码逻辑一致。
+
 # v1.7.2-beta（2026-09-20）
 
 - **修复分流模式（rule）下国内 HTTPS 全部走代理、导致全网断连的问题**（真机故障）。
