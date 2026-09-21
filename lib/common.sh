@@ -16,6 +16,50 @@ OP_LOCK="$DATA_DIR/operation.lock"
 CONTROL_REQUEST="$DATA_DIR/control.request"
 STABLE_IP=192.168.43.1
 IPT=/system/bin/iptables
+
+# ── Web 管理端口访问控制（v1.7.2）──────────────────────────────
+# 仅放行本机(lo)、真实热点接口与 USB 共享接口，其余接口一律 DROP。
+# 端口变更时先清理旧端口规则（生效端口记录于 WEB_FW_PORT_FILE）；
+# 卸载时由 uninstall.sh 按该记录清理。规则由 service.sh 主循环保活。
+WEB_FW_PORT_FILE="$DATA_DIR/web_fw_port"
+
+# 需要放行的接口列表：当前热点接口（绑定管理 IP 的 wlan 接口）+ USB 共享接口
+web_fw_ifaces() {
+  local AP
+  AP=$(get_hotspot_iface 2>/dev/null)
+  [ -n "$AP" ] && printf '%s\n' "$AP"
+  printf 'rndis0\nusb0\n'
+}
+
+# 清理指定端口的全部 Web 管理访问规则（DROP 兜底 + 各放行接口）
+clear_web_fw() {
+  [ -n "$1" ] || return 0
+  $IPT -D INPUT -p tcp --dport "$1" -j DROP 2>/dev/null
+  $IPT -D INPUT -i lo -p tcp --dport "$1" -j ACCEPT 2>/dev/null
+  local IFACE
+  for IFACE in $(web_fw_ifaces); do
+    $IPT -D INPUT -i "$IFACE" -p tcp --dport "$1" -j ACCEPT 2>/dev/null
+  done
+}
+
+# 幂等保活：端口未变时补齐缺失规则；端口变更时先清理旧端口再应用新端口
+ensure_web_fw() {
+  [ -n "$PORT" ] || PORT=8080
+  local prev
+  prev=$(cat "$WEB_FW_PORT_FILE" 2>/dev/null)
+  if [ -n "$prev" ] && [ "$prev" != "$PORT" ]; then
+    clear_web_fw "$prev"
+  fi
+  $IPT -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || $IPT -A INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null
+  $IPT -C INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+  local IFACE
+  for IFACE in $(web_fw_ifaces); do
+    [ -n "$IFACE" ] || continue
+    $IPT -C INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+  done
+  printf '%s\n' "$PORT" > "$WEB_FW_PORT_FILE" 2>/dev/null
+  chmod 0600 "$WEB_FW_PORT_FILE" 2>/dev/null
+}
 NOTIFY_QUEUE="$DATA_DIR/notify.queue"
 SMS_QUEUE="$DATA_DIR/sms.queue"
 SMS_BUSY="$DATA_DIR/sms.busy"
@@ -363,7 +407,6 @@ load_config() {
   PUSHPLUS_TOKEN_B64=${PUSHPLUS_TOKEN_B64:-}
   DINGTALK_WEBHOOK_B64=${DINGTALK_WEBHOOK_B64:-}
   DINGTALK_SECRET_B64=${DINGTALK_SECRET_B64:-}
-  NOTIFY_NEWDEV=${NOTIFY_NEWDEV:-0}
   NOTIFY_LIMIT=${NOTIFY_LIMIT:-1}
   NOTIFY_HOTSPOT_EVT=${NOTIFY_HOTSPOT_EVT:-1}
   NOTIFY_TRAFFIC_THRESHOLDS=${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}
@@ -735,15 +778,17 @@ check_tethering() {
   iface=$1
   TETHER_FWD=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null | "$BB" tr -d ' ')
   [ -z "$TETHER_FWD" ] && TETHER_FWD=0
-  NAT_ALL=$($IPT -t nat -S 2>/dev/null)
-  TETHER_NAT=$(printf '%s\n' "$NAT_ALL" | "$BB" grep -c MASQUERADE)
+  NAT_FILE="$DATA_DIR/iptables_nat.tmp.$$"
+  "$BB" timeout 3 $IPT -t nat -S > "$NAT_FILE" 2>/dev/null || : > "$NAT_FILE"
+  TETHER_NAT=$("$BB" grep -c MASQUERADE "$NAT_FILE" 2>/dev/null)
   [ -z "$TETHER_NAT" ] && TETHER_NAT=0
   # 动态推导热点网段：用热点原生地址（排除固定管理别名）+ 真实掩码；
   # 找不到时回退固定管理网段，避免 HyperOS 原生网关不是 192.168.43.1 时误判。
   AP_SUBNET=$(get_hotspot_subnet "$iface")
   # 固定字符串匹配（子网/接口名含 . 与 / 等正则元字符，不能拼进正则）
-  C1=$(printf '%s\n' "$NAT_ALL" | "$BB" grep MASQUERADE | "$BB" grep -Fc "$AP_SUBNET")
-  C2=$(printf '%s\n' "$NAT_ALL" | "$BB" grep MASQUERADE | "$BB" grep -Fc "$iface")
+  C1=$("$BB" grep MASQUERADE "$NAT_FILE" 2>/dev/null | "$BB" grep -Fc "$AP_SUBNET")
+  C2=$("$BB" grep MASQUERADE "$NAT_FILE" 2>/dev/null | "$BB" grep -Fc "$iface")
+  rm -f "$NAT_FILE" 2>/dev/null
   case "$C1" in ''|*[!0-9]*) C1=0 ;; esac
   case "$C2" in ''|*[!0-9]*) C2=0 ;; esac
   TETHER_HOTSPOT_NAT=$((C1 + C2))
@@ -788,9 +833,42 @@ get_sysinfo() {
 }
 
 # ---------- SIM / 蜂窝状态（尽力而为，解析失败显示 --） ----------
-# dumpsys telephony.registry 输出可达数百 KB 且各字段同行逗号分隔；
-# 解析必须按字段精确截断，不能把整行剩余内容带出来。
-# 缓存 30 秒：缓存有效期内直接读取，不再触发 dumpsys。
+# status.cgi 会同时读取 SIM 与信号信息。两者共享同一份 telephony 快照，
+# 避免冷启动时重复执行大型 dumpsys；采集超时则沿用旧快照，绝不阻塞首页。
+TELEPHONY_SNAPSHOT="$DATA_DIR/telephony.snapshot"
+
+ensure_telephony_snapshot() {
+  now=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  if [ -s "$TELEPHONY_SNAPSHOT" ]; then
+    mt=$("$BB" stat -c %Y "$TELEPHONY_SNAPSHOT" 2>/dev/null)
+    case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+    age=$((now - mt))
+    if [ "$mt" -gt 0 ] && [ "$age" -ge 0 ] && [ "$age" -lt 60 ]; then
+      return 0
+    fi
+  fi
+
+  tmp="$TELEPHONY_SNAPSHOT.tmp.$$"
+  if "$BB" timeout 5 /system/bin/dumpsys telephony.registry > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    chmod 0600 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$TELEPHONY_SNAPSHOT" 2>/dev/null
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+
+  # 部分 ROM 没有 telephony.registry，有限时地回退到 phone。
+  tmp="$TELEPHONY_SNAPSHOT.tmp.$$"
+  if "$BB" timeout 3 /system/bin/dumpsys phone > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    chmod 0600 "$tmp" 2>/dev/null
+    mv -f "$tmp" "$TELEPHONY_SNAPSHOT" 2>/dev/null
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  [ -s "$TELEPHONY_SNAPSHOT" ]
+}
+
+# dumpsys 输出可达数百 KB 且各字段同行逗号分隔；解析必须直接读文件。
+# 缓存 30 秒：缓存有效期内直接读取，不再解析快照。
 get_sim_state() {
   SIM_OPERATOR=
   SIM_DATA=0
@@ -806,10 +884,8 @@ get_sim_state() {
       return 0
     fi
   fi
-  # telephony.registry 输出可达数百 KB：命令替换捕获后经 printf 传参会触发
-  # ARG_MAX 超限（E2BIG, Argument list too long）。改用临时文件逐字段 grep。
-  DMP_FILE="$DATA_DIR/dumpsys_telephony.tmp"
-  /system/bin/dumpsys telephony.registry > "$DMP_FILE" 2>/dev/null
+  DMP_FILE="$TELEPHONY_SNAPSHOT"
+  ensure_telephony_snapshot >/dev/null 2>&1 || true
   if [ -s "$DMP_FILE" ]; then
     SIM_OPERATOR=$("$BB" grep -o 'mOperatorAlphaLong=[^,]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mOperatorAlphaLong=//; s/[[:space:]]*$//')
     SIM_DATA=$("$BB" grep -o 'mDataConnectionState=[0-9]*' "$DMP_FILE" | "$BB" head -1 | "$BB" sed 's/mDataConnectionState=//')
@@ -821,7 +897,6 @@ get_sim_state() {
     else
       SIM_SIGNAL=
     fi
-    rm -f "$DMP_FILE"
     TMP_CACHE="$SIM_CACHE.$$"
     {
       printf 'SIM_OPERATOR_B64=%s\n' "$(b64url_encode "$SIM_OPERATOR")"
@@ -905,7 +980,8 @@ softap_state_snapshot() {
     MT=$("$BB" stat -c %Y "$SOFTAP_CACHE" 2>/dev/null)
     NOW=$(/system/bin/date +%s 2>/dev/null || date +%s)
     case "$MT" in ''|*[!0-9]*) MT=0 ;; esac
-    if [ "$MT" -gt 0 ] && [ $((NOW - MT)) -lt 15 ]; then
+    AGE=$((NOW - MT))
+    if [ "$MT" -gt 0 ] && [ "$AGE" -ge 0 ] && [ "$AGE" -lt 15 ]; then
       # P0(1.5.12)：禁止 source 缓存文件（SSID 可能含引号/反引号/$()）。
       # 逐行白名单解析：只接受固定键，值做严格字符校验；SSID 走 Base64。
       while IFS='=' read -r C_KEY C_VAL; do
@@ -924,19 +1000,33 @@ softap_state_snapshot() {
       return 0
     fi
   fi
-  OUT=$(dumpsys wifi 2>/dev/null)
-  AP_STATE=$(printf '%s\n' "$OUT" | "$BB" grep -o 'mWifiApState=[A-Z]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
-  # 尽力解析 SoftAP 配置段（HyperOS 输出格式多样，取不到字段时留空=unknown，不判失败）
-  # 常见形态1：WifiApInfo{ssid="xxx", ...} / mWifiApInfo SSID: xxx
-  AP_SSID=$(printf '%s\n' "$OUT" | "$BB" grep -o 'WifiApInfo{[^}]*ssid="[^"]*"' | "$BB" head -n1 | "$BB" sed -n 's/.*ssid="\([^"]*\)".*/\1/p')
-  [ -z "$AP_SSID" ] && AP_SSID=$(printf '%s\n' "$OUT" | "$BB" grep -o 'SSID: [^,}]*' | "$BB" head -n1 | "$BB" sed -n 's/SSID: //p' | "$BB" tr -d ' \r')
-  # 常见形态2：WifiConfiguration 段落里的 SSID:"xxx"
-  [ -z "$AP_SSID" ] && AP_SSID=$(printf '%s\n' "$OUT" | "$BB" grep -o 'SSID:"[^"]*"' | "$BB" head -n1 | "$BB" sed -n 's/SSID:"\([^"]*\)"/\1/p')
+  # 禁止把 dumpsys wifi 放进 Shell 变量。小米 Android 16 的输出可超过
+  # ARG_MAX，旧实现会在 printf 时触发 "Argument list too long"。
+  SNAP_TMP="$SOFTAP_CACHE.out.tmp.$$"
+  if "$BB" timeout 5 /system/bin/dumpsys wifi > "$SNAP_TMP" 2>/dev/null && [ -s "$SNAP_TMP" ]; then
+    chmod 0600 "$SNAP_TMP" 2>/dev/null
+    mv -f "$SNAP_TMP" "$SOFTAP_CACHE.out" 2>/dev/null
+  else
+    rm -f "$SNAP_TMP" 2>/dev/null
+  fi
+  # 本次采集失败时允许解析上次成功快照；没有快照则返回“未知”。
+  [ -s "$SOFTAP_CACHE.out" ] || return 0
+  AP_STATE=$("$BB" grep -o 'mWifiApState=[A-Z]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" cut -d= -f2)
+  # 尽力解析 SoftAP 配置段（Android 16/STA+AP 并发，mCurrentSoftApInfoMap 可能含多实例）
+  # 只从 mCurrentSoftApConfiguration 或 WifiApConfigStore config 提取 SSID，
+  # 避免把 bssid=、current SSID(s):、字段名 mCurrentSoftApInfoMap 误当 SSID。
+  AP_SSID=$("$BB" grep -E '^mCurrentSoftApConfiguration:|^WifiApConfigStore config:' "$SOFTAP_CACHE.out" \
+      | "$BB" grep -oE 'ssid *= *"[^"]*"' \
+      | "$BB" head -n1 \
+      | "$BB" sed -E 's/.*"([^"]*)".*/\1/')
+  case "$AP_SSID" in
+    ''|null|NULL|{}|mCurrentSoftApInfoMap|SoftApInfo|SoftApConfiguration|wlan0|wlan1|wlan2) AP_SSID= ;;
+  esac
   # 安全模式：WifiApInfo/WifiConfiguration 中 security 或 allowedKeyManagement
-  AP_SECURITY=$(printf '%s\n' "$OUT" | "$BB" grep -o 'security=[0-9]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
-  AP_CHANNEL=$(printf '%s\n' "$OUT" | "$BB" grep -o 'mWifiApInfo[^}]*channel=[0-9]*' | "$BB" head -n1 | "$BB" sed -n 's/.*channel=\([0-9]*\).*/\1/p')
-  [ -z "$AP_CHANNEL" ] && AP_CHANNEL=$(printf '%s\n' "$OUT" | "$BB" grep -o 'channel=[0-9]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
-  AP_BAND=$(printf '%s\n' "$OUT" | "$BB" grep -o 'band=[0-9]*' | "$BB" head -n1 | "$BB" cut -d= -f2)
+  AP_SECURITY=$("$BB" grep -o 'security=[0-9]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" cut -d= -f2)
+  AP_CHANNEL=$("$BB" grep -o 'mWifiApInfo[^}]*channel=[0-9]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" sed -n 's/.*channel=\([0-9]*\).*/\1/p')
+  [ -z "$AP_CHANNEL" ] && AP_CHANNEL=$("$BB" grep -o 'channel=[0-9]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" cut -d= -f2)
+  AP_BAND=$("$BB" grep -o 'band=[0-9]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" cut -d= -f2)
   TMP="$SOFTAP_CACHE.$$"
   # SSID 经 Base64 存储，避免特殊字符破坏缓存文件；状态/安全/频段/信道只接受枚举或数字
   case "$AP_STATE" in
@@ -966,7 +1056,7 @@ softap_state_ok() {
     ENABLED) return 0 ;;
     DISABLED) return 1 ;;
   esac
-  CMD_STS=$(/system/bin/cmd wifi status 2>/dev/null)
+  CMD_STS=$("$BB" timeout 5 /system/bin/cmd wifi status 2>/dev/null)
   case "$CMD_STS" in
     *"disabled"*|*"Disabled"*|*"DISABLED"*) [ -z "$(get_hotspot_iface)" ] && return 1 ;;
   esac
@@ -1066,8 +1156,11 @@ get_battery_cached() {
       return 0
     fi
   fi
-  LVL=$(/system/bin/dumpsys battery 2>/dev/null | "$BB" awk '/level:/{print $2; exit}')
-  STS=$(/system/bin/dumpsys battery 2>/dev/null | "$BB" awk '/status:/{print $2; exit}')
+  B_DUMP="$DATA_DIR/battery.tmp.$$"
+  "$BB" timeout 3 /system/bin/dumpsys battery > "$B_DUMP" 2>/dev/null || : > "$B_DUMP"
+  LVL=$("$BB" awk '/level:/{print $2; exit}' "$B_DUMP" 2>/dev/null)
+  STS=$("$BB" awk '/status:/{print $2; exit}' "$B_DUMP" 2>/dev/null)
+  rm -f "$B_DUMP" 2>/dev/null
   case "$LVL" in ''|*[!0-9]*) LVL=0 ;; esac
   case "$STS" in 2|5) CHARGING=true ;; *) CHARGING=false ;; esac
   # 原始状态保留给低电量提醒：2=充电 3=放电 4=未充电 5=已充满 其它=未知
@@ -2377,16 +2470,16 @@ get_signal_info() {
   if [ -r "$SIG_CACHE" ]; then
     CACHE_MT=$("$BB" stat -c %Y "$SIG_CACHE" 2>/dev/null)
     case "$CACHE_MT" in ''|*[!0-9]*) CACHE_MT=0 ;; esac
-    if [ "$CACHE_MT" -gt 0 ] && [ $((NOW_S - CACHE_MT)) -lt 60 ] 2>/dev/null; then
+    CACHE_AGE=$((NOW_S - CACHE_MT))
+    if [ "$CACHE_MT" -gt 0 ] && [ "$CACHE_AGE" -ge 0 ] && [ "$CACHE_AGE" -lt 60 ] 2>/dev/null; then
       . "$SIG_CACHE" 2>/dev/null || true
       SIG_OPERATOR=$(b64url_decode "${SIG_OPERATOR_B64:-}")
       return 0
     fi
   fi
-  # P1-81：dumpsys 输出可达数百 KB，直接存 Shell 变量会触发参数过长；先落临时文件再逐字段提取
-  DMP_FILE="$DATA_DIR/dumpsys_sig.tmp"
-  /system/bin/dumpsys telephony.registry > "$DMP_FILE" 2>/dev/null
-  [ -s "$DMP_FILE" ] || /system/bin/dumpsys phone > "$DMP_FILE" 2>/dev/null
+  # 与 get_sim_state 共享有限时 telephony 快照；不重复执行 dumpsys。
+  DMP_FILE="$TELEPHONY_SNAPSHOT"
+  ensure_telephony_snapshot >/dev/null 2>&1 || true
   if [ -s "$DMP_FILE" ]; then
     SIG_OPERATOR=$("$BB" grep -o 'mOperatorAlphaLong=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mOperatorAlphaLong=//')
     [ -n "$SIG_OPERATOR" ] || SIG_OPERATOR=$("$BB" grep -o 'mNetworkOperatorName=[^,} ]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mNetworkOperatorName=//')
@@ -2410,21 +2503,24 @@ get_signal_info() {
       NRST=$("$BB" grep -o 'mNrState=[0-9]*' "$DMP_FILE" | "$BB" head -n1 | "$BB" sed 's/mNrState=//')
       case "$NRST" in 3) SIG_NETWORK=5G-SA ;; 2|1) SIG_NETWORK=5G-NSA ;; *) SIG_NETWORK=5G ;; esac
     fi
-    CI=$("$BB" grep -o 'CellInfo{[^}]*CellIdentityLte=LteCellIdentity{[^}]*}[^}]*CellSignalStrengthLte=LteSignalStrength{[^}]*}' "$DMP_FILE" | "$BB" head -n1)
-    if [ -z "$CI" ]; then
-      CI=$("$BB" grep -o 'CellInfo{[^}]*CellIdentityNr=NrCellIdentity{[^}]*}[^}]*CellSignalStrengthNr=NrSignalStrength{[^}]*}' "$DMP_FILE" | "$BB" head -n1)
+    # 把当前服务小区块写到临时文件，避免长变量作为命令行参数触发 ARG_MAX
+    CI_FILE="$DATA_DIR/cellinfo.tmp"
+    "$BB" grep -o 'CellInfo{[^}]*CellIdentityLte=LteCellIdentity{[^}]*}[^}]*CellSignalStrengthLte=LteSignalStrength{[^}]*}' "$DMP_FILE" | "$BB" head -n1 > "$CI_FILE" 2>/dev/null
+    if [ ! -s "$CI_FILE" ]; then
+      "$BB" grep -o 'CellInfo{[^}]*CellIdentityNr=NrCellIdentity{[^}]*}[^}]*CellSignalStrengthNr=NrSignalStrength{[^}]*}' "$DMP_FILE" | "$BB" head -n1 > "$CI_FILE" 2>/dev/null
     fi
-    if [ -n "$CI" ]; then
-      SIG_PCI=$(printf '%s' "$CI" | "$BB" grep -o 'mPci=[0-9]*' | "$BB" head -n1 | "$BB" sed 's/mPci=//')
-      SIG_BAND=$(printf '%s' "$CI" | "$BB" grep -o 'mEarfcn=[0-9]*' | "$BB" head -n1 | "$BB" sed 's/mEarfcn=//')
-      [ -n "$SIG_BAND" ] || SIG_BAND=$(printf '%s' "$CI" | "$BB" grep -o 'mNrArfcn=[0-9]*' | "$BB" head -n1 | "$BB" sed 's/mNrArfcn=//')
-      SIG_RSRP=$(printf '%s' "$CI" | "$BB" grep -o 'rsrp=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/rsrp=//')
-      [ -n "$SIG_RSRP" ] || SIG_RSRP=$(printf '%s' "$CI" | "$BB" grep -o 'ssRsrp=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/ssRsrp=//')
-      SIG_RSRQ=$(printf '%s' "$CI" | "$BB" grep -o 'rsrq=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/rsrq=//')
-      [ -n "$SIG_RSRQ" ] || SIG_RSRQ=$(printf '%s' "$CI" | "$BB" grep -o 'ssRsrq=[0-9-]*' | "$BB" head -n1 | "$BB" sed 's/ssRsrq=//')
-      SIG_SINR=$(printf '%s' "$CI" | "$BB" grep -o 'sinr=[0-9-.]*' | "$BB" head -n1 | "$BB" sed 's/sinr=//')
-      [ -n "$SIG_SINR" ] || SIG_SINR=$(printf '%s' "$CI" | "$BB" grep -o 'ssSinr=[0-9-.]*' | "$BB" head -n1 | "$BB" sed 's/ssSinr=//')
+    if [ -s "$CI_FILE" ]; then
+      SIG_PCI=$("$BB" grep -o 'mPci=[0-9]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/mPci=//')
+      SIG_BAND=$("$BB" grep -o 'mEarfcn=[0-9]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/mEarfcn=//')
+      [ -n "$SIG_BAND" ] || SIG_BAND=$("$BB" grep -o 'mNrArfcn=[0-9]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/mNrArfcn=//')
+      SIG_RSRP=$("$BB" grep -o 'rsrp=[0-9-]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/rsrp=//')
+      [ -n "$SIG_RSRP" ] || SIG_RSRP=$("$BB" grep -o 'ssRsrp=[0-9-]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/ssRsrp=//')
+      SIG_RSRQ=$("$BB" grep -o 'rsrq=[0-9-]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/rsrq=//')
+      [ -n "$SIG_RSRQ" ] || SIG_RSRQ=$("$BB" grep -o 'ssRsrq=[0-9-]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/ssRsrq=//')
+      SIG_SINR=$("$BB" grep -o 'sinr=[0-9-.]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/sinr=//')
+      [ -n "$SIG_SINR" ] || SIG_SINR=$("$BB" grep -o 'ssSinr=[0-9-.]*' "$CI_FILE" | "$BB" head -n1 | "$BB" sed 's/ssSinr=//')
     fi
+    rm -f "$CI_FILE"
     TMP_CACHE="$SIG_CACHE.$$"
     {
       printf 'SIG_NETWORK=%s\n' "$SIG_NETWORK"
@@ -2439,7 +2535,6 @@ get_signal_info() {
     chmod 0600 "$TMP_CACHE" 2>/dev/null
     mv -f "$TMP_CACHE" "$SIG_CACHE" 2>/dev/null
   fi
-  rm -f "$DMP_FILE" 2>/dev/null
 }
 
 # 信号等级（RSRP dBm）：≥-85 优秀；-85~-95 良好；-95~-105 一般；<-105 较差

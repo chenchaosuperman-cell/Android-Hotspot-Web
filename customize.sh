@@ -88,7 +88,6 @@ https://ghps.cc/$RAW_URL"
   mkdir -p "$TMPD"
   MIHOMO_GZ="$TMPD/mihomo.$$.gz"
   MIHOMO_TMP="$TMPD/mihomo.$$"
-  DL_OK=
   printf '%s\n' "$URLS" | while read -r URL; do
     [ -z "$URL" ] && continue
     ui_print "  Trying: $(echo "$URL" | cut -c1-60)..."
@@ -152,14 +151,16 @@ fi
 
 # Download geosite.dat（国内域名集合，GEOSITE,CN 规则依赖）：
 # 分流模式下国内 HTTPS 依赖 GEOSITE,CN 按域名直连（GEOIP,no-resolve 对已嗅探
-# SNI 的连接无法判定）。数据源 MetaCubeX meta-rules-dat latest；无固定 SHA
-# （随上游 release 更新），下载后校验：非空 + V2Ray protobuf 格式特征。
-# 下载失败不阻塞模块安装，但分流模式下国内流量可能回退走代理。
+# SNI 的连接无法判定）。数据源 v2fly/domain-list-community 固定版本
+# （20260920095009），SHA-256 硬编码校验；下载失败不阻塞模块安装，
+# 但分流模式下国内流量可能回退走代理。
 GEOSITE_BIN="$MODPATH/bin/geosite.dat"
+GEOSITE_VER="20260920095009"
+GEOSITE_SHA="f530223bf1b3e603810984967867cb06567ed862c7c9a6f1c4f873ad8997ac34"
 if [ ! -s "$GEOSITE_BIN" ]; then
-  ui_print "- Downloading geosite.dat (GEOSITE,CN domestic direct rules) ..."
+  ui_print "- Downloading geosite.dat v$GEOSITE_VER (GEOSITE,CN domestic direct rules) ..."
   mkdir -p "$MODPATH/bin"
-  GS_RAW="https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat"
+  GS_RAW="https://github.com/v2fly/domain-list-community/releases/download/$GEOSITE_VER/dlc.dat"
   GS_URLS="$GS_RAW
 https://ghfast.top/$GS_RAW
 https://mirror.ghproxy.com/$GS_RAW
@@ -167,22 +168,20 @@ https://gh-proxy.com/$GS_RAW"
   TMPD="${TMPDIR:-/data/local/tmp}"
   mkdir -p "$TMPD"
   GS_TMP="$TMPD/geosite.$$.dat"
-  GS_OK=
+  SHA_BIN=$(command -v sha256sum 2>/dev/null || echo /system/bin/sha256sum)
   printf '%s\n' "$GS_URLS" | while read -r URL; do
     [ -z "$URL" ] && continue
     ui_print "  Trying: $(echo "$URL" | cut -c1-60)..."
     if curl -fsSL --connect-timeout 15 --max-time 180 "$URL" -o "$GS_TMP" 2>/dev/null && [ -s "$GS_TMP" ]; then
-      # V2Ray geosite.dat protobuf 首字段应为 field1/wire2（0x0a）
-      GS_MAGIC=$(od -An -tx1 -N1 "$GS_TMP" 2>/dev/null | tr -d ' \n')
-      GS_SIZE=$(wc -c < "$GS_TMP" 2>/dev/null)
-      if [ "$GS_MAGIC" = "0a" ] && [ "$GS_SIZE" -gt 1000000 ] 2>/dev/null; then
+      GOT_GS_SHA=$($SHA_BIN "$GS_TMP" 2>/dev/null | awk '{print $1}')
+      if [ "$GOT_GS_SHA" = "$GEOSITE_SHA" ]; then
         mv "$GS_TMP" "$GEOSITE_BIN"
         chmod 0644 "$GEOSITE_BIN"
         echo "OK" > "$TMPD/geosite_dl_ok.$$"
-        ui_print "- geosite.dat OK (${GS_SIZE} bytes)"
+        ui_print "- geosite.dat v$GEOSITE_VER OK (SHA-256 verified)"
         break
       else
-        ui_print "    format/size invalid (magic=$GS_MAGIC size=$GS_SIZE), discarding"
+        ui_print "    SHA256 mismatch (got $GOT_GS_SHA), discarding"
         rm -f "$GS_TMP"
       fi
     fi

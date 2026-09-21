@@ -42,16 +42,24 @@ for IFACE in $IFACES; do
   /system/bin/iptables -D FORWARD -o "$IFACE" -j mifi_dn 2>/dev/null || true
   /system/bin/ip addr del 192.168.43.1/32 dev "$IFACE" 2>/dev/null || true
 done
-# v1.7.1：清理 Web 管理页访问控制规则（INPUT 链，仅本机/热点/USB 接口放行，其余 DROP）
-WEB_PORT=8080
+# v1.7.2：清理 Web 管理页访问控制规则（按记录端口 + config 端口 + 历史 8080 去重清理）
+WEB_PORTS=8080
+if [ -r "$DATA_DIR/web_fw_port" ]; then
+  _WF=$(/system/bin/cat "$DATA_DIR/web_fw_port" 2>/dev/null | tr -d ' \r\n')
+  case "$_WF" in ''|*[!0-9]*) : ;; *) WEB_PORTS="$WEB_PORTS $_WF" ;; esac
+fi
 if [ -r "$DATA_DIR/config.conf" ]; then
   _WP=$(/system/bin/sed -n 's/^PORT=//p' "$DATA_DIR/config.conf" 2>/dev/null | head -n 1)
-  case "$_WP" in ''|*[!0-9]*) : ;; *) WEB_PORT=$_WP ;; esac
+  case "$_WP" in ''|*[!0-9]*) : ;; *) WEB_PORTS="$WEB_PORTS $_WP" ;; esac
 fi
-for IFACE in wlan0 wlan1 wlan2 wlan3 wlan4 ap0 rndis0 usb0 eth0 lo; do
-  /system/bin/iptables -D INPUT -i "$IFACE" -p tcp --dport "$WEB_PORT" -j ACCEPT 2>/dev/null || true
+for WP in $WEB_PORTS; do
+  case " $DONE_WP " in *" $WP "*) continue ;; esac
+  DONE_WP="$DONE_WP $WP"
+  for IFACE in wlan0 wlan1 wlan2 wlan3 wlan4 ap0 rndis0 usb0 eth0 lo; do
+    /system/bin/iptables -D INPUT -i "$IFACE" -p tcp --dport "$WP" -j ACCEPT 2>/dev/null || true
+  done
+  /system/bin/iptables -D INPUT -p tcp --dport "$WP" -j DROP 2>/dev/null || true
 done
-/system/bin/iptables -D INPUT -p tcp --dport "$WEB_PORT" -j DROP 2>/dev/null || true
 
 # P1-75：清空并删除模块统计链（含 FORWARD 引用已在上方移除）
 for CHAIN in mifi_stats mifi_up mifi_dn; do

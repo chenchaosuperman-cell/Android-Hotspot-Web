@@ -120,21 +120,18 @@ save_config() {
 
 # 后台异步重启热点（使用调用方已算好的 NEW_SSID/NEW_SECURITY/NEW_PASS/NEW_BAND/NEW_CHANNEL/NEW_MAX）
 # 子 shell 带 trap：任何退出路径都释放操作锁，避免异常残留 120s
-# P0-5：启动后与请求参数尽力比对；空输出=通过或无法取证，非空=明确不匹配
+# 启动后的参数核验复用 common.sh 的有限时 SoftAP 快照。
+# 参数读取在不同 HyperOS 版本上并不稳定；热点接口/IP/系统状态已确认运行时，
+# 参数不一致只写告警，不能把已成功启动的热点回滚为失败。
 verify_hotspot_params() {
   want_ssid=$1
   want_sec=$2
   want_band=$3
   want_ch=$4
-  OUT=$(dumpsys wifi 2>/dev/null | "$BB" grep -iE 'SSID|SecurityType|mWifiApState' | "$BB" head -20)
-  [ -z "$OUT" ] && { printf ''; return 0; }
-  S=$(printf '%s' "$OUT" | "$BB" grep -iE 'SSID=' | "$BB" head -n1 | "$BB" sed 's/.*SSID=//; s/[",} ].*//')
-  if [ -n "$S" ] && [ "$S" != "$want_ssid" ]; then
-    WANT_HEX=$(printf '%s' "$want_ssid" | "$BB" od -An -tx1 2>/dev/null | "$BB" tr -d ' \n')
-    case "$S" in "$WANT_HEX") : ;; *)
-      printf 'SSID 未按配置生效（系统=%s）' "$S"
-      return 1 ;;
-    esac
+  verify_softap_config "$want_ssid" "$want_sec" "$want_band" "$want_ch"
+  rc=$?
+  if [ "$rc" = "2" ]; then
+    printf '%s hotspot verify warning: reported parameters differ; keep running hotspot\n' "$(date)" >> "$LOG"
   fi
   printf ''
   return 0
@@ -150,7 +147,7 @@ restart_hotspot_async() {
     load_config
     SSID=$(b64url_decode "$SSID_B64")
     PASS=$(b64url_decode "$PASS_B64")
-    STOP_OUT=$(/system/bin/cmd wifi stop-softap 2>&1)
+    STOP_OUT=$("$BB" timeout 10 /system/bin/cmd wifi stop-softap 2>&1)
     printf '%s stop-softap\n%s\n' "$(date)" "$STOP_OUT" >> "$LOG"
     sleep 1
     # Keep loopback management address until hotspot is ready
@@ -564,8 +561,8 @@ case "$ACTION" in
         AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF)
           case "$v" in 0|1) return 0 ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
-          # 1~5 个逗号分隔的 1~100 整数（如 80,90,100）；修复导入时被误判为 0/1 而失效
-          case "$v" in ''|*[!0-9,]*) : ;; *)
+          # 1~5 个逗号分隔的 1~100 整数（如 80,90,100）；v1.7.2：拒绝空段（80,,90 / 80,）
+          case "$v" in ''|,*|*,|*,,*|*[!0-9,]*) : ;; *)
             N=0; OK=1
             _LIST=$(printf '%s' "$v" | "$BB" tr ',' ' ')
             for T in $_LIST; do
@@ -668,7 +665,6 @@ case "$ACTION" in
     NEW_PP_B64=$(get_param pushplusTokenB64)
     NEW_DT_B64=$(get_param dingtalkWebhookB64)
     NEW_DT_SEC=$(get_param dingtalkSecretB64)
-    NEW_ND=$(get_param notifyNewdev)
     NEW_NL=$(get_param notifyLimit)
     NEW_NHE=$(get_param notifyHotspotEvt)
     NEW_NTT=$(get_param notifyThresholds)
@@ -764,11 +760,12 @@ case "$ACTION" in
         *) printf '{"ok":false,"message":"钉钉加签密钥需以 SEC 开头（与机器人安全设置一致）"}'; exit 0 ;;
       esac
     fi
-    case "$NEW_ND" in 0|1) NOTIFY_NEWDEV=$NEW_ND ;; esac
     case "$NEW_NL" in 0|1) NOTIFY_LIMIT=$NEW_NL ;; esac
     case "$NEW_AUTOSTART" in 0|1) AUTOSTART=$NEW_AUTOSTART ;; esac
     case "$NEW_NHE" in 0|1) NOTIFY_HOTSPOT_EVT=$NEW_NHE ;; esac
     if [ -n "$NEW_NTT" ]; then
+      # v1.7.2：拒绝空段（如 80,,90、80,），与导入校验口径一致
+      case "$NEW_NTT" in ,*|*,,*|*,) printf '{"ok":false,"message":"提醒节点格式错误（如 50,80,95）"}'; exit 0 ;; esac
       NTT_CNT=0
       NTT_OUT=
       for NTT_V in $(printf '%s' "$NEW_NTT" | "$BB" tr ',' ' '); do
@@ -947,14 +944,23 @@ case "$ACTION" in
     esac
     PORT=$NEW_PORT
     save_config || { printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
-    printf '{"ok":true,"message":"端口已保存为 %s，Web 服务将在2秒后切换到新端口"}' "$PORT"
+    printf '{"ok":true,"message":"端口已保存为 %s，Web 服务正在切换到新端口"}' "$PORT"
+    # v1.7.2：切换端口 = 按新端口刷新防火墙（清理旧端口规则）→ 重启 httpd/supervisor，
+    # 由 service.sh 以新端口拉起 httpd；前端轮询新端口就绪后跳转。
     (
       sleep 2
+      load_config
+      ensure_web_fw
       HTTP_PID=$(cat "$HTTP_PIDFILE" 2>/dev/null)
       case "$HTTP_PID" in ''|*[!0-9]*) HTTP_PID=0 ;; esac
       if [ "$HTTP_PID" -gt 1 ] && [ -r "/proc/$HTTP_PID/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$HTTP_PID/cmdline" | "$BB" grep -q 'httpd'; then
         kill "$HTTP_PID" 2>/dev/null
       fi
+      SUP=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
+      case "$SUP" in ''|*[!0-9]*) SUP=0 ;; esac
+      [ "$SUP" -gt 1 ] && kill "$SUP" 2>/dev/null
+      sleep 1
+      nohup /system/bin/sh "$MODDIR/service.sh" >/dev/null 2>&1 &
     ) </dev/null >/dev/null 2>&1 &
     ;;
   restart_module)

@@ -122,18 +122,7 @@ else
   chmod 0600 "$HTTP_CONF"
 fi
 
-# Web 管理页访问控制（v1.7.1）：仅允许本机(lo)、热点接口与 USB 共享接口访问管理端口，
-# 其余接口（蜂窝数据等）一律 DROP。规则由 supervisor 主循环周期性校验保活
-# （Android netd 在热点启停时可能清空自定义 INPUT 规则）。
-ensure_web_fw() {
-  [ -n "$PORT" ] || PORT=8080
-  $IPT -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || $IPT -A INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null
-  $IPT -C INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
-  for IFACE in wlan0 wlan1 wlan2 wlan3 wlan4 ap0 rndis0 usb0 eth0; do
-    $IPT -C INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
-  done
-}
-
+# Web 管理页访问控制（v1.7.2）：ensure_web_fw 定义见 lib/common.sh，仅放行本机/热点/USB 接口，主循环每轮保活。
 if [ ! -s "$CSRF_FILE" ]; then
   "$BB" od -An -N24 -tx1 /dev/urandom 2>/dev/null | "$BB" tr -d ' \r\n' > "$CSRF_FILE"
   chmod 0600 "$CSRF_FILE"
@@ -262,7 +251,7 @@ fi
 
 # 开机自启：仅在真正手机开机（uptime<120s，已清 MANUAL_OFF）且 AUTOSTART=1 时启动；
 # 单独重启模块服务保留 MANUAL_OFF，不重新拉起热点。
-if [ "$AUTOSTART" = "1" ] && [ ! -e "$MANUAL_OFF_FILE" ]; then
+if [ "$_UP_SEC" -lt 120 ] && [ "$AUTOSTART" = "1" ] && [ ! -e "$MANUAL_OFF_FILE" ]; then
   echo "$(date) autostart: starting" >> "$LOG"
   echo 1 > "$DESIRED_FILE"
   start_hotspot || echo 0 > "$DESIRED_FILE"
@@ -323,7 +312,18 @@ while true; do
   fi
 
   HTTP_PID=$(cat "$PIDFILE" 2>/dev/null)
-  if [ -z "$HTTP_PID" ] || ! kill -0 "$HTTP_PID" 2>/dev/null; then
+  HTTP_OK=0
+  case "$HTTP_PID" in
+    ''|*[!0-9]*) : ;;
+    *)
+      if [ "$HTTP_PID" -gt 1 ] && kill -0 "$HTTP_PID" 2>/dev/null && \
+         [ -r "/proc/$HTTP_PID/cmdline" ] && \
+         "$BB" tr '\000' ' ' < "/proc/$HTTP_PID/cmdline" 2>/dev/null | "$BB" grep -q 'httpd'; then
+        HTTP_OK=1
+      fi
+      ;;
+  esac
+  if [ "$HTTP_OK" != "1" ]; then
     echo "$(date) Web UI exited; restarting" >> "$LOG"
     start_httpd
   fi

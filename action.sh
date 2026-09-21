@@ -23,8 +23,9 @@ cmd="$1"; sub="$2"
 
 case "$cmd" in
   status)
-    # 只有绑定了 192.168.43.1 的 wlan 接口才算热点运行（避免把普通 WiFi 当热点）
-    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | /system/bin/awk -v s="$STABLE_IP" '$4 ~ "^"s"/" {print $2; exit}')
+    # 只有绑定了 192.168.43.1 的 wlan[1-9]+ 热点接口才算热点运行
+    # （v1.7.2：必须限定接口名为 wlan 热点接口，避免 lo/其它接口误判）
+    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | /system/bin/awk -v s="$STABLE_IP" '$2 ~ /^wlan[1-9][0-9]*$/ && $4 ~ "^"s"/" {print $2; exit}')
     RUNNING=false; [ -n "$IFACE" ] && RUNNING=true
     DESIRED=$(/system/bin/cat "$DESIRED_FILE" 2>/dev/null); [ "$DESIRED" = "1" ] || DESIRED=0
     MOFF=false; [ -f "$MANUAL_OFF_FILE" ] && MOFF=true
@@ -42,6 +43,8 @@ case "$cmd" in
         # v1.7.1：与 Web 后台一致，按模块保存的 SSID/密码/频段/信道/最大客户端参数启动
         . "$MODDIR/lib/common.sh" 2>/dev/null
         load_config
+        SSID=$(b64url_decode "$SSID_B64")
+        PASS=$(b64url_decode "$PASS_B64")
         run_softap "$SSID" "$SECURITY" "$PASS" "$BAND" "$CHANNEL" "$MAX_CLIENTS" >/dev/null 2>&1
         echo "hotspot start requested with saved config"
         ;;
@@ -62,7 +65,9 @@ case "$cmd" in
         PID=$(/system/bin/cat "$pf" 2>/dev/null)
         case "$PID" in ''|*[!0-9]*) PID=0 ;; esac
         [ "$PID" -gt 1 ] || continue
-        cmd=$(/system/bin/tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null)
+        [ -r "/proc/$PID/cmdline" ] || continue
+        cmd=$(/system/bin/cat "/proc/$PID/cmdline" 2>/dev/null | /system/bin/tr '\000' ' ')
+        [ -n "$cmd" ] || continue
         case "$f" in
           httpd) echo "$cmd" | /system/bin/grep -q httpd && /system/bin/kill "$PID" 2>/dev/null ;;
           supervisor) echo "$cmd" | /system/bin/grep -q "xiaomi_mifi_web" && /system/bin/kill "$PID" 2>/dev/null ;;
@@ -89,12 +94,16 @@ case "$cmd" in
     if [ -f "$DATA_DIR/httpd.pid" ]; then
       PID=$(/system/bin/cat "$DATA_DIR/httpd.pid" 2>/dev/null)
       case "$PID" in ''|*[!0-9]*) PID=0 ;; esac
-      [ "$PID" -gt 1 ] && /system/bin/kill "$PID" 2>/dev/null
+      if [ "$PID" -gt 1 ] && [ -r "/proc/$PID/cmdline" ]; then
+        /system/bin/cat "/proc/$PID/cmdline" 2>/dev/null | /system/bin/tr '\000' ' ' | /system/bin/grep -q httpd && /system/bin/kill "$PID" 2>/dev/null
+      fi
     fi
     if [ -f "$DATA_DIR/supervisor.pid" ]; then
       PID=$(/system/bin/cat "$DATA_DIR/supervisor.pid" 2>/dev/null)
       case "$PID" in ''|*[!0-9]*) PID=0 ;; esac
-      [ "$PID" -gt 1 ] && /system/bin/kill "$PID" 2>/dev/null
+      if [ "$PID" -gt 1 ] && [ -r "/proc/$PID/cmdline" ]; then
+        /system/bin/cat "/proc/$PID/cmdline" 2>/dev/null | /system/bin/tr '\000' ' ' | /system/bin/grep -q xiaomi_mifi_web && /system/bin/kill "$PID" 2>/dev/null
+      fi
     fi
     /system/bin/sleep 1
     /system/bin/nohup /system/bin/sh "$MODDIR/service.sh" >/dev/null 2>&1 &

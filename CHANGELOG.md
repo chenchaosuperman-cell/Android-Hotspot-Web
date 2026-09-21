@@ -403,3 +403,13 @@
 ### 遗留（待真机验证，HyperOS 相关）
 - cmd wifi / dumpsys 输出解析、wlan2 接口名、SELinux 对 su 调用限制需在小米 14 真机确认。
 - tc / iptables 对 HyperOS 内核的可用性未真机验证。
+# v1.7.2-beta.1（2026-09-21）
+
+- 修复首页永久停在“正在获取设备数据”：纠正 `status()` 异步 IIFE 的 JavaScript 语法错误。
+- 修复 `dumpsys wifi` 经大型 Shell 变量和 `printf` 触发 `Argument list too long`。
+- SoftAP、telephony 系统采集增加 3–5 秒硬超时；失败时使用旧快照或空字段，不再阻塞整个状态接口。
+- SIM 与信号信息共用一份 60 秒 telephony 快照，冷启动不再重复执行大型 `dumpsys`。
+- Web 请求增加超时，连续失败后显示明确的重试界面，不再无限转圈。
+- 修复操作入口启动热点时未解码保存的 SSID/密码。
+- 修复普通服务重启错误触发开机自启，以及 httpd PID 复用造成的假存活。
+- 修复热点提醒保存失败时无法正确恢复服务器原值。
