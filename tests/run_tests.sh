@@ -297,6 +297,12 @@ band_5g=2
 band_6g=4
 band_any=7
 softap_capability=1
+password_readable=1
+tether_start_cm=1
+tether_stop_cm=1
+channels2g=1,3,6,9,11
+channels5g=36,40,44,48,149,153
+channels6g=empty
 EOF
 printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
 cat > "$MOCKBIN/app_process" <<EOF
@@ -308,7 +314,7 @@ for a in "\$@"; do
   if [ "\$FOUND" = "1" ]; then
     if [ -z "\$ARGS" ]; then ARGS="\$a"; else ARGS="\$ARGS|\$a"; fi
   else
-    case "\$a" in get-config|set-config|probe|tether-state) CMD=\$a; FOUND=1 ;; esac
+    case "\$a" in get-config|set-config|probe|tether-state|tether-start|tether-stop) CMD=\$a; FOUND=1 ;; esac
   fi
 done
 case "\$CMD" in
@@ -332,6 +338,14 @@ EOF2
     ;;
   tether-state)
     printf 'tethered=1\nifaces=wlan0\ntether_state=2\n'
+    ;;
+  tether-start)
+    echo "tether-start|0" >> "$BRIDGE_LOG"
+    echo "ok=1"
+    ;;
+  tether-stop)
+    echo "tether-stop|0" >> "$BRIDGE_LOG"
+    echo "ok=1"
     ;;
 esac
 exit 0
@@ -403,10 +417,12 @@ assert_eq 'set_config bridge 不可用 → rc=1' '1' "$?"
 if "$BB" grep -q 'stop-softap' "$MOCK_LOG"; then ok '写失败不关闭热点' 1; else ok '写失败不关闭热点' 0; fi
 APP_PROCESS=$APP_PROCESS_SAVE
 
-# --- hotspot_start：Generic Backend = 系统 Tethering（与 Settings 一致），非无参 start-softap ---
+# --- hotspot_start：Generic Backend = Bridge 系统 Tethering（IConnectivityManager.startTethering），非 cmd/无参 start-softap ---
+: > "$BRIDGE_LOG"
 : > "$MOCK_LOG"
 hotspot_start "" "" "" "" "" ""
-"$BB" grep -q 'connectivity tether start' "$MOCK_LOG"; ok 'hotspot_start 走系统 Tethering（connectivity tether start）' $?
+"$BB" grep -q 'tether-start' "$BRIDGE_LOG"; ok 'hotspot_start 走 Bridge 系统 Tethering（tether-start）' $?
+if "$BB" grep -q 'connectivity tether start' "$MOCK_LOG"; then ok 'hotspot_start 未依赖 cmd connectivity 子命令（bridge 优先）' 1; else ok 'hotspot_start 未依赖 cmd connectivity 子命令（bridge 优先）' 0; fi
 if "$BB" grep -q 'wifi start-softap' "$MOCK_LOG"; then ok 'hotspot_start 未错误使用 start-softap 作主路径' 1; else ok 'hotspot_start 未错误使用 start-softap 作主路径' 0; fi
 # tethering 异步 → 轮询 bridge tether-state 确认 ENABLED
 assert_eq 'hotspot_start 返回 0（tether 激活确认）' '0' "$?"
@@ -416,15 +432,17 @@ assert_eq 'hotspot_start 返回 0（tether 激活确认）' '0' "$?"
 : > "$BRIDGE_STATE"   # 模拟系统从未配置热点
 hotspot_start "Migrated-AP" "wpa2" "12345678" "any" "0" "0"
 "$BB" grep -q 'set-config|Migrated-AP|wpa2|12345678|any|0|0|0' "$BRIDGE_LOG"; ok 'hotspot_start 迁移：旧配置经 Framework 持久化' $?
-"$BB" grep -q 'connectivity tether start' "$MOCK_LOG"; ok 'hotspot_start 迁移后走系统 Tethering 启动' $?
+"$BB" grep -q 'tether-start' "$BRIDGE_LOG"; ok 'hotspot_start 迁移后走 Bridge 系统 Tethering 启动' $?
 hotspot_get_config
 assert_eq '迁移后系统配置 ssid' 'Migrated-AP' "$sys_ssid"
 printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
 
-# --- hotspot_stop：系统 Tethering 停止路径优先 ---
+# --- hotspot_stop：Bridge 系统 Tethering 停止优先 ---
+: > "$BRIDGE_LOG"
 : > "$MOCK_LOG"
 hotspot_stop
-"$BB" grep -q 'connectivity tether stop' "$MOCK_LOG"; ok 'hotspot_stop 走系统 Tethering（connectivity tether stop）' $?
+"$BB" grep -q 'tether-stop' "$BRIDGE_LOG"; ok 'hotspot_stop 走 Bridge 系统 Tethering（tether-stop）' $?
+if "$BB" grep -q 'connectivity tether stop' "$MOCK_LOG"; then ok 'hotspot_stop 未依赖 cmd connectivity 子命令（bridge 优先）' 1; else ok 'hotspot_stop 未依赖 cmd connectivity 子命令（bridge 优先）' 0; fi
 
 # 新版 SSID 标签（SoftApConfToXmlMigration 风格）
 cat > "$TMP_SYS_DIR/store3.xml" <<'XMLEOF'
@@ -454,6 +472,9 @@ case "$CAPS" in *'"syncLevel":"A"'*) ok 'caps 同步级别 A（Framework 双向�
 case "$CAPS" in *'"android":34'*) ok 'caps android=34（probe/getprop）' 0 ;; *) ok 'caps android=34（probe/getprop）' 1 ;; esac
 case "$CAPS" in *'"band6g":true'*) ok 'caps 常量 band_6g=4 → band6g=true' 0 ;; *) ok 'caps 常量 band_6g=4 → band6g=true' 1 ;; esac
 case "$CAPS" in *'"hiddenSsid":true'*) ok 'caps Builder setHiddenSsid → hiddenSsid=true' 0 ;; *) ok 'caps Builder setHiddenSsid → hiddenSsid=true' 1 ;; esac
+case "$CAPS" in *'"channels2g":[1,3,6,9,11]'*) ok 'caps 信道列表实测（channels2g）' 0 ;; *) ok 'caps 信道列表实测（channels2g）' 1 ;; esac
+case "$CAPS" in *'"channels5g":[36,40,44,48,149,153]'*) ok 'caps 信道列表实测（channels5g）' 0 ;; *) ok 'caps 信道列表实测（channels5g）' 1 ;; esac
+case "$CAPS" in *'"channels6g":[]'*) ok 'caps 6G 无信道列表 → 空数组' 0 ;; *) ok 'caps 6G 无信道列表 → 空数组' 1 ;; esac
 # 降级：setSoftApConfiguration 仅 1 参变体、无 setPassphrase(String,int) → writeConfig 仍可（兼容路径）
 # 降级：set_config_2arg=0 且 Builder 无密码方法 → writeConfig=false / syncLevel=B
 cat > "$PROBE_FILE" <<'EOF'
@@ -517,6 +538,34 @@ hotspot_detect_capabilities
 # 统一接口可用性
 hotspot_get_capabilities >/dev/null 2>&1; ok '接口 hotspot_get_capabilities' $?
 hotspot_get_config >/dev/null 2>&1; ok '接口 hotspot_get_config' $?
+
+# --- 一次性旧配置迁移（v1.7.5 → v1.7.6：SSID_B64 等 → 系统 SoftApConfiguration + 清理）---
+: > "$BRIDGE_LOG"
+cat > "$TMP_SYS_DIR/config.conf" <<'CFGEOF'
+SSID_B64=TGl0ZU1pRmk
+PASS_B64=MTIzNDU2Nzg
+SECURITY=wpa2
+BAND=5
+CHANNEL=149
+HIDDEN=0
+MAX_CLIENTS=0
+KEEPALIVE=1
+AUTOSTART=1
+CFGEOF
+DATA_DIR="$TMP_SYS_DIR"
+CONFIG="$TMP_SYS_DIR/config.conf"
+LOG="$TMP_SYS_DIR/service.log"
+export DATA_DIR CONFIG LOG
+load_config
+migrate_legacy_hotspot_config
+"$BB" grep -q 'set-config|LiteMiFi|wpa2|12345678|5|149|0|0' "$BRIDGE_LOG"; ok 'migrate 旧配置写入系统 SoftApConfiguration（set-config）' $?
+[ -f "$TMP_SYS_DIR/.hotspot_migrated_v176" ]; ok 'migrate 成功写 marker（幂等）' $?
+if "$BB" grep -q '^SSID_B64=' "$TMP_SYS_DIR/config.conf" 2>/dev/null; then ok 'migrate 后 config.conf 清除旧热点字段' 1; else ok 'migrate 后 config.conf 清除旧热点字段' 0; fi
+# 幂等：二次调用不再写入
+: > "$BRIDGE_LOG"
+migrate_legacy_hotspot_config
+if [ -s "$BRIDGE_LOG" ]; then ok 'migrate 幂等（marker 后不再执行）' 1; else ok 'migrate 幂等（marker 后不再执行）' 0; fi
+rm -f "$TMP_SYS_DIR/config.conf"
 rm -rf "$TMP_SYS_DIR"
 echo
 echo "== 结果：$PASS 通过 / $FAIL 失败 =="

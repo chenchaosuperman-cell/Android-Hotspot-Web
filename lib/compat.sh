@@ -51,6 +51,8 @@ sys_bridge_probe() {
   BRIDGE_P_BS_HIDDEN=0; BRIDGE_P_BS_MAX=0
   BRIDGE_P_SEC_OPEN=-1; BRIDGE_P_SEC_WPA2=-1; BRIDGE_P_SEC_WPA3_T=-1; BRIDGE_P_SEC_WPA3=-1
   BRIDGE_P_BAND_2G=-1; BRIDGE_P_BAND_5G=-1; BRIDGE_P_BAND_6G=-1; BRIDGE_P_BAND_ANY=-1
+  BRIDGE_P_CAP=0; BRIDGE_P_PASS_R=0; BRIDGE_P_TSTART=0; BRIDGE_P_TSTOP=0
+  BRIDGE_P_CH2G=; BRIDGE_P_CH5G=; BRIDGE_P_CH6G=
   while IFS= read -r PL; do
     case "$PL" in
       api=*) BRIDGE_P_API=${PL#api=} ;;
@@ -75,6 +77,13 @@ sys_bridge_probe() {
       band_5g=*) BRIDGE_P_BAND_5G=${PL#band_5g=} ;;
       band_6g=*) BRIDGE_P_BAND_6G=${PL#band_6g=} ;;
       band_any=*) BRIDGE_P_BAND_ANY=${PL#band_any=} ;;
+      softap_capability=*) BRIDGE_P_CAP=${PL#softap_capability=} ;;
+      password_readable=*) BRIDGE_P_PASS_R=${PL#password_readable=} ;;
+      tether_start_cm=*) BRIDGE_P_TSTART=${PL#tether_start_cm=} ;;
+      tether_stop_cm=*) BRIDGE_P_TSTOP=${PL#tether_stop_cm=} ;;
+      channels2g=*) BRIDGE_P_CH2G=${PL#channels2g=} ;;
+      channels5g=*) BRIDGE_P_CH5G=${PL#channels5g=} ;;
+      channels6g=*) BRIDGE_P_CH6G=${PL#channels6g=} ;;
     esac
   done <<EOF
 $P_OUT
@@ -143,16 +152,27 @@ hotspot_detect_capabilities() {
     BAND_2G=1; BAND_5G=1
   fi
 
-  # 启停能力：系统 Tethering 或 cmd wifi fallback
+  # 启停能力：Bridge 系统 Tethering（IConnectivityManager.startTethering，probe 实测）优先，
+  # cmd connectivity / cmd wifi 仅作 fallback 可用性判断
   START_STOP=0
-  { [ "$TETHER_SUPPORTED" = "1" ] || [ "$CMDW_START" = "1" ]; } && START_STOP=1
+  if [ "$BRIDGE_P_TSTART" = "1" ] || [ "$BRIDGE_P_TSTOP" = "1" ]; then
+    START_STOP=1
+  elif [ "$TETHER_SUPPORTED" = "1" ] || [ "$CMDW_START" = "1" ]; then
+    START_STOP=1
+  fi
+
+  # 信道能力：由设备 SoftApCapability 实测（SoftApCapabilities.getSupportedChannelList），
+  # 无列表时 Web 只显示"自动"
+  CH_JSON_2G=[$(list_to_json "$BRIDGE_P_CH2G")]
+  CH_JSON_5G=[$(list_to_json "$BRIDGE_P_CH5G")]
+  CH_JSON_6G=[$(list_to_json "$BRIDGE_P_CH6G")]
 
   # 同步级别：A=完整读写（系统↔Web 双向同步）；B=只读；C=无系统配置能力（仅开关/状态）
   SYNC_LEVEL=C
   [ "$READ_CFG" = "1" ] && SYNC_LEVEL=B
   [ "$WRITE_CFG" = "1" ] && SYNC_LEVEL=A
 
-  HOTSPOT_CAPS_JSON=$(printf '{"android":%s,"startStop":%s,"readConfig":%s,"writeConfig":%s,"band2g":%s,"band5g":%s,"band6g":%s,"hiddenSsid":%s,"channelControl":%s,"maxClients":%s,"syncLevel":"%s"}' \
+  HOTSPOT_CAPS_JSON=$(printf '{"android":%s,"startStop":%s,"readConfig":%s,"writeConfig":%s,"band2g":%s,"band5g":%s,"band6g":%s,"hiddenSsid":%s,"channelControl":%s,"maxClients":%s,"channels2g":%s,"channels5g":%s,"channels6g":%s,"syncLevel":"%s"}' \
     "$API" \
     "$([ "$START_STOP" = "1" ] && echo true || echo false)" \
     "$([ "$READ_CFG" = "1" ] && echo true || echo false)" \
@@ -163,7 +183,15 @@ hotspot_detect_capabilities() {
     "$([ "$HIDDEN_OK" = "1" ] && echo true || echo false)" \
     "$([ "$CH_CTL" = "1" ] && echo true || echo false)" \
     "$([ "$MAX_CTL" = "1" ] && echo true || echo false)" \
+    "$CH_JSON_2G" \
+    "$CH_JSON_5G" \
+    "$CH_JSON_6G" \
     "$SYNC_LEVEL")
+}
+
+# "1,3,6,9" → "1,3,6,9"（空/empty 时输出空串）
+list_to_json() {
+  case "$1" in ''|empty) printf '' ;; *) printf '%s' "$1" ;; esac
 }
 
 # ---- 接口 1：能力清单 ----
@@ -252,6 +280,9 @@ hotspot_set_config() {
     return 1
   fi
 
+  # 确保 probe 已跑（密码可读性 / 最大连接数能力判定）
+  [ -n "${BRIDGE_P_GET:-}" ] || sys_bridge_probe 2>/dev/null
+
   # 读回验证：系统配置已持久化（热点保持原状态未动）
   hotspot_get_config
   VERIFY_OK=0
@@ -261,9 +292,25 @@ hotspot_set_config() {
      && [ "$sys_channel" = "$NEW_CHANNEL" ] \
      && [ "$sys_hidden" = "$NEW_HIDDEN" ]; then
     VERIFY_OK=1
+    # 密码验证：非 open 且设置了新密码时，系统可读回则必须一致（读不回=ROM 遮蔽，跳过并记日志）
+    if [ "$VERIFY_OK" = "1" ] && [ "$NEW_SEC" != "open" ] && [ -n "$NEW_PASS" ]; then
+      if [ "${BRIDGE_P_PASS_R:-0}" = "1" ]; then
+        if [ -z "$sys_password" ] || [ "$sys_password" != "$NEW_PASS" ]; then
+          echo "$(date) hotspot_set_config: password verify mismatch" >> "$LOG" 2>/dev/null
+          VERIFY_OK=0
+        fi
+      else
+        echo "$(date) hotspot_set_config: password not readable on this ROM, skip verify" >> "$LOG" 2>/dev/null
+      fi
+    fi
+    # 最大连接数验证：设备支持时 0（恢复默认）与正数都必须一致
+    if [ "$VERIFY_OK" = "1" ] && [ "${BRIDGE_P_BS_MAX:-0}" = "1" ] && [ "$sys_maxclients" != "$NEW_MAX" ]; then
+      echo "$(date) hotspot_set_config: maxclients verify mismatch (saved=$sys_maxclients want=$NEW_MAX)" >> "$LOG" 2>/dev/null
+      VERIFY_OK=0
+    fi
   fi
   if [ "$VERIFY_OK" != "1" ]; then
-    echo "$(date) hotspot_set_config: verify failed (saved ssid=$sys_ssid want=$NEW_SSID sec=$sys_security want=$NEW_SEC band=$sys_band want=$NEW_BAND)" >> "$LOG" 2>/dev/null
+    echo "$(date) hotspot_set_config: verify failed (saved ssid=$sys_ssid want=$NEW_SSID sec=$sys_security want=$NEW_SEC band=$sys_band want=$NEW_BAND hidden=$sys_hidden want=$NEW_HIDDEN)" >> "$LOG" 2>/dev/null
     return 1
   fi
   return 0
@@ -306,7 +353,23 @@ get_hotspot_iface() {
   printf '%s' "$IFACE"
 }
 
-# ---- 接口 5：启动热点（Generic Backend = 系统 Tethering，与 Settings 一致）----
+# 等待系统 Tethering 生效（轮询 dumpsys 快照 / bridge tether-state）
+wait_tether_enabled() {
+  I=0
+  while [ "$I" -lt "$1" ]; do
+    I=$((I + 1))
+    sleep 1
+    softap_state_snapshot 2>/dev/null
+    [ "$SNAP_AP_STATE" = "ENABLED" ] && return 0
+    if bridge_available; then
+      T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
+      case "$T_OUT" in *'tether_state=2'*|*'tethered=1'*) return 0 ;; esac
+    fi
+  done
+  return 1
+}
+
+# ---- 接口 5：启动热点（Generic Backend = Bridge 系统 Tethering，与 Settings 一致）----
 hotspot_start() {
   NEW_SSID_ARG=$1; NEW_SEC_ARG=$2; NEW_PASS_ARG=$3; NEW_BAND_ARG=$4; NEW_CHANNEL_ARG=$5; NEW_MAX_ARG=$6
   NEW_HIDDEN_ARG=${HIDDEN:-0}
@@ -325,36 +388,38 @@ hotspot_start() {
     fi
   fi
 
-  # Generic Backend：系统 Tethering（ConnectivityManager/TetheringManager.startTethering 路径）
+  # Generic Backend：Bridge 系统 Tethering（IConnectivityManager.startTethering，
+  # 跨 ROM 无需 cmd connectivity 子命令存在；回调经 Proxy+Binder 静默接受）
+  if bridge_available; then
+    B_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-start 2>/dev/null)
+    case "$B_OUT" in
+      ok=1*)
+        echo "$(date) hotspot_start: bridge tether-start (system Tethering)" >> "$LOG" 2>/dev/null
+        if wait_tether_enabled 10; then
+          return 0
+        fi
+        echo "$(date) hotspot_start: bridge tether-start did not reach ENABLED within 10s" >> "$LOG" 2>/dev/null
+        ;;
+      *) echo "$(date) hotspot_start: bridge tether-start unavailable/failed, fallback" >> "$LOG" 2>/dev/null ;;
+    esac
+  fi
+
+  # Fallback 2：cmd connectivity tether start（老系统 Shell 路径）
   if command -v "$CMD_WIFI" >/dev/null 2>&1; then
     case "$("$CMD_WIFI" connectivity help 2>/dev/null)" in
       *'tether'*'start'*)
-        echo "$(date) hotspot_start: connectivity tether start (system tethering)" >> "$LOG" 2>/dev/null
+        echo "$(date) hotspot_start: connectivity tether start (shell fallback)" >> "$LOG" 2>/dev/null
         "$BB" timeout 10 "$CMD_WIFI" connectivity tether start 2>&1 | "$BB" head -3 >> "$LOG" 2>/dev/null
-        # 轮询等待 SoftAP ENABLED（最多 ~10s；tethering 异步生效）
-        I=0
-        while [ "$I" -lt 10 ]; do
-          I=$((I + 1))
-          sleep 1
-          softap_state_snapshot 2>/dev/null
-          if [ "$SNAP_AP_STATE" = "ENABLED" ]; then
-            echo "$(date) hotspot_start: tether active (softap enabled)" >> "$LOG" 2>/dev/null
-            return 0
-          fi
-          if bridge_available; then
-            T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
-            case "$T_OUT" in *'tether_state=2'*|*'tethered=1'*)
-              echo "$(date) hotspot_start: tether active (bridge state)" >> "$LOG" 2>/dev/null
-              return 0 ;; esac
-          fi
-        done
-        echo "$(date) hotspot_start: tether start did not reach ENABLED within 10s" >> "$LOG" 2>/dev/null
+        if wait_tether_enabled 10; then
+          return 0
+        fi
+        echo "$(date) hotspot_start: connectivity tether start did not reach ENABLED" >> "$LOG" 2>/dev/null
         ;;
       *) echo "$(date) hotspot_start: connectivity tether unsupported" >> "$LOG" 2>/dev/null ;;
     esac
   fi
 
-  # Fallback（capability 验证后）：cmd wifi start-softap 带参（用系统配置，OEM/老系统路径）
+  # Fallback 3（capability 验证后）：cmd wifi start-softap 带参（用系统配置，OEM/老系统路径）
   if command -v "$CMD_WIFI" >/dev/null 2>&1 \
      && "$CMD_WIFI" wifi help 2>/dev/null | grep -q 'start-softap'; then
     hotspot_get_config
@@ -379,8 +444,25 @@ hotspot_start() {
   return 1
 }
 
-# ---- 接口 6：停止热点（Generic = 系统 Tethering 优先；wifi stop-softap fallback）----
+# ---- 接口 6：停止热点（Generic = Bridge 系统 Tethering 优先；cmd connectivity / wifi fallback）----
 hotspot_stop() {
+  if bridge_available; then
+    B_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-stop 2>/dev/null)
+    case "$B_OUT" in
+      ok=1*)
+        echo "$(date) hotspot_stop: bridge tether-stop (system Tethering)" >> "$LOG" 2>/dev/null
+        I=0
+        while [ "$I" -lt 8 ]; do
+          I=$((I + 1))
+          sleep 1
+          softap_state_snapshot 2>/dev/null
+          case "$SNAP_AP_STATE" in DISABLED|'') return 0 ;; esac
+        done
+        return 0
+        ;;
+      *) echo "$(date) hotspot_stop: bridge tether-stop unavailable, fallback" >> "$LOG" 2>/dev/null ;;
+    esac
+  fi
   stop_hotspot_real
   return $?
 }
@@ -391,4 +473,51 @@ hotspot_restart() {
   sleep 2
   hotspot_start "$@"
   return $?
+}
+
+# ---- 一次性迁移：v1.7.5 及更早保存在 config.conf 的热点字段 → 系统 SoftApConfiguration ----
+# 服务启动时调用（load_config 之后）。幂等：成功写 marker；失败下次启动重试。
+# 系统不可写时跳过（hotspot_start 内还有带参兜底迁移）。
+migrate_legacy_hotspot_config() {
+  MARKER="$DATA_DIR/.hotspot_migrated_v176"
+  [ -f "$MARKER" ] && return 0
+  [ -s "$CONFIG" ] || { : > "$MARKER"; return 0; }
+  # 无旧热点字段
+  if [ -z "${SSID_B64:-}" ] && [ -z "${PASS_B64:-}" ] && [ -z "${SECURITY:-}" ]; then
+    : > "$MARKER"
+    return 0
+  fi
+  # 系统可写（probe 实测）
+  [ -n "${BRIDGE_P_GET:-}" ] || sys_bridge_probe 2>/dev/null
+  if [ "${BRIDGE_P_SET2:-0}" != "1" ] && [ "${BRIDGE_P_SET1:-0}" != "1" ]; then
+    echo "$(date) migrate: system not writable, skip (legacy fields kept)" >> "$LOG" 2>/dev/null
+    return 0
+  fi
+  OLD_SSID=$(b64url_decode "$SSID_B64" 2>/dev/null)
+  OLD_PASS=$(b64url_decode "$PASS_B64" 2>/dev/null)
+  OLD_SEC=${SECURITY:-wpa2}
+  case "$OLD_SEC" in open|wpa2|wpa3|wpa3_transition) ;; *) OLD_SEC=wpa2 ;; esac
+  OLD_BAND=${BAND:-any}
+  case "$OLD_BAND" in 2|5|6|any) ;; *) OLD_BAND=any ;; esac
+  OLD_CHANNEL=${CHANNEL:-0}
+  case "$OLD_CHANNEL" in ''|*[!0-9]*) OLD_CHANNEL=0 ;; esac
+  OLD_HIDDEN=${HIDDEN:-0}
+  case "$OLD_HIDDEN" in 1|true|on) OLD_HIDDEN=1 ;; *) OLD_HIDDEN=0 ;; esac
+  OLD_MAX=${MAX_CLIENTS:-0}
+  case "$OLD_MAX" in ''|*[!0-9]*) OLD_MAX=0 ;; esac
+  if [ -z "$OLD_SSID" ]; then
+    echo "$(date) migrate: legacy ssid empty, mark done" >> "$LOG" 2>/dev/null
+    : > "$MARKER"
+    return 0
+  fi
+  echo "$(date) migrate: migrating legacy hotspot config (ssid=$OLD_SSID) to system SoftApConfiguration" >> "$LOG" 2>/dev/null
+  if hotspot_set_config "$OLD_SSID" "$OLD_SEC" "$OLD_PASS" "$OLD_BAND" "$OLD_CHANNEL" "$OLD_HIDDEN" "$OLD_MAX"; then
+    # 迁移成功：save_config 重写 config.conf（热点字段不再输出），写 marker
+    save_config 2>/dev/null
+    : > "$MARKER"
+    echo "$(date) migrate: done, legacy fields cleared from config.conf" >> "$LOG" 2>/dev/null
+  else
+    echo "$(date) migrate: failed, keep legacy fields for retry" >> "$LOG" 2>/dev/null
+  fi
+  return 0
 }

@@ -123,7 +123,7 @@
 
 ### 已知限制
 
-- **v1.7.6 起热点配置已与系统设置合一**：网页修改的热点名称/密码/频段等经 **Binder Bridge** 调用系统 `setSoftApConfiguration(config, packageName)` 持久化（标准 AOSP 两参签名，运行时枚举兼容 OEM 变体；该接口才真正写入 `WifiApConfigStore`），系统设置页同步可见；系统设置里手动修改同样会反映到 Web。**不使用** `cmd wifi start-softap <参数>`（它只临时启动、不写系统配置），也不直接改写 `WifiConfigStore.xml`（内存配置不会随之更新、会被系统写回覆盖）。热点**开关**走系统 Tethering（`connectivity tether start/stop`，与设置应用同一路径），`cmd wifi` 仅作能力验证后的 OEM fallback。热点开启时保存会重启一次应用新配置；关闭时保存不启动、下次开启生效；写失败时热点保持原状态不掉线。
+- **v1.7.6 起热点配置已与系统设置合一**：网页修改的热点名称/密码/频段等经 **Binder Bridge** 调用系统 `setSoftApConfiguration(config, packageName)` 持久化（标准 AOSP 两参签名，运行时枚举兼容 OEM 变体；该接口才真正写入 `WifiApConfigStore`），系统设置页同步可见；系统设置里手动修改同样会反映到 Web。**不使用** `cmd wifi start-softap <参数>`（它只临时启动、不写系统配置），也不直接改写 `WifiConfigStore.xml`（内存配置不会随之更新、会被系统写回覆盖）。热点**开关**经 Bridge 调用系统 Tethering（`IConnectivityManager.startTethering/stopTethering`，与设置应用同一路径；`cmd connectivity tether` 为 fallback 2，`cmd wifi` 为最后 fallback）。热点开启时保存会重启一次应用新配置；关闭时保存不启动、下次开启生效；写失败时热点保持原状态不掉线。
 - 单 Wi-Fi 硬件不能 STA+AP 并发；普通 Wi-Fi 开启时热点可保持运行，但上游联网是否可共享给客户端取决于 ROM 路由策略（页面有检测提示）。
 - 定时/保活/空闲关闭由模块 watchdog 每 15 秒轮询驱动，误差在 15 秒以内。
 - 流量限额口径为热点客户端转发流量，与运营商账单口径可能有差异，仅供参考。

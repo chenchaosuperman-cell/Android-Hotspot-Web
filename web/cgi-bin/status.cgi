@@ -29,7 +29,6 @@ case "$IP_LINES" in
   *" $STABLE_IP/"*) IP=$STABLE_IP ;;
   *) IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk '{split($4,a,"/"); print a[1]; exit}') ;;
 esac
-SSID=$(b64url_decode "$SSID_B64")
 RUNNING=false
 if [ -n "$IFACE" ] && [ -n "$IP" ] && softap_state_ok "$IFACE" "$IP"; then
   RUNNING=true

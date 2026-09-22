@@ -2,3 +2,4 @@ bin/
 *.zip
 .DS_Store
 dist/
+tools/softap_bridge/classes/

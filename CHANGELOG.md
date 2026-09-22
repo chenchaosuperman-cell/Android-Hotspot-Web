@@ -24,8 +24,17 @@
   - 跨厂商接口名：`action.sh status` / 状态读取统一走 `hotspot_get_state` / `get_hotspot_iface`（bridge tether-state 优先，支持 wlan*/ap0/softap0/swlan0 等），不再写死 wlan[1-9]。
   - 业务层全部 stop 调用统一走 `hotspot_stop`（tether 优先）。
   - 回归测试增至 115 用例（新增 AOSP 常量映射、set 不关热点、写失败保持状态、tether 主路径、probe 驱动降级断言），全部通过。
+- **rc3 — 第四轮修复（用户 6 项要求）**：
+  - **OPEN 网络**：Builder 复制旧配置后显式 `setPassphrase(null, SECURITY_TYPE_OPEN)`（旧实现"不设密码"会保留原 WPA2 安全与密码，WPA2/WPA3 → 开放网络失败）；无 `(String,int)` 签名时降级 `setSecurityType(OPEN)`。
+  - **Bridge 真正接管热点开关**：新增 `tether-start` / `tether-stop` 命令，反射 `IConnectivityManager.startTethering(int, boolean, IOnStartTetheringCallback, int)` / `stopTethering(int)`（回调经 Proxy+Binder 静默接受）；`hotspot_start/stop` 优先走 Bridge 系统 Tethering（与 Android 设置行为一致），`cmd connectivity tether` 降为 fallback 2、`cmd wifi start-softap` 为最后 fallback。
+  - **旧版一次性迁移**：新增 `migrate_legacy_hotspot_config()`（marker 幂等）：启动时读取旧 `SSID_B64/PASS_B64/...` → 经 Framework `setSoftApConfiguration` 持久化 → `save_config` 重写（旧热点字段清除）→ 写 marker；不依赖 `hotspot_start` 传参（修复旧版升级后 Web 读取不到原模块配置的问题）。
+  - **前端 formDirty 双向同步**：`hotspotDirty` 标记 + `sysDirtyHint` 提示条 + `reloadSysCfg()`；未编辑时状态轮询实时同步系统配置，编辑中被外部修改时提示"重新加载系统配置"；保存成功复位。
+  - **hidden/channel/maxClients 全由 Framework capability 驱动**：`softap_hidden_supported`/`valid_channel` 改用 probe 实测（`SoftApCapabilities.getSupportedChannelList` 输出 channels2g/5g/6g JSON，前端动态生成信道列表，无列表仅"自动"）；maxClients 显式写 0（恢复系统默认）。
+  - **保存验证增强**：读回验证增加 password（`password_readable` 能力时强制一致，ROM 遮蔽则记日志跳过）与 maxclients（能力支持时 0 与正数都必须一致）。
+  - **架构修正**：`save_config` 从 control.cgi 移至 common.sh（迁移在 service.sh 启动时调用，此前函数不存在导致迁移后旧字段无法清除）。
+  - 回归测试增至 **124 用例**（bridge tether-start/stop 断言、channels 实测断言、一次性迁移与幂等断言），全部通过。
 
-# # v1.7.5-beta（2026-09-22）稳定性修复版
+# v1.7.5-beta（2026-09-22）稳定性修复版
 
 - **修复代理默认范围错误（P0）**：全新安装默认仅代理热点设备（`PROXY_SCOPE` 默认 `hotspot`），不会再一开启就把手机本机一起加入代理；前端/后端/文档口径统一。旧配置已显式设置 `PROXY_SCOPE` 的保留原值。
 - **修复 MAC 白名单切换残留（P0）**：白名单→黑名单切换时旧 `mifi_acl` 链残留、设备仍被旧白名单阻断的问题。新增统一入口 `apply_mac_policy()`：每次应用前先清理黑名单 DROP 规则与白名单链，再按当前模式重建；守护进程主循环、热点启动异步验证、设备操作均改走该入口。

@@ -138,6 +138,9 @@ check_version_upgrade
 # 升级后首次运行：清理 v1.5.2 及更早版本遗留的无 comment 80 端口规则（只执行一次）
 migrate_port80_once
 migrate_removed_once
+# v1.7.6 一次性迁移：config.conf 中遗留的旧热点字段（SSID_B64/PASS_B64 等）写入系统
+# SoftApConfiguration 后清除（不依赖 hotspot_start 带参路径；成功写 marker，失败下次重试）
+migrate_legacy_hotspot_config
 # 启动时清理上次异常退出可能残留的通知 busy 标记，避免后续通知被静默丢弃
 rm -f "$DATA_DIR/notify.busy" 2>/dev/null
 # P1-55/P1-56：清理可能残留的序号锁/健康写锁（mkdir 原子目录，正常退出自行删除）

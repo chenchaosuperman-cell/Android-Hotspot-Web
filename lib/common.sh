@@ -448,6 +448,80 @@ load_config() {
   PROXY_SCOPE=${PROXY_SCOPE:-hotspot}
 }
 
+save_config() {
+  # P1-73：配置写锁（mkdir 原子），所有修改串行执行，避免并发保存互相覆盖
+  # P1-6(1.5.11)：CFG_TXN=1 表示调用方已在 action 入口持有 config.lock
+  # （覆盖 加锁→load_config→修改→save→解锁 全过程，防止并发请求读旧配置后互相覆盖字段）。
+  HELD=0
+  if [ "${CFG_TXN:-0}" != "1" ]; then
+    lock_acquire "$DATA_DIR/config.lock" || return 1
+    HELD=1
+  fi
+  tmp="$CONFIG.tmp.$$"
+  {
+    # v1.7.6：热点参数（SSID/密码/安全/频段/信道/隐藏/最大连接数）不写入 config.conf，
+    # 唯一数据源为系统 WifiConfigStore.xml（Hotspot Compatibility Layer）。
+    printf 'AUTOSTART=%s\n' "$AUTOSTART"
+    printf 'PORT=%s\n' "$PORT"
+    printf 'KEEPALIVE=%s\n' "${KEEPALIVE:-1}"
+    printf 'IDLE_SHUTDOWN=%s\n' "${IDLE_SHUTDOWN:-0}"
+    printf 'SCHED_ENABLE=%s\n' "${SCHED_ENABLE:-0}"
+    printf 'SCHED_ON=%s\n' "${SCHED_ON:-2300}"
+    printf 'SCHED_OFF=%s\n' "${SCHED_OFF:-0700}"
+    printf 'SCHED_MODE=%s\n' "${SCHED_MODE:-daily}"
+    printf 'SCHED_ON_WD=%s\n' "${SCHED_ON_WD:-2300}"
+    printf 'SCHED_OFF_WD=%s\n' "${SCHED_OFF_WD:-0700}"
+    printf 'SCHED_ON_WE=%s\n' "${SCHED_ON_WE:-2300}"
+    printf 'SCHED_OFF_WE=%s\n' "${SCHED_OFF_WE:-0700}"
+    printf 'BLOCKED_MACS=%s\n' "$BLOCKED_MACS"
+    printf 'MAC_MODE=%s\n' "${MAC_MODE:-blacklist}"
+    printf 'ALLOWED_MACS=%s\n' "${ALLOWED_MACS:-}"
+    printf 'PUSHPLUS_TOKEN_B64=%s\n' "${PUSHPLUS_TOKEN_B64:-}"
+    printf 'DINGTALK_WEBHOOK_B64=%s\n' "${DINGTALK_WEBHOOK_B64:-}"
+    printf 'DINGTALK_SECRET_B64=%s\n' "${DINGTALK_SECRET_B64:-}"
+    printf 'BARK_KEY_B64=%s\n' "${BARK_KEY_B64:-}"
+    printf 'NOTIFY_TRAFFIC_THRESHOLDS=%s\n' "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
+    printf 'NOTIFY_LIMIT=%s\n' "${NOTIFY_LIMIT:-1}"
+    printf 'NOTIFY_HOTSPOT_EVT=%s\n' "${NOTIFY_HOTSPOT_EVT:-1}"
+    printf 'SMS_FWD=%s\n' "${SMS_FWD:-0}"
+    printf 'SMS_FWD_KEYWORD_B64=%s\n' "${SMS_FWD_KEYWORD_B64:-}"
+    printf 'SMS_FWD_SENDERS_B64=%s\n' "${SMS_FWD_SENDERS_B64:-}"
+    printf 'LOWBATT_ENABLE=%s\n' "${LOWBATT_ENABLE:-0}"
+    printf 'LOWBATT_THRESHOLD=%s\n' "${LOWBATT_THRESHOLD:-20}"
+    printf 'DATA_PLAN_MB=%s\n' "${DATA_PLAN_MB:-0}"
+    printf 'DATA_PLAN_DAY=%s\n' "${DATA_PLAN_DAY:-1}"
+    printf 'DATA_LIMIT_ACTION=%s\n' "${DATA_LIMIT_ACTION:-stop}"
+    printf 'PROXY_ENABLE=%s\n' "${PROXY_ENABLE:-0}"
+    printf 'PROXY_SUB_B64=%s\n' "${PROXY_SUB_B64:-}"
+    printf 'PROXY_MODE=%s\n' "${PROXY_MODE:-auto}"
+    printf 'PROXY_BLOCK_QUIC=%s\n' "${PROXY_BLOCK_QUIC:-1}"
+    printf 'PROXY_SELF=%s\n' "${PROXY_SELF:-0}"
+    printf 'PROXY_ROUTE_MODE=%s\n' "${PROXY_ROUTE_MODE:-rule}"
+    printf 'PROXY_SCOPE=%s\n' "${PROXY_SCOPE:-hotspot}"
+    # P0-64：保留内部迁移标记，避免保存配置后升级迁移被重复执行
+    printf 'PORT80_MIGRATED=%s\n' "${PORT80_MIGRATED:-0}"
+    printf 'MIGRATE_REMOVED=%s\n' "${MIGRATE_REMOVED:-0}"
+  } > "$tmp" 2>/dev/null
+  # P1-74：写入失败立即返回错误并保留旧配置
+  if [ ! -s "$tmp" ]; then
+    rm -f "$tmp" 2>/dev/null
+    [ "$HELD" = "1" ] && lock_release "$DATA_DIR/config.lock"
+    return 1
+  fi
+  chmod 0600 "$tmp"
+  if ! mv -f "$tmp" "$CONFIG" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    [ "$HELD" = "1" ] && lock_release "$DATA_DIR/config.lock"
+    return 1
+  fi
+  # P1-145：记录最后保存时间（前端展示“配置最后保存于 …”）
+  /system/bin/date '+%Y-%m-%d %H:%M:%S' > "$DATA_DIR/config.saved" 2>/dev/null || date '+%Y-%m-%d %H:%M:%S' > "$DATA_DIR/config.saved" 2>/dev/null
+  chmod 0600 "$DATA_DIR/config.saved" 2>/dev/null
+  [ "$HELD" = "1" ] && lock_release "$DATA_DIR/config.lock"
+  return 0
+}
+
+
 get_hotspot_iface() {
   if /system/bin/ip -o -4 addr show dev wlan2 2>/dev/null | "$BB" awk -v stable="$STABLE_IP" '$4 !~ "^" stable "/" {found=1} END {exit !found}'; then
     printf 'wlan2'
@@ -537,8 +611,9 @@ valid_hhmm() {
   esac
 }
 
-# 信道白名单：自动=0；2.4G 1/3/6/9/11/13；5G 36/40/44/48/149/153/157/161/165；自动频段只允许 0
-# 校验频段与信道的组合；band=2|5|any, channel=0 表示自动（任何频段均合法）
+# 信道校验（v1.7.6：由设备 SoftApCapability 实测信道列表驱动，不再写死固定列表）
+# channel=0 表示自动（任何频段均合法）；band=any 只允许自动；
+# 有实测列表则校验在列表内；无列表（能力缺失）只校验数字格式，信任前端按能力显示。
 valid_channel() {
   band=$1
   channel=$2
@@ -547,9 +622,20 @@ valid_channel() {
     *[!0-9]*) return 1 ;;
   esac
   case "$band" in
-    2) case "$channel" in 1|3|6|9|11|13) return 0 ;; esac ;;
-    5) case "$channel" in 36|40|44|48|149|153|157|161|165) return 0 ;; esac ;;
-    6) case "$channel" in 0) return 0 ;; esac ;;
+    2|5|6)
+      hotspot_get_capabilities >/dev/null 2>&1
+      LIST=
+      case "$band" in
+        2) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels2g":\[\([0-9,]*\)\].*//p') ;;
+        5) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels5g":\[\([0-9,]*\)\].*//p') ;;
+        6) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels6g":\[\([0-9,]*\)\].*//p') ;;
+      esac
+      if [ -n "$LIST" ]; then
+        case ",$LIST," in *",$channel,"*) return 0 ;; esac
+        return 1
+      fi
+      return 0
+      ;;
     any) return 1 ;;
   esac
   return 1
@@ -767,19 +853,11 @@ sys_softap_status() {
   fi
 }
 
-# 隐藏 SSID 能力检测（软检测，不执行真命令）：cmd wifi help 中 start-softap 是否支持 -h。
-# 仅解析 help 文本；即使误判，启动失败时 run_softap 会自动回滚为广播 SSID。
+# 隐藏 SSID 能力检测（v1.7.6：由 SoftApConfiguration Framework capability 决定，
+# 不再看 cmd wifi -h——系统 Framework 支持 setHiddenSsid 与 shell 命令无关）
 softap_hidden_supported() {
-  local OUT SEG
-  OUT=$("$CMD_WIFI" wifi help 2>/dev/null)
-  case "$OUT" in
-    *'start-softap'*)
-      SEG=${OUT#*start-softap}
-      case "$SEG" in
-        *'-h'*) return 0 ;;
-      esac
-      ;;
-  esac
+  hotspot_get_capabilities >/dev/null 2>&1
+  case "$HOTSPOT_CAPS_JSON" in *'"hiddenSsid":true'*) return 0 ;; esac
   return 1
 }
 

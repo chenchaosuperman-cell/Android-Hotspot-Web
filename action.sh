@@ -85,8 +85,10 @@ case "$cmd" in
     echo "http://127.0.0.1:$PORT"
     ;;
   *)
-    # legacy: no args -> show info + restart
-    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | /system/bin/awk -v s="$STABLE_IP" '$2 ~ /^wlan[1-9][0-9]*$/ && $4 !~ "^"s"/" {print $2; exit}')
+    # legacy: no args -> show info + restart（接口名统一走 compat，跨厂商）
+    . "$MODDIR/lib/common.sh" 2>/dev/null
+    hotspot_get_state 2>/dev/null
+    IFACE=$(get_hotspot_iface)
     IP=""
     [ -n "$IFACE" ] && IP=$(/system/bin/ip -o -4 addr show dev "$IFACE" 2>/dev/null | /system/bin/awk '{split($4,a,"/"); print a[1]; exit}')
     echo "Xiaomi 14 MiFi Web Control"
