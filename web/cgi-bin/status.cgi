@@ -310,18 +310,18 @@ MOD_VERSION=$("$BB" sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | 
 read_device_info
 printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%s,' \
   "$MOD_VERSION" "$(json_escape "$DEVICE_MODEL")" "$(json_escape "$OS_VERSION")" "$RUNNING"
-printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,' \
-  "$(json_escape "$SSID")" "$([ -n "$PASS_B64" ] && echo true || echo false)" "$(json_escape "$SECURITY")" "$(json_escape "$BAND")" "${CHANNEL:-0}" "$([ "${HIDDEN:-0}" = "1" ] && echo true || echo false)"
+printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,"hiddenSupported":%s,' \
+  "$(json_escape "$SSID")" "$([ -n "$PASS_B64" ] && echo true || echo false)" "$(json_escape "$SECURITY")" "$(json_escape "$BAND")" "${CHANNEL:-0}" "$([ "${HIDDEN:-0}" = "1" ] && echo true || echo false)" "$(softap_hidden_supported && echo true || echo false)"
 printf '"maxClients":%s,"keepalive":%s,"idleShutdown":%s,"holdOff":%s,' "${MAX_CLIENTS:-0}" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${HOLD_OFF:-0}" = "1" ] && echo true || echo false)"
-printf '"sched":{"enable":%s,"on":"%s","off":"%s","mode":"%s","onWd":"%s","offWd":"%s","onWe":"%s","offWe":"%s"},"restartDaily":{"enable":%s,"time":"%s"},' \
-  "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${SCHED_ON:-2300}")" "$(json_escape "${SCHED_OFF:-0700}")" "$(json_escape "${SCHED_MODE:-daily}")" "$(json_escape "${SCHED_ON_WD:-2300}")" "$(json_escape "${SCHED_OFF_WD:-0700}")" "$(json_escape "${SCHED_ON_WE:-2300}")" "$(json_escape "${SCHED_OFF_WE:-0700}")" "$([ "${RESTART_DAILY_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${RESTART_DAILY_TIME:-0300}")"
+printf '"sched":{"enable":%s,"on":"%s","off":"%s","mode":"%s","onWd":"%s","offWd":"%s","onWe":"%s","offWe":"%s"},' \
+  "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${SCHED_ON:-2300}")" "$(json_escape "${SCHED_OFF:-0700}")" "$(json_escape "${SCHED_MODE:-daily}")" "$(json_escape "${SCHED_ON_WD:-2300}")" "$(json_escape "${SCHED_OFF_WD:-0700}")" "$(json_escape "${SCHED_ON_WE:-2300}")" "$(json_escape "${SCHED_OFF_WE:-0700}")"
 printf '"autostart":%s,"iface":"%s","ip":"%s","nativeIp":"%s","port":%s,"battery":%s,"charging":%s,' \
   "$([ "$AUTOSTART" = "1" ] && echo true || echo false)" "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$NATIVE_IP")" "$PORT" "$BATTERY" "$CHARGING"
 printf '"desired":%s,"csrf":"%s","operation":{"state":"%s","time":%s,"message":"%s"},' \
   "$([ "$DESIRED" = "1" ] && echo true || echo false)" "$(json_escape "$CSRF")" "$(json_escape "$OP_STATE")" "$OP_TIME" "$(json_escape "$OP_MESSAGE")"
 CFG_SAVED=$("$BB" tr -d '\r\n' < "$DATA_DIR/config.saved" 2>/dev/null)
 printf '"cfgSaved":"%s",' "$(json_escape "$CFG_SAVED")"
-printf '"activeClientCount":%s,"connectedClientCount":%s,"manualOff":%s,' "$(count_online_clients "$IFACE")" "$(count_connected_clients "$IFACE")" "$([ -f "$MANUAL_OFF_FILE" ] && echo true || echo false)"
+printf '"activeClientCount":%s,"connectedClientCount":%s,"manualOff":%s,"tcSupported":%s,' "$(count_online_clients "$IFACE")" "$(count_connected_clients "$IFACE")" "$([ -f "$MANUAL_OFF_FILE" ] && echo true || echo false)" "$([ -n "$(command -v tc 2>/dev/null)" ] && echo true || echo false)"
 printf '"tether":{"fwd":%s,"nat":%s,"hotspotNat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_HOTSPOT_NAT" "$TETHER_PKTS"
 printf '"sys":{"memTotal":%s,"memAvail":%s,"load":"%s","uptime":"%s","storTotal":%s,"storAvail":%s,"thermal":"%s"},' \
   "${SYS_MEM_TOTAL:-0}" "${SYS_MEM_AVAIL:-0}" "$(json_escape "$SYS_LOAD")" "$(json_escape "$SYS_UPTIME")" "${SYS_STOR_TOTAL:-0}" "${SYS_STOR_AVAIL:-0}" "$(json_escape "$SYS_THERMAL")"
@@ -346,15 +346,15 @@ printf '"days":[%s],"history":%s},' "$(build_traffic_days)" "$(build_traffic_his
 printf '"smsFwd":{"on":%s,"keyword":%s,"senders":%s,"keywordText":"%s","sendersText":"%s"},' "$([ "${SMS_FWD:-0}" = "1" ] && echo true || echo false)" "$([ -n "${SMS_FWD_KEYWORD_B64:-}" ] && echo true || echo false)" "$([ -n "${SMS_FWD_SENDERS_B64:-}" ] && echo true || echo false)" "$(json_escape "${SMS_FWD_KEYWORD:-}")" "$(json_escape "${SMS_FWD_SENDERS:-}")"
 printf '"lowbatt":{"enable":%s,"threshold":%s,"level":"%s","power":%s,"latch":"%s","reason":"%s","checked":%s},' "$([ "$LB_EN" = "1" ] && echo true || echo false)" "$LB_TH" "$(json_escape "$LB_LEVEL")" "$LB_POWER" "$(json_escape "$LB_LATCH")" "$(json_escape "$LB_REASON")" "$LB_CHECKED"
 printf '"idleLeft":%s,' "$IDLE_LEFT"
-printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"hotspotEvt":%s,"newDevice":%s,"bark":%s,"sc":%s,"thresholds":"%s"},' \
-  "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_NEW_DEVICE:-0}" = "1" ] && echo true || echo false)" "$([ -n "${BARK_KEY_B64:-}" ] && echo true || echo false)" "$([ -n "${SERVERCHAN_KEY_B64:-}" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
-printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s,"bk":%s,"sc":%s},' \
-  "$(health_json pp)" "$(health_json dt)" "$(health_json sms)" "$(health_json bk)" "$(health_json sc)"
+printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"hotspotEvt":%s,"bark":%s,"thresholds":"%s"},' \
+  "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && echo true || echo false)" "$([ -n "${BARK_KEY_B64:-}" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
+printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s,"bk":%s},' \
+  "$(health_json pp)" "$(health_json dt)" "$(health_json sms)" "$(health_json bk)"
 printf '"proxy":%s,' "$(proxy_status_json "$IFACE")"
   printf '"signal":{"network":"%s","operator":"%s","sim":"%s","band":"%s","pci":%s,"rsrp":%s,"rsrq":%s,"sinr":%s,"level":"%s"},' \
   "$(json_escape "$SIG_NETWORK")" "$(json_escape "$SIG_OPERATOR")" "$(json_escape "$SIG_SIM")" "$(json_escape "$SIG_BAND")" "${SIG_PCI:-0}" "${SIG_RSRP:-0}" "${SIG_RSRQ:-0}" "${SIG_SINR:-0}" "$(json_escape "$SIG_LEVEL")"
 printf '"auto":{"desired":%s,"keepalive":%s,"idleMin":%s,"sched":%s,"stopReason":"%s","limitAction":"%s"},' \
-  "$([ "$DESIRED" = "1" ] && echo true || echo false)" "$([ "${KEEPALIVE:-0}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "$STOP_REASON")" "${DATA_LIMIT_ACTION:-stop}"
+  "$([ "$DESIRED" = "1" ] && echo true || echo false)" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "$STOP_REASON")" "${DATA_LIMIT_ACTION:-stop}"
 printf '"blocked":[%s],' "$(build_blocked)"
 printf '"macMode":"%s","allowedMacs":"%s",' "$(json_escape "${MAC_MODE:-blacklist}")" "$(json_escape "$ALLOWED_MACS")"
 printf '"history":['

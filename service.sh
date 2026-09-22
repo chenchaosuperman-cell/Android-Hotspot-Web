@@ -380,7 +380,7 @@ while true; do
               proxy_self_clear_error
             fi
 
-            if [ "${PROXY_SCOPE:-both}" = "self" ]; then
+            if [ "${PROXY_SCOPE:-hotspot}" = "self" ]; then
               proxy_teardown_hotspot_iptables
               if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_iptables_ok; then
                 proxy_clear_error
@@ -512,7 +512,7 @@ while true; do
     if [ -n "$IFACE" ]; then
       add_management_alias "$IFACE"
       ensure_stats_chain "$IFACE"
-      apply_blacklist "$IFACE"
+      apply_mac_policy "$IFACE"
       ensure_usage_chain "$IFACE"
       apply_rate_limits "$IFACE"
       CLIENTS=$(list_clients "$IFACE")
@@ -619,30 +619,6 @@ while true; do
 
     # 低电量提醒（放电中电量低于阈值时推送一次；同一轮只提醒一次，充电或电量回升后恢复）
     lowbatt_tick
-
-    # 新设备接入通知（首次出现的客户端 MAC 推送 PushPlus/钉钉）
-    check_new_clients
-
-    # 每日定时重启热点：到点（HHMM）且当日未执行过、热点正在运行时执行。
-    # 停止后 DESIRED 保持 1，由 keepalive 自动拉起（短暂间隔避免系统 SoftAP 未释放）。
-    if [ "${RESTART_DAILY_ENABLE:-0}" = "1" ] && [ -n "${RESTART_DAILY_TIME:-}" ] && \
-       [ "$DESIRED" = "1" ] && [ -n "$IFACE" ]; then
-      RD_FILE="$DATA_DIR/restart_daily_date"
-      RD_LAST=$("$BB" cat "$RD_FILE" 2>/dev/null)
-      RD_TODAY=$(/system/bin/date '+%Y%m%d' 2>/dev/null)
-      case "$RD_TODAY" in ''|*[!0-9]*) RD_TODAY=0 ;; esac
-      if [ "$(now_hhmm)" = "$RESTART_DAILY_TIME" ] && [ "$RD_LAST" != "$RD_TODAY" ]; then
-        printf '%s\n' "$RD_TODAY" > "$RD_FILE" 2>/dev/null
-        chmod 0600 "$RD_FILE" 2>/dev/null
-        echo "$(date) daily-restart: 到点重启热点（$RESTART_DAILY_TIME）" >> "$LOG"
-        if stop_hotspot_real; then
-          echo "$(date) daily-restart: 已停止，等待保活自动拉起" >> "$LOG"
-        else
-          echo "$(date) daily-restart: 停止失败，热点可能已关闭" >> "$LOG"
-        fi
-        sleep 10
-      fi
-    fi
 
     # 通知队列周期兜底：失败重试的消息在退避到期后由这里再触发（每 60 秒）
     NOTIFY_TICK=$(( ${NOTIFY_TICK:-0} + 1 ))

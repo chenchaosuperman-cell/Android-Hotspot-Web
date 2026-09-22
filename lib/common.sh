@@ -61,7 +61,6 @@ ensure_web_fw() {
   chmod 0600 "$WEB_FW_PORT_FILE" 2>/dev/null
 }
 NOTIFY_QUEUE="$DATA_DIR/notify.queue"
-KNOWN_DEVICES="$DATA_DIR/known_devices"
 SMS_QUEUE="$DATA_DIR/sms.queue"
 SMS_BUSY="$DATA_DIR/sms.busy"
 NOTIFY_HEALTH_FILE="$DATA_DIR/notify_health"
@@ -252,8 +251,6 @@ cfg_apply_key() {
           case "$value" in 0|1) NOTIFY_LIMIT=$value ;; esac ;;
         NOTIFY_HOTSPOT_EVT)
           case "$value" in 0|1) NOTIFY_HOTSPOT_EVT=$value ;; esac ;;
-        NOTIFY_NEW_DEVICE)
-          case "$value" in 0|1) NOTIFY_NEW_DEVICE=$value ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
           # 逗号分隔 1~100，最多 5 个；非法值忽略（默认 80,90,100）
           _NT_RAW="$value"
@@ -352,12 +349,6 @@ cfg_apply_key() {
             fi
           done
           ALLOWED_MACS=$NEW ;;
-        RESTART_DAILY_ENABLE)
-          case "$value" in 0|1) RESTART_DAILY_ENABLE=$value ;; esac ;;
-        RESTART_DAILY_TIME)
-          case "$value" in ''|*[!0-9]*) : ;;
-            *) [ ${#value} -eq 4 ] && RESTART_DAILY_TIME=$value ;;
-          esac ;;
         PUSHPLUS_TOKEN_B64)
           if [ -z "$value" ]; then PUSHPLUS_TOKEN_B64=
           elif valid_b64url "$value"; then PUSHPLUS_TOKEN_B64=$value
@@ -373,10 +364,6 @@ cfg_apply_key() {
         BARK_KEY_B64)
           if [ -z "$value" ]; then BARK_KEY_B64=
           elif valid_b64url "$value"; then BARK_KEY_B64=$value
-          fi ;;
-        SERVERCHAN_KEY_B64)
-          if [ -z "$value" ]; then SERVERCHAN_KEY_B64=
-          elif valid_b64url "$value"; then SERVERCHAN_KEY_B64=$value
           fi ;;
         SMS_FWD_KEYWORD_B64)
           if [ -z "$value" ]; then SMS_FWD_KEYWORD_B64=
@@ -438,22 +425,17 @@ load_config() {
   BLOCKED_MACS=${BLOCKED_MACS:-}
   MAC_MODE=${MAC_MODE:-blacklist}
   ALLOWED_MACS=${ALLOWED_MACS:-}
-  RESTART_DAILY_ENABLE=${RESTART_DAILY_ENABLE:-0}
-  RESTART_DAILY_TIME=${RESTART_DAILY_TIME:-0300}
   PUSHPLUS_TOKEN_B64=${PUSHPLUS_TOKEN_B64:-}
   DINGTALK_WEBHOOK_B64=${DINGTALK_WEBHOOK_B64:-}
   DINGTALK_SECRET_B64=${DINGTALK_SECRET_B64:-}
   BARK_KEY_B64=${BARK_KEY_B64:-}
-  SERVERCHAN_KEY_B64=${SERVERCHAN_KEY_B64:-}
   NOTIFY_LIMIT=${NOTIFY_LIMIT:-1}
   NOTIFY_HOTSPOT_EVT=${NOTIFY_HOTSPOT_EVT:-1}
-  NOTIFY_NEW_DEVICE=${NOTIFY_NEW_DEVICE:-0}
   NOTIFY_TRAFFIC_THRESHOLDS=${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}
   PUSHPLUS_TOKEN=$(b64url_decode "$PUSHPLUS_TOKEN_B64")
   DINGTALK_WEBHOOK=$(b64url_decode "$DINGTALK_WEBHOOK_B64")
   DINGTALK_SECRET=$(b64url_decode "$DINGTALK_SECRET_B64")
   BARK_KEY=$(b64url_decode "$BARK_KEY_B64")
-  SERVERCHAN_KEY=$(b64url_decode "$SERVERCHAN_KEY_B64")
   SMS_FWD=${SMS_FWD:-0}
   SMS_FWD_KEYWORD_B64=${SMS_FWD_KEYWORD_B64:-}
   SMS_FWD_SENDERS_B64=${SMS_FWD_SENDERS_B64:-}
@@ -465,7 +447,7 @@ load_config() {
   PROXY_BLOCK_QUIC=${PROXY_BLOCK_QUIC:-1}
   PROXY_SELF=${PROXY_SELF:-0}
   PROXY_ROUTE_MODE=${PROXY_ROUTE_MODE:-rule}
-  PROXY_SCOPE=${PROXY_SCOPE:-both}
+  PROXY_SCOPE=${PROXY_SCOPE:-hotspot}
 }
 
 get_hotspot_iface() {
@@ -658,6 +640,22 @@ release_operation_lock() {
   rm -rf "$OP_LOCK"
 }
 
+# 隐藏 SSID 能力检测（软检测，不执行真命令）：cmd wifi help 中 start-softap 是否支持 -h。
+# 仅解析 help 文本；即使误判，启动失败时 run_softap 会自动回滚为广播 SSID。
+softap_hidden_supported() {
+  local OUT SEG
+  OUT=$(/system/bin/cmd wifi help 2>/dev/null)
+  case "$OUT" in
+    *'start-softap'*)
+      SEG=${OUT#*start-softap}
+      case "$SEG" in
+        *'-h'*) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
 run_softap() {
   ssid=$1
   security=$2
@@ -671,11 +669,38 @@ run_softap() {
   # 隐藏 SSID（不广播热点名称）：cmd wifi start-softap 支持 -h 选项
   [ "${HIDDEN:-0}" = "1" ] && EXTRA="$EXTRA -h"
 
+  RC=0
   if [ "$security" = "open" ]; then
     /system/bin/cmd wifi start-softap "$ssid" open -b "$band" $EXTRA
+    RC=$?
   else
     /system/bin/cmd wifi start-softap "$ssid" "$security" "$password" -b "$band" $EXTRA
+    RC=$?
   fi
+  # 隐藏 SSID 启动失败 → 自动回滚为广播 SSID 重试一次（持久化 HIDDEN=0 + 通知）
+  if [ "$RC" -ne 0 ] && [ "${HIDDEN:-0}" = "1" ]; then
+    echo "$(date) start-softap with -h failed rc=$RC, retrying without -h" >> "$LOG"
+    if [ "$security" = "open" ]; then
+      /system/bin/cmd wifi start-softap "$ssid" open -b "$band"
+    else
+      /system/bin/cmd wifi start-softap "$ssid" "$security" "$password" -b "$band"
+    fi
+    RC=$?
+    if [ "$RC" -eq 0 ]; then
+      HIDDEN=0
+      if [ ! -f "$CONFIG" ]; then
+        printf 'HIDDEN=0\n' > "$CONFIG" 2>/dev/null
+        chmod 0600 "$CONFIG" 2>/dev/null
+      elif "$BB" grep -q '^HIDDEN=' "$CONFIG" 2>/dev/null; then
+        "$BB" sed -i 's/^HIDDEN=.*/HIDDEN=0/' "$CONFIG" 2>/dev/null
+      else
+        printf 'HIDDEN=0\n' >> "$CONFIG" 2>/dev/null
+      fi
+      echo "$(date) hidden-ssid unsupported: rolled back to broadcast SSID, HIDDEN=0 persisted" >> "$LOG"
+      [ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && notify_all_async "热点隐藏SSID回滚" "系统不支持隐藏 SSID（cmd wifi 无 -h 支持），已自动回滚为广播名称。如需重试可在热点设置中重新开启。" 2>/dev/null &
+    fi
+  fi
+  return $RC
 }
 
 # ---------- 客户端 MAC 访问策略（黑名单 DROP / 白名单仅放行） ----------
@@ -715,12 +740,12 @@ apply_whitelist() {
   return 0
 }
 
-clear_blacklist() {
+# 清理黑名单模式的 FORWARD/INPUT DROP 规则（对 BLOCKED_MACS 逐条清理，上限 20 防死循环）
+clear_blacklist_rules() {
   iface=$1
   [ -z "$iface" ] && return 0
   for mac in $BLOCKED_MACS; do
     valid_mac "$mac" || continue
-    # P1-45：旧版可能残留多条相同规则，循环删除直到 -C 不再匹配（上限 20 防死循环）
     N=0
     while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
       $IPT -D FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
@@ -733,7 +758,12 @@ clear_blacklist() {
       N=$((N + 1))
     done
   done
-  # 白名单模式链 mifi_acl：先删 FORWARD 跳转，再清链删除
+}
+
+# 清理白名单专用链 mifi_acl：先删 FORWARD 跳转，再清链删除
+clear_mac_acl() {
+  iface=$1
+  [ -z "$iface" ] && return 0
   N=0
   while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -j mifi_acl 2>/dev/null; do
     $IPT -D FORWARD -i "$iface" -j mifi_acl 2>/dev/null
@@ -741,6 +771,29 @@ clear_blacklist() {
   done
   $IPT -F mifi_acl 2>/dev/null || true
   $IPT -X mifi_acl 2>/dev/null || true
+}
+
+# 全量清理（热点停止/接口变化等场景）：黑名单 DROP 规则 + 白名单链
+clear_blacklist() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  clear_blacklist_rules "$iface"
+  clear_mac_acl "$iface"
+}
+
+# 统一应用 MAC 访问策略：先清旧策略残留（黑名单 DROP + 白名单链），再按当前模式重建。
+# 修复 whitelist→blacklist 切换时 mifi_acl 残留导致旧白名单仍生效的问题。
+apply_mac_policy() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  clear_blacklist_rules "$iface"
+  clear_mac_acl "$iface"
+  if [ "${MAC_MODE:-blacklist}" = "whitelist" ]; then
+    apply_whitelist "$iface"
+  else
+    apply_blacklist "$iface"
+  fi
+  return 0
 }
 
 unblock_one_mac() {
@@ -1283,31 +1336,6 @@ verify_softap_config() {
 # ---------- 客户端厂商识别（MAC OUI 前缀表） ----------
 # MAC 前 3 字节（大写，如 "F0:18:98"）→ 厂商名；未收录返回空。
 # 调用前先归一化大写：V=$(printf '%s' "$MAC" | tr 'a-f' 'A-F')
-# ---------- 新设备接入通知 ----------
-# 首次出现的客户端 MAC 记录到 known_devices 并推送（PushPlus/钉钉）。
-# 配置键 NOTIFY_NEW_DEVICE（0/1）；列表按 MAC 持久化，同一设备只通知一次。
-check_new_clients() {
-  [ "${NOTIFY_NEW_DEVICE:-0}" = "1" ] || return 0
-  IFACE_N=$(get_hotspot_iface)
-  [ -n "$IFACE_N" ] || return 0
-  touch "$KNOWN_DEVICES" 2>/dev/null
-  list_clients "$IFACE_N" | while IFS='|' read -r CL_IP CL_MAC CL_ST; do
-    [ -n "$CL_MAC" ] || continue
-    CL_MAC_U=$(printf '%s' "$CL_MAC" | "$BB" tr 'a-f' 'A-F')
-    case "$CL_MAC_U" in ''|00:00:00:00:00:00) continue ;; esac
-    if ! "$BB" grep -qx "$CL_MAC_U" "$KNOWN_DEVICES" 2>/dev/null; then
-      printf '%s\n' "$CL_MAC_U" >> "$KNOWN_DEVICES" 2>/dev/null
-      CL_VENDOR=$(mac_vendor "$CL_MAC_U")
-      notify_all_async "热点新设备接入" "新设备已连接热点：
-IP: ${CL_IP:-未知}
-MAC: $CL_MAC_U${CL_VENDOR:+（$CL_VENDOR）}
-时间: $(/system/bin/date '+%m-%d %H:%M')"
-      echo "$(date) new-device: $CL_MAC_U${CL_VENDOR:+($CL_VENDOR)} ${CL_IP:-?}" >> "$LOG"
-    fi
-  done
-  return 0
-}
-
 mac_vendor() {
   mac=$1
   PREFIX=$(printf '%s' "$mac" | "$BB" cut -d: -f1-3 2>/dev/null)
@@ -2059,37 +2087,6 @@ send_bark() {
   return 1
 }
 
-# 发送 Server酱（微信推送）：POST 到 https://sctapi.ftqq.com/{key}.send
-send_serverchan() {
-  SERVERCHAN_LAST_ERR=
-  [ -n "${SERVERCHAN_KEY:-}" ] || return 2
-  TITLE_ESC=$(json_escape "$1")
-  CONTENT_ESC=$(json_escape_nl "$2")
-  ERR_TMP="$DATA_DIR/.sc_err.$$"
-  R=$(/system/bin/curl -sS -m 8 -X POST "https://sctapi.ftqq.com/$SERVERCHAN_KEY.send" \
-      -H "Content-Type: application/json" \
-      -d "{\"title\":\"$TITLE_ESC\",\"desp\":\"$CONTENT_ESC\"}" 2>"$ERR_TMP")
-  RC=$?
-  CURL_ERR=$("$BB" cat "$ERR_TMP" 2>/dev/null | "$BB" head -c 200)
-  rm -f "$ERR_TMP"
-  if [ "$RC" -ne 0 ]; then
-    SERVERCHAN_LAST_ERR="curl 错误($RC)${CURL_ERR:+: $CURL_ERR}"
-    echo "$(date) serverchan curl failed rc=$RC ${CURL_ERR:+err=$CURL_ERR}" >> "$LOG"
-    health_note sc 1 "$SERVERCHAN_LAST_ERR"
-    return 1
-  fi
-  if printf '%s' "$R" | "$BB" grep -q '"code":0'; then
-    echo "$(date) serverchan ok" >> "$LOG"
-    health_note sc 0 ''
-    return 0
-  fi
-  SERR=$(printf '%s' "$R" | "$BB" head -c 200)
-  SERVERCHAN_LAST_ERR="Server酱 返回: $SERR"
-  echo "$(date) serverchan err: $SERR" >> "$LOG"
-  health_note sc 1 "$SERVERCHAN_LAST_ERR"
-  return 1
-}
-
 # 向所有已配置渠道推送（$1=标题 $2=内容，内容可含真实换行）
 # 返回 0=至少一个渠道成功；1=全部失败（未配置渠道按失败计，但调用方应先判断已配置）
 notify_all() {
@@ -2101,9 +2098,7 @@ notify_all() {
   RC2=$?
   send_bark "$1" "$2"
   RC3=$?
-  send_serverchan "$1" "$2"
-  RC4=$?
-  [ "$RC1" = "0" ] || [ "$RC2" = "0" ] || [ "$RC3" = "0" ] || [ "$RC4" = "0" ]
+  [ "$RC1" = "0" ] || [ "$RC2" = "0" ] || [ "$RC3" = "0" ]
 }
 
 # 通知队列（目录式，一消息一文件）：事件先入队，后台 worker 顺序发送，主守护循环不被 curl 阻塞。
@@ -2247,13 +2242,8 @@ drain_notify_queue() {
       elif [ "$BRC" = "2" ]; then BK=done
       else BK=failed; CHANGED=1; fi
     fi
-    if [ "$SC" = "pending" ] || [ "$SC" = "failed" ]; then
-      SC=pending
-      send_serverchan "$TITLE" "$MSG"; SRC=$?
-      if [ "$SRC" = "0" ]; then SC=done
-      elif [ "$SRC" = "2" ]; then SC=done
-      else SC=failed; CHANGED=1; fi
-    fi
+    # Server酱 已移除：SC 位保留以兼容存量队列文件，直接视为完成
+    SC=done
     if [ "$CHANGED" = "1" ]; then
       RETRY=$((RETRY + 1))
       if [ "$RETRY" -le 3 ]; then
@@ -3696,7 +3686,7 @@ proxy_start() {
     fi
     return 0
   fi
-  if [ "${PROXY_SCOPE:-both}" = "self" ]; then
+  if [ "${PROXY_SCOPE:-hotspot}" = "self" ]; then
     proxy_teardown_hotspot_iptables
     if [ "${PROXY_SELF:-0}" = "1" ] && proxy_self_iptables_ok; then
       proxy_clear_error
@@ -3852,7 +3842,7 @@ proxy_status_json() {
   self_bypass=$(cat "$PROXY_SELF_BYPASS_FILE" 2>/dev/null | "$BB" head -c 16)
   printf '{"enabled":%s,"running":%s,"state":"%s","mode":"%s","routeMode":"%s","scope":"%s","transparentMode":"%s","coreVersion":"%s","interface":"%s","hasSubscription":%s,"apiReady":%s,"providerLoaded":%s,"providerNodeCount":%s,"selfProxy":%s,"selfProxyActive":%s,"selfProxyQuic":%s,"selfProxyBypass":"%s","selfProxyError":"%s","lastError":"%s","errorDetail":"%s"}' \
     "$([ "${PROXY_ENABLE:-0}" = "1" ] && echo true || echo false)" \
-    "$running" "$(json_escape "$state")" "$(json_escape "${PROXY_MODE:-auto}")" "$(json_escape "${PROXY_ROUTE_MODE:-rule}")" "$(json_escape "${PROXY_SCOPE:-both}")" "$transparent" "$PROXY_CORE_VERSION" \
+    "$running" "$(json_escape "$state")" "$(json_escape "${PROXY_MODE:-auto}")" "$(json_escape "${PROXY_ROUTE_MODE:-rule}")" "$(json_escape "${PROXY_SCOPE:-hotspot}")" "$transparent" "$PROXY_CORE_VERSION" \
     "$(json_escape "$iface")" "$has_sub" "$api_ready" "$provider_ready" "$node_count" \
     "$([ "${PROXY_SELF:-0}" = "1" ] && echo true || echo false)" "$self_active" "$self_quic" "$(json_escape "$self_bypass")" "$(json_escape "$self_error")" \
     "$(json_escape "$last_error")" "$(json_escape "$error_detail")"

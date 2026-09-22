@@ -30,7 +30,7 @@ CFG_TXN=0
 # P2(1.5.12)：只读/不写配置的 action（导出、测试通知、读密码、读短信、鉴权）不加锁，
 # 避免测试通知十几秒的网络请求阻塞其它设置保存。
 case "$ACTION" in
-  export_config|test_notify|test_lowbatt|get_password|sms_list|auth_check)
+  export_config|test_notify|test_lowbatt|get_password|sms_list)
     : ;;
   *)
     if lock_acquire "$DATA_DIR/config.lock"; then
@@ -77,17 +77,13 @@ save_config() {
     printf 'BLOCKED_MACS=%s\n' "$BLOCKED_MACS"
     printf 'MAC_MODE=%s\n' "${MAC_MODE:-blacklist}"
     printf 'ALLOWED_MACS=%s\n' "${ALLOWED_MACS:-}"
-    printf 'RESTART_DAILY_ENABLE=%s\n' "${RESTART_DAILY_ENABLE:-0}"
-    printf 'RESTART_DAILY_TIME=%s\n' "${RESTART_DAILY_TIME:-0300}"
     printf 'PUSHPLUS_TOKEN_B64=%s\n' "${PUSHPLUS_TOKEN_B64:-}"
     printf 'DINGTALK_WEBHOOK_B64=%s\n' "${DINGTALK_WEBHOOK_B64:-}"
     printf 'DINGTALK_SECRET_B64=%s\n' "${DINGTALK_SECRET_B64:-}"
     printf 'BARK_KEY_B64=%s\n' "${BARK_KEY_B64:-}"
-    printf 'SERVERCHAN_KEY_B64=%s\n' "${SERVERCHAN_KEY_B64:-}"
     printf 'NOTIFY_TRAFFIC_THRESHOLDS=%s\n' "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
     printf 'NOTIFY_LIMIT=%s\n' "${NOTIFY_LIMIT:-1}"
     printf 'NOTIFY_HOTSPOT_EVT=%s\n' "${NOTIFY_HOTSPOT_EVT:-1}"
-    printf 'NOTIFY_NEW_DEVICE=%s\n' "${NOTIFY_NEW_DEVICE:-0}"
     printf 'SMS_FWD=%s\n' "${SMS_FWD:-0}"
     printf 'SMS_FWD_KEYWORD_B64=%s\n' "${SMS_FWD_KEYWORD_B64:-}"
     printf 'SMS_FWD_SENDERS_B64=%s\n' "${SMS_FWD_SENDERS_B64:-}"
@@ -102,7 +98,7 @@ save_config() {
     printf 'PROXY_BLOCK_QUIC=%s\n' "${PROXY_BLOCK_QUIC:-1}"
     printf 'PROXY_SELF=%s\n' "${PROXY_SELF:-0}"
     printf 'PROXY_ROUTE_MODE=%s\n' "${PROXY_ROUTE_MODE:-rule}"
-    printf 'PROXY_SCOPE=%s\n' "${PROXY_SCOPE:-both}"
+    printf 'PROXY_SCOPE=%s\n' "${PROXY_SCOPE:-hotspot}"
     # P0-64：保留内部迁移标记，避免保存配置后升级迁移被重复执行
     printf 'PORT80_MIGRATED=%s\n' "${PORT80_MIGRATED:-0}"
     printf 'MIGRATE_REMOVED=%s\n' "${MIGRATE_REMOVED:-0}"
@@ -180,7 +176,7 @@ restart_hotspot_async() {
         switch_management_to_hotspot "$VERIFY_IFACE"
         flush_stats_chain
         ensure_stats_chain "$VERIFY_IFACE"
-        apply_blacklist "$VERIFY_IFACE"
+        apply_mac_policy "$VERIFY_IFACE"
         ensure_usage_chain "$VERIFY_IFACE"
         apply_rate_limits "$VERIFY_IFACE"
         rm -f "$STOP_REASON_FILE"
@@ -239,6 +235,10 @@ case "$ACTION" in
     case "$NEW_SECURITY" in open|wpa2|wpa3|wpa3_transition) : ;; *) printf '{"ok":false,"message":"不支持的加密方式"}'; exit 0 ;; esac
     case "$NEW_BAND" in 2|5|any) : ;; *) printf '{"ok":false,"message":"不支持的频段"}'; exit 0 ;; esac
     case "$NEW_HIDDEN" in 0|1) : ;; *) NEW_HIDDEN=0 ;; esac
+    if [ "$NEW_HIDDEN" = "1" ] && ! softap_hidden_supported; then
+      printf '{"ok":false,"message":"当前系统不支持隐藏 SSID（cmd wifi 无 -h 支持），已保持广播模式"}'
+      exit 0
+    fi
     case "$NEW_AUTOSTART" in 0|1) : ;; *) NEW_AUTOSTART=1 ;; esac
     case "$NEW_CHANNEL" in ''|0|any) NEW_CHANNEL=0 ;; *[!0-9]*) printf '{"ok":false,"message":"信道格式错误"}'; exit 0 ;; esac
     valid_channel "$NEW_BAND" "$NEW_CHANNEL" || { printf '{"ok":false,"message":"信道 %s 与频段不匹配（2.4G: 1/3/6/9/11/13；5G: 36/40/44/48/149/153/157/161/165）"}' "$NEW_CHANNEL"; exit 0; }
@@ -542,6 +542,31 @@ case "$ACTION" in
     save_config || { printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
     printf '{"ok":true,"message":"已解除 %s 的禁止上网"}' "$(json_escape "$MAC")"
     ;;
+  toggle_whitelist)
+    # 白名单模式设备按钮：在名单内 → 移出；不在 → 加入。立即应用规则。
+    MAC=$(get_param mac)
+    valid_mac "$MAC" || { printf '{"ok":false,"message":"MAC 地址格式错误"}'; exit 0; }
+    MAC_U=$(printf '%s' "$MAC" | "$BB" tr 'a-f' 'A-F')
+    if printf '%s\n' $ALLOWED_MACS | "$BB" grep -qx "$MAC_U" 2>/dev/null; then
+      ALLOWED_MACS=$(printf '%s' "$ALLOWED_MACS" | "$BB" tr ' ' '\n' | "$BB" grep -v "^$MAC_U$" | "$BB" tr '\n' ' ' | "$BB" sed 's/ *$//')
+      MSG="已移出白名单"
+    else
+      ALLOWED_MACS=$(printf '%s %s' "$ALLOWED_MACS" "$MAC_U" | "$BB" sed 's/^ *//;s/ *$//')
+      MSG="已加入白名单"
+    fi
+    save_config || { printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
+    AP_IFACE=$(get_hotspot_iface)
+    apply_mac_policy "$AP_IFACE" 2>/dev/null
+    printf '{"ok":true,"message":"%s"}' "$(json_escape "$MSG")"
+    ;;
+  clear_whitelist)
+    # 清空白名单属危险操作：清空后所有客户端无法上网（前端已二次确认）
+    AP_IFACE=$(get_hotspot_iface)
+    clear_mac_acl "$AP_IFACE"
+    ALLOWED_MACS=
+    save_config || { printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
+    printf '{"ok":true,"message":"白名单已清空（所有客户端将无法上网）"}'
+    ;;
   clear_blacklist)
     AP_IFACE=$(get_hotspot_iface)
     clear_blacklist "$AP_IFACE"
@@ -569,7 +594,7 @@ case "$ACTION" in
       case "$k" in
         SECURITY) case "$v" in open|wpa2|wpa3|wpa3_transition) return 0 ;; esac ;;
         BAND) case "$v" in 2|5|any) return 0 ;; esac ;;
-        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|NOTIFY_NEW_DEVICE|RESTART_DAILY_ENABLE|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF|HIDDEN)
+        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF|HIDDEN)
           case "$v" in 0|1) return 0 ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
           # 1~5 个逗号分隔的 1~100 整数（如 80,90,100）；v1.7.2：拒绝空段（80,,90 / 80,）
@@ -612,7 +637,7 @@ case "$ACTION" in
     printf '%s\n' "$PLAIN" > "$TMP_CFG"
     # 只允许明确白名单字段（不直接 source 上传内容），逐行读取赋值；
     # 排除含 shell 元字符的任意内容，避免导入任意变量进入运行环境
-    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|HIDDEN|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|MAC_MODE|ALLOWED_MACS|RESTART_DAILY_ENABLE|RESTART_DAILY_TIME|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|BARK_KEY_B64|SERVERCHAN_KEY_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_NEW_DEVICE|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
+    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|HIDDEN|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|MAC_MODE|ALLOWED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|BARK_KEY_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
     "$BB" grep -E "$ALLOWED" "$TMP_CFG" > "$TMP_CFG.clean" 2>/dev/null || true
     if [ ! -s "$TMP_CFG.clean" ]; then
       rm -f "$TMP_CFG" "$TMP_CFG.clean"
@@ -677,13 +702,9 @@ case "$ACTION" in
     NEW_DT_B64=$(get_param dingtalkWebhookB64)
     NEW_DT_SEC=$(get_param dingtalkSecretB64)
     NEW_BK=$(get_param barkKey)
-    NEW_SC=$(get_param serverchanKey)
     NEW_NL=$(get_param notifyLimit)
-    NEW_NND=$(get_param notifyNewDevice)
     NEW_MM=$(get_param macMode)
     NEW_AM=$(get_param allowedMacs)
-    NEW_RDE=$(get_param restartDailyEnable)
-    NEW_RDT=$(get_param restartDailyTime)
     NEW_NHE=$(get_param notifyHotspotEvt)
     NEW_NTT=$(get_param notifyThresholds)
     NEW_SMS_FWD=$(get_param smsFwd)
@@ -782,14 +803,9 @@ case "$ACTION" in
       valid_b64url "$NEW_BK" || { printf '{"ok":false,"message":"Bark Key 格式错误"}'; exit 0; }
       BARK_KEY_B64=$NEW_BK
     fi
-    if [ -n "$NEW_SC" ]; then
-      valid_b64url "$NEW_SC" || { printf '{"ok":false,"message":"Server酱 Key 格式错误"}'; exit 0; }
-      SERVERCHAN_KEY_B64=$NEW_SC
-    fi
     case "$NEW_NL" in 0|1) NOTIFY_LIMIT=$NEW_NL ;; esac
     case "$NEW_AUTOSTART" in 0|1) AUTOSTART=$NEW_AUTOSTART ;; esac
     case "$NEW_NHE" in 0|1) NOTIFY_HOTSPOT_EVT=$NEW_NHE ;; esac
-    case "$NEW_NND" in 0|1) NOTIFY_NEW_DEVICE=$NEW_NND ;; esac
     case "$NEW_MM" in blacklist|whitelist) MAC_MODE=$NEW_MM ;; esac
     if [ -n "$NEW_AM" ]; then
       for _m in $NEW_AM; do
@@ -800,11 +816,6 @@ case "$ACTION" in
     case "$QUERY_STRING" in
       *allowedMacs=*) ALLOWED_MACS=$NEW_AM ;;
     esac
-    case "$NEW_RDE" in 0|1) RESTART_DAILY_ENABLE=$NEW_RDE ;; esac
-    if [ -n "$NEW_RDT" ]; then
-      valid_hhmm "$NEW_RDT" || { printf '{"ok":false,"message":"定时重启时间格式错误（HHMM，00:00–23:59）"}'; exit 0; }
-      RESTART_DAILY_TIME=$NEW_RDT
-    fi
     if [ -n "$NEW_NTT" ]; then
       # v1.7.2：拒绝空段（如 80,,90、80,），与导入校验口径一致
       case "$NEW_NTT" in ,*|*,,*|*,) printf '{"ok":false,"message":"提醒节点格式错误（如 50,80,95）"}'; exit 0 ;; esac
@@ -873,7 +884,6 @@ case "$ACTION" in
       smskw) SMS_FWD_KEYWORD_B64= ;;
       smssd) SMS_FWD_SENDERS_B64= ;;
       bk) BARK_KEY_B64= ;;
-      sc) SERVERCHAN_KEY_B64= ;;
       *) printf '{"ok":false,"message":"未知字段"}'; exit 0 ;;
     esac
     save_config || { printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
@@ -893,11 +903,8 @@ case "$ACTION" in
     send_dingtalk "【测试通知】 $MSG"
     DT_RC=$?
     BARK_LAST_ERR=
-    SERVERCHAN_LAST_ERR=
     send_bark "测试通知" "$MSG"
     BK_RC=$?
-    send_serverchan "测试通知" "$MSG"
-    SC_RC=$?
     case "$PP_RC" in
       0) PP_TXT=成功 ;;
       1) PP_TXT="失败（${PUSHPLUS_LAST_ERR:-未知错误}）" ;;
@@ -913,15 +920,10 @@ case "$ACTION" in
       1) BK_TXT="失败（${BARK_LAST_ERR:-未知错误}）" ;;
       *) BK_TXT=未配置 ;;
     esac
-    case "$SC_RC" in
-      0) SC_TXT=成功 ;;
-      1) SC_TXT="失败（${SERVERCHAN_LAST_ERR:-未知错误}）" ;;
-      *) SC_TXT=未配置 ;;
-    esac
-    if [ "$PP_RC" -eq 0 ] || [ "$DT_RC" -eq 0 ] || [ "$BK_RC" -eq 0 ] || [ "$SC_RC" -eq 0 ]; then
-      printf '{"ok":true,"message":"测试通知: PushPlus %s；钉钉 %s；Bark %s；Server酱 %s"}' "$(json_escape "$PP_TXT")" "$(json_escape "$DT_TXT")" "$(json_escape "$BK_TXT")" "$(json_escape "$SC_TXT")"
+    if [ "$PP_RC" -eq 0 ] || [ "$DT_RC" -eq 0 ] || [ "$BK_RC" -eq 0 ]; then
+      printf '{"ok":true,"message":"测试通知: PushPlus %s；钉钉 %s；Bark %s"}' "$(json_escape "$PP_TXT")" "$(json_escape "$DT_TXT")" "$(json_escape "$BK_TXT")"
     else
-      printf '{"ok":false,"message":"测试通知发送失败: PushPlus %s；钉钉 %s；Bark %s；Server酱 %s"}' "$(json_escape "$PP_TXT")" "$(json_escape "$DT_TXT")" "$(json_escape "$BK_TXT")" "$(json_escape "$SC_TXT")"
+      printf '{"ok":false,"message":"测试通知发送失败: PushPlus %s；钉钉 %s；Bark %s"}' "$(json_escape "$PP_TXT")" "$(json_escape "$DT_TXT")" "$(json_escape "$BK_TXT")"
     fi
     ;;
 
@@ -1168,41 +1170,6 @@ case "$ACTION" in
     ITEMS=$("$BB" paste -sd ',' "$SMS_TMP" 2>/dev/null)
     rm -f "$SMS_TMP"
     printf '{"ok":true,"sms":[%s]}' "$ITEMS"
-    ;;
-  auth_check)
-    # 会话解锁校验：比对 httpd.conf 中当前后台密码
-    # 登录失败锁定：连续 5 次错误锁定 5 分钟（防暴力破解管理页）
-    AUTH_FAIL_FILE="$DATA_DIR/auth_fail"
-    AUTH_FAIL_N=0; AUTH_LOCK_UNTIL=0
-    if [ -r "$AUTH_FAIL_FILE" ]; then
-      read -r AUTH_FAIL_N AUTH_LOCK_UNTIL < "$AUTH_FAIL_FILE" 2>/dev/null
-    fi
-    case "$AUTH_FAIL_N" in ''|*[!0-9]*) AUTH_FAIL_N=0 ;; esac
-    case "$AUTH_LOCK_UNTIL" in ''|*[!0-9]*) AUTH_LOCK_UNTIL=0 ;; esac
-    NOW_S=$($DATE_CMD +%s 2>/dev/null || date +%s)
-    if [ "$AUTH_LOCK_UNTIL" -gt "$NOW_S" ]; then
-      printf '{"ok":false,"message":"尝试次数过多，已锁定 %s 秒，请稍后再试"}' "$((AUTH_LOCK_UNTIL-NOW_S))"
-      exit 0
-    fi
-    NEW_PASS_B64=$(get_param password)
-    valid_b64url "$NEW_PASS_B64" || { printf '{"ok":false,"message":"密码格式错误"}'; exit 0; }
-    NEW_PASS=$(b64url_decode "$NEW_PASS_B64")
-    CUR_PASS=$(read_admin_password)
-    if [ -n "$CUR_PASS" ] && [ "$NEW_PASS" = "$CUR_PASS" ]; then
-      printf '0 0\n' > "$AUTH_FAIL_FILE" 2>/dev/null
-      printf '{"ok":true,"message":"密码正确"}'
-    else
-      AUTH_FAIL_N=$((AUTH_FAIL_N + 1))
-      if [ "$AUTH_FAIL_N" -ge 5 ]; then
-        AUTH_FAIL_N=0
-        AUTH_LOCK_UNTIL=$((NOW_S + 300))
-        printf '0 %s\n' "$AUTH_LOCK_UNTIL" > "$AUTH_FAIL_FILE" 2>/dev/null
-        printf '{"ok":false,"message":"密码错误次数过多，已锁定 5 分钟"}'
-      else
-        printf '%s 0\n' "$AUTH_FAIL_N" > "$AUTH_FAIL_FILE" 2>/dev/null
-        printf '{"ok":false,"message":"密码错误（剩余 %s 次尝试机会）"}' "$((5-AUTH_FAIL_N))"
-      fi
-    fi
     ;;
   *)
     printf '{"ok":false,"message":"未知操作"}'

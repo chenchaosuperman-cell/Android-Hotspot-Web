@@ -11,8 +11,7 @@ ui_print " Root Android Hotspot Manager"
 ui_print "*******************************"
 ui_print "Default Wi-Fi password: 87654321"
 ui_print "Web port: 8080"
-ui_print "Web login: admin / admin"
-ui_print "IMPORTANT: change the Web password after first login."
+ui_print "Web login: admin / admin（登录后可修改）"
 
 # 模块目录去重自检：安装/更新时清理与当前模块同 id 的“非标准目录”残留副本
 # （标准目录 = /data/adb/modules/<id>，KernelSU 规范要求目录名必须等于 MODID）。
@@ -39,17 +38,21 @@ if [ -n "$MOD_ID" ]; then
   done
 fi
 
-# 首次安装生成随机后台管理密码（升级保留用户已有 httpd.conf 密码，不覆盖）。
-# 密码写入模块目录 .admin_pwd，由 service.sh 首次创建 httpd.conf 时读取并删除。
-if [ ! -f "$MODPATH/.admin_pwd" ]; then
-  GEN_PWD=$(od -An -N9 -tx1 /dev/urandom 2>/dev/null | tr -d ' \r\n' | cut -c1-12)
-  case "$GEN_PWD" in ''|*[!A-Za-z0-9._@!-]*) GEN_PWD= ;; esac
-  if [ -n "$GEN_PWD" ]; then
-    printf '%s\n' "$GEN_PWD" > "$MODPATH/.admin_pwd"
-    chmod 0600 "$MODPATH/.admin_pwd"
-    ui_print "  ** 本次安装生成的后台管理密码：$GEN_PWD"
-    ui_print "  ** 请立即保存；登录后可在 设置 → 修改后台密码 中更换"
-  fi
+# 后台密码：统一默认 admin/admin，登录后可在 设置 → 修改后台密码 中更换。
+# 覆盖升级：旧 httpd.conf 已存在，沿用旧密码，不覆盖；
+#           同时清理旧版本随机密码机制可能残留的 .admin_pwd，避免 service.sh 误用。
+OLD_HTTP_CONF=/data/adb/xiaomi14_mifi_web/httpd.conf
+if [ -s "$OLD_HTTP_CONF" ]; then
+  rm -f "$MODPATH/.admin_pwd"
+  ui_print "- 检测到覆盖升级"
+  ui_print "- 后台用户名：admin"
+  ui_print "- 后台密码：沿用旧版密码"
+else
+  rm -f "$MODPATH/.admin_pwd"
+  ui_print "- 全新安装"
+  ui_print "- 后台用户名：admin"
+  ui_print "- 后台初始密码：admin"
+  ui_print "- 登录后可在 设置 → 修改后台密码 中更换"
 fi
 
 # Download Mihomo core if not bundled（供应链加固 v1.7.1）：
