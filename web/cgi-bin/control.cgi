@@ -144,13 +144,13 @@ restart_hotspot_async() {
     trap 'release_operation_lock' EXIT
     sleep 2
     load_config
-    SSID=$(b64url_decode "$SSID_B64")
-    PASS=$(b64url_decode "$PASS_B64")
+    # v1.7.6：系统 SoftApConfiguration 为唯一数据源，run_softap 无参启动
+    # （config.conf 残留旧热点字段时，run_softap 内部自动迁移到系统后清除）
     STOP_OUT=$("$BB" timeout 10 "$CMD_WIFI" wifi stop-softap 2>&1)
     printf '%s stop-softap\n%s\n' "$(date)" "$STOP_OUT" >> "$LOG"
     sleep 1
     # Keep loopback management address until hotspot is ready
-    OUT=$(run_softap "$SSID" "$SECURITY" "$PASS" "$BAND" "$CHANNEL" "$MAX_CLIENTS" 2>&1)
+    OUT=$(run_softap 2>&1)
     RC=$?
     printf '%s\n' "$OUT" >> "$LOG"
     VERIFY_IFACE=
@@ -244,8 +244,9 @@ case "$ACTION" in
     if [ -n "$NEW_PASS_B64" ]; then
       NEW_PASS=$(b64url_decode "$NEW_PASS_B64")
     else
-      NEW_PASS_B64=$PASS_B64
-      NEW_PASS=$(b64url_decode "$PASS_B64")
+      # v1.7.6：密码留空 = 沿用系统当前密码（唯一数据源）
+      hotspot_get_config
+      NEW_PASS=$sys_password
     fi
     SSID_LEN=$(printf '%s' "$NEW_SSID" | "$BB" wc -c | "$BB" tr -d ' ')
     PASS_LEN=$(printf '%s' "$NEW_PASS" | "$BB" wc -c | "$BB" tr -d ' ')
@@ -268,19 +269,8 @@ case "$ACTION" in
       exit 0
     fi
 
-    SSID_B64=$NEW_SSID_B64
-    # P1-8：开放网络清空已保存密码，避免状态误报“已设置密码”或回显旧密码
-    if [ "$NEW_SECURITY" = "open" ]; then
-      PASS_B64=
-    else
-      PASS_B64=$NEW_PASS_B64
-    fi
-    SECURITY=$NEW_SECURITY
-    BAND=$NEW_BAND
-    HIDDEN=$NEW_HIDDEN
+    # v1.7.6：热点参数经 hotspot_set_config 写入系统，不再写入模块 config.conf
     AUTOSTART=$NEW_AUTOSTART
-    CHANNEL=$NEW_CHANNEL
-    MAX_CLIENTS=$NEW_MAX
     # 手动开启：解除本次开机手动关闭，恢复自动策略
     rm -f "$MANUAL_OFF_FILE" 2>/dev/null
     HOLD_OFF=0
@@ -290,7 +280,7 @@ case "$ACTION" in
     # P1-4(1.5.12)：记录备份时配置指纹，异步回滚前对比——期间用户若又改过配置则不回滚
     "$BB" md5sum "$CONFIG" 2>/dev/null | "$BB" cut -d' ' -f1 > "$CONFIG.bak.md5" 2>/dev/null
     save_config || { release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"; printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
-    # 一套配置：经 Hotspot Compatibility Layer 写入系统 WifiConfigStore.xml（系统设置 ↔ Web 共用一份）
+    # 一套配置：经 Hotspot Compatibility Layer 调 Framework setSoftApConfiguration 持久化（系统设置 ↔ Web 共用一份）
     if ! hotspot_set_config "$NEW_SSID" "$NEW_SECURITY" "$NEW_PASS" "$NEW_BAND" "$NEW_CHANNEL" "$NEW_HIDDEN" "$NEW_MAX"; then
       release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"
       printf '{"ok":false,"message":"系统热点配置写入失败（系统 API 未接受），已还原模块配置"}'; exit 0
@@ -592,9 +582,7 @@ case "$ACTION" in
     check_import_value() {
       k=$1; v=$2
       case "$k" in
-        SECURITY) case "$v" in open|wpa2|wpa3|wpa3_transition) return 0 ;; esac ;;
-        BAND) case "$v" in 2|5|any) return 0 ;; esac ;;
-        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF|HIDDEN)
+        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF)
           case "$v" in 0|1) return 0 ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
           # 1~5 个逗号分隔的 1~100 整数（如 80,90,100）；v1.7.2：拒绝空段（80,,90 / 80,）
@@ -612,8 +600,6 @@ case "$ACTION" in
         PROXY_ROUTE_MODE) case "$v" in rule|global) return 0 ;; esac ;;
         PROXY_SCOPE) case "$v" in hotspot|self|both) return 0 ;; esac ;;
         PORT) case "$v" in ''|*[!0-9]*) : ;; *) [ "$v" -ge 1024 ] && [ "$v" -le 65535 ] && return 0 ;; esac ;;
-        CHANNEL) case "$v" in ''|*[!0-9]*) : ;; *) return 0 ;; esac ;;
-        MAX_CLIENTS) valid_max_clients "$v" && return 0 ;;
         IDLE_SHUTDOWN) valid_idle "$v" && return 0 ;;
         DATA_LIMIT_MB) valid_data_limit "$v" && return 0 ;;
         SCHED_ON|SCHED_OFF|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE) valid_hhmm "$v" && return 0 ;;
@@ -637,7 +623,7 @@ case "$ACTION" in
     printf '%s\n' "$PLAIN" > "$TMP_CFG"
     # 只允许明确白名单字段（不直接 source 上传内容），逐行读取赋值；
     # 排除含 shell 元字符的任意内容，避免导入任意变量进入运行环境
-    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|HIDDEN|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|MAC_MODE|ALLOWED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|BARK_KEY_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
+    ALLOWED='^(AUTOSTART|PORT|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|MAC_MODE|ALLOWED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|BARK_KEY_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
     "$BB" grep -E "$ALLOWED" "$TMP_CFG" > "$TMP_CFG.clean" 2>/dev/null || true
     if [ ! -s "$TMP_CFG.clean" ]; then
       rm -f "$TMP_CFG" "$TMP_CFG.clean"
@@ -660,26 +646,14 @@ case "$ACTION" in
         INVALID_FIELDS="$INVALID_FIELDS $CFG_KEY"
       fi
     done < "$TMP_CFG"
-    case "$SSID_B64" in '') rm -f "$TMP_CFG"; printf '{"ok":false,"message":"配置缺少 SSID"}'; exit 0 ;; esac
-    valid_b64url "$SSID_B64" || { rm -f "$TMP_CFG"; printf '{"ok":false,"message":"配置中 SSID 无效"}'; exit 0; }
-    case "$PASS_B64" in '') : ;; *) valid_b64url "$PASS_B64" || { rm -f "$TMP_CFG"; printf '{"ok":false,"message":"配置中密码无效"}'; exit 0; } ;; esac
-    # P1-67/68：跨字段组合校验（导入信道时必须与导入后的频段匹配；任意数字不再放行）
-    case "${CHANNEL:-0}" in
-      ''|0|any) : ;;
-      *)
-        if ! valid_channel "$BAND" "$CHANNEL"; then
-          rm -f "$TMP_CFG"
-          printf '{"ok":false,"message":"配置中信道 %s 与频段 %s 不匹配（2.4G:1/3/6/9/11/13；5G:36/40/44/48/149/153/157/161/165；自动频段仅支持自动信道）"}' "$CHANNEL" "$BAND"
-          exit 0
-        fi ;;
-    esac
-    # P1-71：导入为“合并”语义（未提供字段沿用当前配置），文案明确说明
+    # v1.7.6：热点参数（SSID/密码/频段/信道等）属系统 SoftApConfiguration，导入不涉及；
+    # 导入为“合并”语义（未提供字段沿用当前配置），文案明确说明
     save_config || { rm -f "$TMP_CFG"; printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间"}'; exit 0; }
     rm -f "$TMP_CFG"
     if [ -n "$INVALID_FIELDS" ]; then
       printf '{"ok":true,"message":"配置已合并导入并保存；以下字段无效已按旧值保留：%s"}' "$(printf '%s' "$INVALID_FIELDS" | "$BB" sed 's/^ //')"
     else
-      printf '{"ok":true,"message":"配置已合并导入并保存；热点名称、密码、频段、信道等参数将在下次重启热点时生效"}'
+      printf '{"ok":true,"message":"配置已合并导入并保存"}'
     fi
     ;;
   set_settings)
@@ -961,11 +935,13 @@ case "$ACTION" in
 
   get_password)
     # 仅在登录 + CSRF 校验通过后返回热点密码明文（状态接口不回传密码）
-    if [ -z "$PASS_B64" ]; then
+    # v1.7.6：密码属系统 SoftApConfiguration，从系统读取（唯一数据源）
+    hotspot_get_config
+    if [ "$sys_ok" != "1" ] || [ -z "$sys_password" ]; then
       printf '{"ok":true,"password":"","message":"开放网络无密码"}'
       exit 0
     fi
-    printf '{"ok":true,"password":"%s","message":"当前密码已显示（8秒后自动隐藏）"}' "$(json_escape "$(b64url_decode "$PASS_B64")")"
+    printf '{"ok":true,"password":"%s","message":"当前密码已显示（8秒后自动隐藏）"}' "$(json_escape "$sys_password")"
     ;;
   kick)
     MAC=$(get_param mac)

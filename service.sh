@@ -59,14 +59,10 @@ fi
 
 if [ ! -f "$CONFIG" ]; then
   cat > "$CONFIG" <<'EOF'
-SSID_B64=WGlhb21pMTQtTWlGaQ
-PASS_B64=ODc2NTQzMjE
-SECURITY=wpa2
-BAND=2
+# v1.7.6：热点参数（SSID/密码/安全/频段/信道/隐藏/最大连接数）不存于此，
+# 唯一数据源为系统 SoftApConfiguration（Hotspot Compatibility Layer）。
 AUTOSTART=1
 PORT=8080
-CHANNEL=0
-MAX_CLIENTS=0
 KEEPALIVE=1
 IDLE_SHUTDOWN=0
 SCHED_ENABLE=0
@@ -151,8 +147,8 @@ rm -rf "$NOTIFY_HEALTH_LOCK" 2>/dev/null
 # 定时多组：按模式返回生效的开/关时间（HHMM）。
 start_hotspot() {
   load_config
-  SSID=$(b64url_decode "$SSID_B64")
-  PASS=$(b64url_decode "$PASS_B64")
+  # 无参启动：系统 SoftApConfiguration 为唯一数据源（模块不再持有热点参数；
+  # 若 config.conf 仍残留旧热点字段，run_softap 内部会自动迁移一次并清除）
   # Do not redirect cmd's file descriptors directly to /data/adb. On this
   # HyperOS build, WifiShellCommand can fail its Binder transaction when the
   # remote service receives such an FD. Capture through an anonymous pipe and
@@ -161,18 +157,22 @@ start_hotspot() {
   STOP_RC=$?
   printf '%s stop-softap rc=%s\n%s\n' "$(date)" "$STOP_RC" "$STOP_OUT" >> "$LOG"
   sleep 1
-  START_OUT=$(run_softap "$SSID" "$SECURITY" "$PASS" "$BAND" "$CHANNEL" "$MAX_CLIENTS" 2>&1)
+  START_OUT=$(run_softap 2>&1)
   START_RC=$?
   printf '%s start-softap rc=%s\n%s\n' "$(date)" "$START_RC" "$START_OUT" >> "$LOG"
   if [ "$START_RC" -eq 0 ]; then
     AP_IFACE=$(get_hotspot_iface)
     # 综合验证（P1-13）：接口 + IP + 系统 SoftAP 状态
-    # P1-8(1.5.11)：再尽力核验实际 SSID/安全/频段/信道；返回 2=明确不匹配 → 日志告警（不回滚）
+    # P1-8(1.5.11)：核验实际 SSID/安全/频段/信道；期望值 = 系统持久配置（Framework 优先）
     if [ -n "$AP_IFACE" ] && softap_state_ok "$AP_IFACE"; then
-      verify_softap_config "$SSID" "$SECURITY" "$BAND" "$CHANNEL"
-      VRC=$?
-      if [ "$VRC" = "2" ]; then
-        echo "$(date) start-softap: SoftAP 参数核验不匹配（期望 ssid=$SSID band=$BAND ch=$CHANNEL，系统返回 ssid=$SNAP_AP_SSID band=$SNAP_AP_BAND ch=$SNAP_AP_CHANNEL），请人工确认实际生效配置" >> "$LOG"
+      hotspot_get_config
+      WANT_SSID=$sys_ssid; WANT_SEC=$sys_security; WANT_BAND=$sys_band; WANT_CH=$sys_channel
+      if [ -n "$WANT_SSID" ]; then
+        verify_softap_config "$WANT_SSID" "$WANT_SEC" "$WANT_BAND" "$WANT_CH"
+        VRC=$?
+        if [ "$VRC" = "2" ]; then
+          echo "$(date) start-softap: SoftAP 参数核验不匹配（期望 ssid=$WANT_SSID band=$WANT_BAND ch=$WANT_CH，系统返回 ssid=$SNAP_AP_SSID band=$SNAP_AP_BAND ch=$SNAP_AP_CHANNEL），请人工确认实际生效配置" >> "$LOG"
+        fi
       fi
       add_management_alias "$AP_IFACE"
       flush_stats_chain
@@ -191,10 +191,14 @@ start_hotspot() {
     sleep 3
     AP_IFACE=$(get_hotspot_iface)
     if [ -n "$AP_IFACE" ] && softap_state_ok "$AP_IFACE"; then
-      verify_softap_config "$SSID" "$SECURITY" "$BAND" "$CHANNEL"
-      VRC=$?
-      if [ "$VRC" = "2" ]; then
-        echo "$(date) start-softap: SoftAP 参数核验不匹配（期望 ssid=$SSID band=$BAND ch=$CHANNEL，系统返回 ssid=$SNAP_AP_SSID band=$SNAP_AP_BAND ch=$SNAP_AP_CHANNEL），请人工确认实际生效配置" >> "$LOG"
+      hotspot_get_config
+      WANT_SSID=$sys_ssid; WANT_SEC=$sys_security; WANT_BAND=$sys_band; WANT_CH=$sys_channel
+      if [ -n "$WANT_SSID" ]; then
+        verify_softap_config "$WANT_SSID" "$WANT_SEC" "$WANT_BAND" "$WANT_CH"
+        VRC=$?
+        if [ "$VRC" = "2" ]; then
+          echo "$(date) start-softap: SoftAP 参数核验不匹配（期望 ssid=$WANT_SSID band=$WANT_BAND ch=$WANT_CH，系统返回 ssid=$SNAP_AP_SSID band=$SNAP_AP_BAND ch=$SNAP_AP_CHANNEL），请人工确认实际生效配置" >> "$LOG"
+        fi
       fi
       add_management_alias "$AP_IFACE"
       flush_stats_chain

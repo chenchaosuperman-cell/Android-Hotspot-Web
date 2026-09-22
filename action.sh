@@ -40,18 +40,16 @@ case "$cmd" in
       start)
         rm -f "$MANUAL_OFF_FILE" 2>/dev/null
         echo 1 > "$DESIRED_FILE" && chmod 0600 "$DESIRED_FILE"
-        # v1.7.1：与 Web 后台一致，按模块保存的 SSID/密码/频段/信道/最大客户端参数启动
+        # v1.7.6：系统 SoftApConfiguration 为唯一数据源，无参启动（与系统设置行为一致）
         . "$MODDIR/lib/common.sh" 2>/dev/null
         load_config
-        SSID=$(b64url_decode "$SSID_B64")
-        PASS=$(b64url_decode "$PASS_B64")
-        run_softap "$SSID" "$SECURITY" "$PASS" "$BAND" "$CHANNEL" "$MAX_CLIENTS" >/dev/null 2>&1
-        echo "hotspot start requested with saved config"
+        run_softap >/dev/null 2>&1
+        echo "hotspot start requested with system config"
         ;;
       stop)
         echo 1 > "$MANUAL_OFF_FILE" && chmod 0600 "$MANUAL_OFF_FILE"
         echo 0 > "$DESIRED_FILE" && chmod 0600 "$DESIRED_FILE"
-        /system/bin/cmd wifi stop-softap >/dev/null 2>&1
+        "$CMD_WIFI" wifi stop-softap >/dev/null 2>&1
         echo "hotspot stop requested (manual-off this boot)"
         ;;
       *) echo "usage: action.sh hotspot start|stop"; exit 1 ;;

@@ -1,20 +1,19 @@
-# v1.7.6-beta（2026-09-22）一套配置 + 通用兼容层
+# v1.7.6-beta（2026-09-22）一套配置 + 系统 Framework 持久化
 
-> 架构升级：热点配置不再维护「模块一份 + 系统一份」，改为**系统设置与 Web 共用一份**（系统 `WifiConfigStore.xml` 为唯一数据源）；新增 **Hotspot Compatibility Layer**，为跨 Android 版本 / 厂商 ROM 做准备。
+> 架构升级：热点配置不再维护「模块一份 + 系统一份」，改为**系统 SoftApConfiguration 为唯一数据源**，系统设置与 Web 双向同步；新增 **Hotspot Compatibility Layer** 与 **Binder Bridge**，写入一律走 Android Wi-Fi Framework 真实持久化接口。
 
-- **一套配置（消除两套）**：Web 后台「热点设置」读写系统 `WifiConfigStore.xml` 的 `<SoftAp>` 段（`/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml`）。
+- **一套配置（消除两套）**：Web 后台「热点设置」与手机系统设置共用同一份 Android 持久 SoftApConfiguration。
   - 系统设置里改热点 → Web 状态/设置页刷新即同步；
-  - Web 里保存 → 写入系统存储（备份→重建 SoftAp 段→回读校验→原子替换→恢复属主/权限/SELinux 上下文），热点开着时立即重启应用，关着时下次启动生效；
-  - 热点启动改为以系统配置为准（不再用模块参数临时覆盖）。
-  - 旧版已保存的热点参数在首次启动时自动迁移进系统存储；此后 `config.conf` 不再保存 SSID/密码/安全类型/频段/信道/隐藏/最大连接数（这些属于 Android，不属于模块）。
-- **Hotspot Compatibility Layer（`lib/compat.sh`）**：不针对具体机型/ROM/Android 版本写死，运行时能力检测。
-  - 统一接口：`hotspot_get_capabilities / get_config / set_config / get_state / start / stop / restart`；
-  - 能力清单 JSON：Android API、cmd wifi 启停、系统配置读写、2.4/5/6 GHz、隐藏 SSID、信道控制、最大连接数、同步级别（A 双向同步 / B 只读 / C 仅开关状态）；
-  - 启动 Backend 自动选择：`cmd wifi start-softap` 可用 → 主路径；不可用（旧系统）→ `cmd connectivity tether start` 降级；
-  - 前端按能力动态显示：设备不支持 6 GHz / 隐藏 SSID / 固定信道 / 最大连接数时，对应选项自动隐藏或禁用，不再出现「按钮能点、底层报错」。
-- **新增 6 GHz 频段**：频段下拉支持 6 GHz（仅自动信道；`valid_channel` 对 6G 只允许 0）。
-- **README 口径修正**：不再承诺「支持所有安卓手机」，改为「通用兼容架构 + 按设备能力自动降级」，公布已验证机型（Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU）。
-- **回归测试扩充**：新增系统 SoftAp 解析/写入/新增段/open 网络/新版标签、能力检测 JSON、统一接口可用性断言（57 → 87 用例全部通过）。
+  - Web 里保存 → **走 Framework `setSoftApConfiguration()`（→ `WifiApConfigStore.setApConfiguration()` 系统持久化）**，热点开着时立即重启应用、关着时仅保存；启动一律无参（系统 tethering 用已保存配置，与系统设置开启行为一致）；
+  - 旧版 `config.conf` 中残留的热点参数在首次启动时自动迁移进系统（经同一 Framework 路径），此后不再保存。
+- **Binder Bridge（`lib/softap_bridge.dex`，`tools/softap_bridge/SoftApBridge.java`）**：root 下经 `app_process` 调用 `IWifiManager.get/setSoftApConfiguration()`，即 Android 设置应用同一套持久化 API。
+  - 为什么不用 `cmd wifi start-softap <参数>`：AOSP 中该命令只构造临时 SoftApConfiguration 调 `startTetheredHotspot()` 启动，**不写系统持久配置**（设置页不变化、重启丢失）；
+  - 明确禁止直接改写 `WifiConfigStore.xml`：内存中配置不会因改文件而更新，随后会被系统写回覆盖；
+  - API 30+ 使用 SoftApConfiguration；API < 30 输出明确降级（读走 XML 只读 fallback、写拒绝并提示 Level B/C）。
+- **Hotspot Compatibility Layer（`lib/compat.sh`）**：统一 7 接口 `hotspot_get_capabilities / get_config / set_config / get_state / start / stop / restart`；运行时能力检测输出 JSON（Android API、cmd wifi 启停、2.4/5/6 GHz、隐藏 SSID、信道、最大连接数、同步级别 A/B/C），前端按能力动态显示，不再出现「按钮能点、底层报错」。
+- **残留清理**：`service.sh` 全新生成配置、`start_hotspot()`、`action.sh hotspot start`、`control.cgi` 配置导入导出与密码读取全部移除对 `SSID_B64/PASS_B64/SECURITY/BAND/CHANNEL/HIDDEN/MAX_CLIENTS` 的依赖（仅在升级迁移时由 `cfg_apply_key` 读取一次）；`get_password` 改从系统读。
+- **新增 6 GHz 频段**；README 口径改为「通用兼容架构 + 按设备能力自动降级」，公布已验证机型（Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU）。
+- **回归测试**：重写为 Binder Bridge mock（模拟 Framework 持久化闭环：Web 改 → 系统配置变 → 重启/关开仍一致），新增迁移、留空密码沿用系统密码、open 网络、caps 降级断言（87 → 92 用例全部通过）。
 
 # # v1.7.5-beta（2026-09-22）稳定性修复版
 

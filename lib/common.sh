@@ -785,7 +785,17 @@ run_softap() {
   # 迁移：系统从未配置热点（XML 无 SoftAp 段）且模块携带有旧参数（首次安装/旧版升级）
   # 时，先带参启动一次（系统 API 持久化）完成迁移，之后一律以系统配置为准。
   NEW_SSID_ARG=$1; NEW_SEC_ARG=$2; NEW_PASS_ARG=$3; NEW_BAND_ARG=$4; NEW_CHANNEL_ARG=$5; NEW_MAX_ARG=$6
-  if [ -n "$NEW_SSID_ARG" ] && ! sys_softap_present; then
+  # 无显式参数但模块 config.conf 仍残留旧热点字段（旧版升级）→ 用旧值完成迁移
+  if [ -z "$NEW_SSID_ARG" ] && [ -n "${SSID_B64:-}" ] && ! hotspot_config_present; then
+    NEW_SSID_ARG=$(b64url_decode "$SSID_B64")
+    NEW_SEC_ARG=${SECURITY:-wpa2}
+    NEW_PASS_ARG=$(b64url_decode "${PASS_B64:-}")
+    NEW_BAND_ARG=${BAND:-any}
+    NEW_CHANNEL_ARG=${CHANNEL:-0}
+    NEW_MAX_ARG=${MAX_CLIENTS:-0}
+    HIDDEN=${HIDDEN:-0}
+  fi
+  if [ -n "$NEW_SSID_ARG" ] && ! hotspot_config_present; then
     echo "$(date) run_softap: migrating module hotspot config to system SoftApConfiguration" >> "$LOG" 2>/dev/null
     hotspot_set_config "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" "$NEW_BAND_ARG" "$NEW_CHANNEL_ARG" "${HIDDEN:-0}" "$NEW_MAX_ARG" || {
       echo "$(date) run_softap: migration failed, falling back to direct start" >> "$LOG" 2>/dev/null
@@ -819,11 +829,7 @@ run_softap() {
   return $RC
 }
 
-# 系统是否已存在 SoftAp 配置（XML 只读探测）
-sys_softap_present() {
-  sys_softap_get
-  [ "$sys_ok" = "1" ] && [ -n "$sys_ssid" ]
-}
+
 
 # ---------- 客户端 MAC 访问策略（黑名单 DROP / 白名单仅放行） ----------
 apply_blacklist() {

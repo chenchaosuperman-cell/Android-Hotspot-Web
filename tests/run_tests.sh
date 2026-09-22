@@ -230,11 +230,63 @@ assert_eq 'sys 解析 无Band字段→any' 'any' "$sys_band"
 assert_eq 'sys 解析 hidden=false' '0' "$sys_hidden"
 assert_eq 'sys 解析 ok=1' '1' "$sys_ok"
 
-# 修改系统配置走系统 API（mock cmd wifi 记录调用参数；热点关闭 → 带参启动保存后停止）
-MOCK_LOG="$TMP_SYS_DIR/mock_cmd.log"
-: > "$MOCK_LOG"
+# ---- Binder Bridge mock（模拟 Framework setSoftApConfiguration/getSoftApConfiguration 系统持久化）----
+MOCKBIN="$TMP_SYS_DIR/mockbin"
+mkdir -p "$MOCKBIN"
+# mock getprop：模拟 API 34 设备
+cat > "$MOCKBIN/getprop" <<'EOF'
+#!/bin/sh
+echo "34"
+EOF
+chmod +x "$MOCKBIN/getprop"
+BRIDGE_STATE="$TMP_SYS_DIR/bridge_state"
+BRIDGE_LOG="$TMP_SYS_DIR/bridge_calls.log"
 LOG="$TMP_SYS_DIR/service.log"
 export LOG
+: > "$BRIDGE_LOG"
+# 初始系统配置（模拟设备已有持久热点配置）
+printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
+cat > "$MOCKBIN/app_process" <<EOF
+#!/bin/sh
+# 参数形式：-Djava.class.path=... /system/bin com.mifi.softap.SoftApBridge set|get ...
+CMD=
+FOUND=0
+ARGS=
+for a in "\$@"; do
+  if [ "\$FOUND" = "1" ]; then
+    if [ -z "\$ARGS" ]; then ARGS="\$a"; else ARGS="\$ARGS|\$a"; fi
+  else
+    case "\$a" in set|get|get-api) CMD=\$a; FOUND=1 ;; esac
+  fi
+done
+case "\$CMD" in
+  set)
+    echo "\$ARGS" >> "$BRIDGE_LOG"
+    IFS='|' read -r S1 S2 S3 S4 S5 S6 S7 <<EOF2
+\$ARGS
+EOF2
+    printf '%s|%s|%s|%s|%s|%s|%s' "\$S1" "\$S2" "\$S3" "\$S4" "\$S5" "\$S6" "\$S7" > "$BRIDGE_STATE"
+    echo "ok=1"
+    ;;
+  get)
+    if [ ! -s "$BRIDGE_STATE" ]; then echo "present=0"; exit 0; fi
+    IFS='|' read -r G1 G2 G3 G4 G5 G6 G7 < "$BRIDGE_STATE"
+    E1=\$(printf '%s' "\$G1" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+    E3=\$(printf '%s' "\$G3" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
+    printf 'present=1\nssid_b64=%s\nsecurity=%s\npassword_b64=%s\nband=%s\nchannel=%s\nhidden=%s\nmaxclients=%s\n' "\$E1" "\$G2" "\$E3" "\$G4" "\$G5" "\$G6" "\$G7"
+    ;;
+esac
+exit 0
+EOF
+chmod +x "$MOCKBIN/app_process"
+PATH="$MOCKBIN:$PATH"
+export PATH
+APP_PROCESS="$MOCKBIN/app_process"
+export APP_PROCESS
+
+# mock cmd wifi：记录调用（启动/停止走 cmd；配置读写走 bridge）
+MOCK_LOG="$TMP_SYS_DIR/mock_cmd.log"
+: > "$MOCK_LOG"
 cat > "$TMP_SYS_DIR/cmdwifi" <<CMDEOF
 #!/bin/sh
 printf '%s\n' "\$*" >> "$MOCK_LOG"
@@ -244,41 +296,48 @@ chmod +x "$TMP_SYS_DIR/cmdwifi"
 CMD_WIFI="$TMP_SYS_DIR/cmdwifi"
 export CMD_WIFI
 
+# --- hotspot_set_config：Web 改 → Framework setSoftApConfiguration 持久化 ---
 hotspot_set_config "New Hotspot" "wpa3" "Pass@123" "5" "149" "1" "8"
 assert_eq 'set_config rc=0' '0' "$?"
-# 期望调用：带参启动（含 -h）+ 保存后停止（WAS_ON=0）
-"$BB" grep -q 'start-softap New Hotspot wpa3 Pass@123 -b 5 -c 149 -m 8 -h' "$MOCK_LOG"; ok 'set_config 带参启动（系统API持久化）' $?
-"$BB" grep -q 'stop-softap' "$MOCK_LOG"; ok 'set_config 热点关闭时保存后停止' $?
+"$BB" grep -q 'New Hotspot|wpa3|Pass@123|5|149|1|8' "$BRIDGE_LOG"; ok 'set_config 走 Framework setSoftApConfiguration（参数完整）' $?
+# 持久化闭环：改完立刻从系统读到新配置（模拟 Web 改 → 系统变）
+hotspot_get_config
+assert_eq 'set_config 后系统配置 ssid' 'New Hotspot' "$sys_ssid"
+assert_eq 'set_config 后系统配置 security' 'wpa3' "$sys_security"
+assert_eq 'set_config 后系统配置 band' '5' "$sys_band"
+assert_eq 'set_config 后系统配置 hidden' '1' "$sys_hidden"
+assert_eq 'set_config 后系统配置 maxclients' '8' "$sys_maxclients"
 
-# 密码留空 → 读取系统旧密码（XML 只读）再带参启动
-: > "$MOCK_LOG"
-SYS_WIFI_STORE="$TMP_SYS_DIR/store.xml"
+# 密码留空 → 沿用系统当前密码（Framework 读 → set）
 hotspot_set_config "New Hotspot" "wpa2" "" "2" "0" "0" "0"
 assert_eq 'set_config 留空密码 rc=0' '0' "$?"
-"$BB" grep -q 'start-softap New Hotspot wpa2 87654321 -b 2' "$MOCK_LOG"; ok 'set_config 留空密码沿用系统密码' $?
+"$BB" grep -q 'New Hotspot|wpa2|Pass@123|2|0|0|0' "$BRIDGE_LOG"; ok 'set_config 留空密码沿用系统密码' $?
 
-# open 网络 → 无密码参数
-: > "$MOCK_LOG"
+# open 网络 → 无密码
 hotspot_set_config "Open-Net" "open" "" "2" "0" "0" "0"
-"$BB" grep -q 'start-softap Open-Net open -b 2' "$MOCK_LOG"; ok 'set_config open 网络无密码' $?
-# 注意：非 open 时 open 分支不应带密码（grep 不含密码参数即可）——上面已覆盖
+assert_eq 'set_config open rc=0' '0' "$?"
+"$BB" grep -q 'Open-Net|open||2|0|0|0' "$BRIDGE_LOG"; ok 'set_config open 网络无密码' $?
 
-# run_softap：系统已有配置 → 无参启动（用系统配置）
+# 热点关闭时保存 → 不改变开启/关闭意图（不调用 start-softap）
+if "$BB" grep -q 'start-softap' "$MOCK_LOG"; then ok 'set_config 热点关闭时仅持久化（不启动）' 1; else ok 'set_config 热点关闭时仅持久化（不启动）' 0; fi
+
+# --- run_softap：系统已有配置 → 无参启动（用系统配置） ---
 : > "$MOCK_LOG"
 run_softap "" "" "" "" "" ""
 "$BB" grep -q 'start-softap$' "$MOCK_LOG"; ok 'run_softap 系统已有配置 → 无参启动' $?
 
-# run_softap：系统无 SoftAp 段且带旧参数 → 先迁移（带参启动）再无参启动
+# --- run_softap：系统从未配置 + 模块旧参数 → 迁移（bridge 持久化）后无参启动 ---
 : > "$MOCK_LOG"
-cat > "$TMP_SYS_DIR/store4.xml" <<'XMLEOF'
-<WifiConfigStoreData>
-<int name="Version" value="3" />
-</WifiConfigStoreData>
-XMLEOF
-SYS_WIFI_STORE="$TMP_SYS_DIR/store4.xml"
+: > "$BRIDGE_STATE"   # 模拟系统从未配置热点
 run_softap "Migrated-AP" "wpa2" "12345678" "any" "0" "0"
-"$BB" grep -q 'start-softap Migrated-AP wpa2 12345678 -b any' "$MOCK_LOG"; ok 'run_softap 迁移带参启动（旧配置→系统API）' $?
-"$BB" grep -q 'stop-softap' "$MOCK_LOG"; ok 'run_softap 迁移后恢复关闭（保存不启动）' $?
+"$BB" grep -q 'Migrated-AP|wpa2|12345678|any|0|0|0' "$BRIDGE_LOG"; ok 'run_softap 迁移：旧配置经 Framework 持久化' $?
+"$BB" grep -q 'start-softap$' "$MOCK_LOG"; ok 'run_softap 迁移后无参启动（用系统配置）' $?
+# 迁移后系统配置已生效（持久化闭环）
+hotspot_get_config
+assert_eq '迁移后系统配置 ssid' 'Migrated-AP' "$sys_ssid"
+BRIDGE_LOG="$TMP_SYS_DIR/bridge_calls.log"
+: > "$BRIDGE_STATE"
+printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
 
 # 新版 SSID 标签（SoftApConfToXmlMigration 风格）
 cat > "$TMP_SYS_DIR/store3.xml" <<'XMLEOF'
@@ -311,18 +370,20 @@ fi
 exit 0
 CMDEOF
 chmod +x "$TMP_SYS_DIR/cmdwifi"
-# mock 提供了 start-softap help → startStop=true
+# mock 提供了 start-softap help → startStop=true；bridge 可用 → 读写 true / 同步 A
 hotspot_detect_capabilities
 CAPS=$HOTSPOT_CAPS_JSON
 case "$CAPS" in *'"startStop":true'*) ok 'caps cmd wifi 支持 start-softap → startStop=true' 0 ;; *) ok 'caps cmd wifi 支持 start-softap → startStop=true' 1 ;; esac
-# 真正无 cmd wifi（路径不存在）→ startStop=false
+case "$CAPS" in *'"readConfig":true'*) ok 'caps bridge 可读 → readConfig=true' 0 ;; *) ok 'caps bridge 可读 → readConfig=true' 1 ;; esac
+case "$CAPS" in *'"writeConfig":true'*) ok 'caps bridge 可写 → writeConfig=true' 0 ;; *) ok 'caps bridge 可写 → writeConfig=true' 1 ;; esac
+case "$CAPS" in *'"syncLevel":"A"'*) ok 'caps 同步级别 A（Framework 双向）' 0 ;; *) ok 'caps 同步级别 A（Framework 双向）' 1 ;; esac
+case "$CAPS" in *'"android":34'*) ok 'caps android=34（getprop mock）' 0 ;; *) ok 'caps android=34（getprop mock）' 1 ;; esac
+# 真正无 cmd wifi（路径不存在）→ startStop=false（bridge 读写不受影响）
 CMD_WIFI=/nonexistent/cmd
 hotspot_detect_capabilities
 CAPS=$HOTSPOT_CAPS_JSON
 case "$CAPS" in *'"startStop":false'*) ok 'caps 无 cmd wifi → startStop=false' 0 ;; *) ok 'caps 无 cmd wifi → startStop=false' 1 ;; esac
-case "$CAPS" in *'"readConfig":true'*) ok 'caps 系统XML可读 → readConfig=true' 0 ;; *) ok 'caps 系统XML可读 → readConfig=true' 1 ;; esac
-case "$CAPS" in *'"writeConfig":true'*) ok 'caps 系统XML可写 → writeConfig=true' 0 ;; *) ok 'caps 系统XML可写 → writeConfig=true' 1 ;; esac
-case "$CAPS" in *'"syncLevel":"A"'*) ok 'caps 同步级别 A（读写）' 0 ;; *) ok 'caps 同步级别 A（读写）' 1 ;; esac
+case "$CAPS" in *'"writeConfig":true'*) ok 'caps 无 cmd wifi 仍可写（bridge 独立）' 0 ;; *) ok 'caps 无 cmd wifi 仍可写（bridge 独立）' 1 ;; esac
 case "$CAPS" in *'"android":'*'"band2g":'*'"hiddenSsid":'*'"channelControl":'*'"maxClients":'*) ok 'caps JSON 字段齐全' 0 ;; *) ok 'caps JSON 字段齐全' 1 ;; esac
 # 统一接口可用性
 hotspot_get_capabilities >/dev/null 2>&1; ok '接口 hotspot_get_capabilities' $?
