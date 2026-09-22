@@ -59,6 +59,7 @@ save_config() {
     printf 'PASS_B64=%s\n' "$PASS_B64"
     printf 'SECURITY=%s\n' "$SECURITY"
     printf 'BAND=%s\n' "$BAND"
+    printf 'HIDDEN=%s\n' "${HIDDEN:-0}"
     printf 'AUTOSTART=%s\n' "$AUTOSTART"
     printf 'PORT=%s\n' "$PORT"
     printf 'CHANNEL=%s\n' "${CHANNEL:-0}"
@@ -221,6 +222,7 @@ case "$ACTION" in
     NEW_PASS_B64=$(get_param password)
     NEW_SECURITY=$(get_param security)
     NEW_BAND=$(get_param band)
+    NEW_HIDDEN=$(get_param hidden)
     NEW_AUTOSTART=$(get_param autostart)
     NEW_CHANNEL=$(get_param channel)
     NEW_MAX=$(get_param maxClients)
@@ -229,6 +231,7 @@ case "$ACTION" in
     case "$NEW_PASS_B64" in *[!A-Za-z0-9_-]*) printf '{"ok":false,"message":"密码格式错误"}'; exit 0 ;; esac
     case "$NEW_SECURITY" in open|wpa2|wpa3|wpa3_transition) : ;; *) printf '{"ok":false,"message":"不支持的加密方式"}'; exit 0 ;; esac
     case "$NEW_BAND" in 2|5|any) : ;; *) printf '{"ok":false,"message":"不支持的频段"}'; exit 0 ;; esac
+    case "$NEW_HIDDEN" in 0|1) : ;; *) NEW_HIDDEN=0 ;; esac
     case "$NEW_AUTOSTART" in 0|1) : ;; *) NEW_AUTOSTART=1 ;; esac
     case "$NEW_CHANNEL" in ''|0|any) NEW_CHANNEL=0 ;; *[!0-9]*) printf '{"ok":false,"message":"信道格式错误"}'; exit 0 ;; esac
     valid_channel "$NEW_BAND" "$NEW_CHANNEL" || { printf '{"ok":false,"message":"信道 %s 与频段不匹配（2.4G: 1/3/6/9/11/13；5G: 36/40/44/48/149/153/157/161/165）"}' "$NEW_CHANNEL"; exit 0; }
@@ -272,6 +275,7 @@ case "$ACTION" in
     fi
     SECURITY=$NEW_SECURITY
     BAND=$NEW_BAND
+    HIDDEN=$NEW_HIDDEN
     AUTOSTART=$NEW_AUTOSTART
     CHANNEL=$NEW_CHANNEL
     MAX_CLIENTS=$NEW_MAX
@@ -558,7 +562,7 @@ case "$ACTION" in
       case "$k" in
         SECURITY) case "$v" in open|wpa2|wpa3|wpa3_transition) return 0 ;; esac ;;
         BAND) case "$v" in 2|5|any) return 0 ;; esac ;;
-        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF)
+        AUTOSTART|KEEPALIVE|NOTIFY_LIMIT|SMS_FWD|SCHED_ENABLE|LOWBATT_ENABLE|NOTIFY_HOTSPOT_EVT|PROXY_ENABLE|PROXY_BLOCK_QUIC|PROXY_SELF|HIDDEN)
           case "$v" in 0|1) return 0 ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
           # 1~5 个逗号分隔的 1~100 整数（如 80,90,100）；v1.7.2：拒绝空段（80,,90 / 80,）
@@ -601,7 +605,7 @@ case "$ACTION" in
     printf '%s\n' "$PLAIN" > "$TMP_CFG"
     # 只允许明确白名单字段（不直接 source 上传内容），逐行读取赋值；
     # 排除含 shell 元字符的任意内容，避免导入任意变量进入运行环境
-    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
+    ALLOWED='^(SSID_B64|PASS_B64|SECURITY|BAND|HIDDEN|AUTOSTART|PORT|CHANNEL|MAX_CLIENTS|KEEPALIVE|IDLE_SHUTDOWN|SCHED_ENABLE|SCHED_ON|SCHED_OFF|SCHED_MODE|SCHED_ON_WD|SCHED_OFF_WD|SCHED_ON_WE|SCHED_OFF_WE|DATA_LIMIT_MB|BLOCKED_MACS|PUSHPLUS_TOKEN_B64|DINGTALK_WEBHOOK_B64|DINGTALK_SECRET_B64|NOTIFY_LIMIT|NOTIFY_HOTSPOT_EVT|NOTIFY_TRAFFIC_THRESHOLDS|SMS_FWD|SMS_FWD_KEYWORD_B64|SMS_FWD_SENDERS_B64|LOWBATT_ENABLE|LOWBATT_THRESHOLD|DATA_PLAN_MB|DATA_PLAN_DAY|DATA_LIMIT_ACTION|PROXY_ENABLE|PROXY_SUB_B64|PROXY_MODE|PROXY_BLOCK_QUIC|PROXY_SELF|PROXY_ROUTE_MODE|PROXY_SCOPE)=[^;&|`$\\]*$'
     "$BB" grep -E "$ALLOWED" "$TMP_CFG" > "$TMP_CFG.clean" 2>/dev/null || true
     if [ ! -s "$TMP_CFG.clean" ]; then
       rm -f "$TMP_CFG" "$TMP_CFG.clean"

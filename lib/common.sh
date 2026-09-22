@@ -241,6 +241,8 @@ cfg_apply_key() {
           case "$value" in wpa2|wpa3|wpa3_transition|open) SECURITY=$value ;; esac ;;
         BAND)
           case "$value" in 2|5|any) BAND=$value ;; esac ;;
+        HIDDEN)
+          case "$value" in 0|1) HIDDEN=$value ;; esac ;;
         AUTOSTART)
           case "$value" in 0|1) AUTOSTART=$value ;; esac ;;
         KEEPALIVE)
@@ -388,6 +390,7 @@ load_config() {
   DATA_LIMIT_ACTION=${DATA_LIMIT_ACTION:-stop}
   SECURITY=${SECURITY:-wpa2}
   BAND=${BAND:-2}
+  HIDDEN=${HIDDEN:-0}
   AUTOSTART=${AUTOSTART:-1}
   PORT=${PORT:-8080}
   CHANNEL=${CHANNEL:-0}
@@ -629,6 +632,8 @@ run_softap() {
   EXTRA=
   case "$channel" in ''|0|any) ;; *[!0-9]*) : ;; *) EXTRA="$EXTRA -c $channel" ;; esac
   case "$maxclients" in ''|0) ;; *[!0-9]*) : ;; *) EXTRA="$EXTRA -m $maxclients" ;; esac
+  # 隐藏 SSID（不广播热点名称）：cmd wifi start-softap 支持 -h 选项
+  [ "${HIDDEN:-0}" = "1" ] && EXTRA="$EXTRA -h"
 
   if [ "$security" = "open" ]; then
     /system/bin/cmd wifi start-softap "$ssid" open -b "$band" $EXTRA

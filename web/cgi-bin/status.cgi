@@ -293,8 +293,8 @@ MOD_VERSION=$("$BB" sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | 
 read_device_info
 printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%s,' \
   "$MOD_VERSION" "$(json_escape "$DEVICE_MODEL")" "$(json_escape "$OS_VERSION")" "$RUNNING"
-printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,' \
-  "$(json_escape "$SSID")" "$([ -n "$PASS_B64" ] && echo true || echo false)" "$(json_escape "$SECURITY")" "$(json_escape "$BAND")" "${CHANNEL:-0}"
+printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,' \
+  "$(json_escape "$SSID")" "$([ -n "$PASS_B64" ] && echo true || echo false)" "$(json_escape "$SECURITY")" "$(json_escape "$BAND")" "${CHANNEL:-0}" "$([ "${HIDDEN:-0}" = "1" ] && echo true || echo false)"
 printf '"maxClients":%s,"keepalive":%s,"idleShutdown":%s,"holdOff":%s,' "${MAX_CLIENTS:-0}" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${HOLD_OFF:-0}" = "1" ] && echo true || echo false)"
 printf '"sched":{"enable":%s,"on":"%s","off":"%s","mode":"%s","onWd":"%s","offWd":"%s","onWe":"%s","offWe":"%s"},' \
   "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${SCHED_ON:-2300}")" "$(json_escape "${SCHED_OFF:-0700}")" "$(json_escape "${SCHED_MODE:-daily}")" "$(json_escape "${SCHED_ON_WD:-2300}")" "$(json_escape "${SCHED_OFF_WD:-0700}")" "$(json_escape "${SCHED_ON_WE:-2300}")" "$(json_escape "${SCHED_OFF_WE:-0700}")"
