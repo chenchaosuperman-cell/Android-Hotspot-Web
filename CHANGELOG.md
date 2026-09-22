@@ -1,4 +1,22 @@
-# v1.7.5-beta（2026-09-22）稳定性修复版
+# v1.7.6-beta（2026-09-22）一套配置 + 通用兼容层
+
+> 架构升级：热点配置不再维护「模块一份 + 系统一份」，改为**系统设置与 Web 共用一份**（系统 `WifiConfigStore.xml` 为唯一数据源）；新增 **Hotspot Compatibility Layer**，为跨 Android 版本 / 厂商 ROM 做准备。
+
+- **一套配置（消除两套）**：Web 后台「热点设置」读写系统 `WifiConfigStore.xml` 的 `<SoftAp>` 段（`/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml`）。
+  - 系统设置里改热点 → Web 状态/设置页刷新即同步；
+  - Web 里保存 → 写入系统存储（备份→重建 SoftAp 段→回读校验→原子替换→恢复属主/权限/SELinux 上下文），热点开着时立即重启应用，关着时下次启动生效；
+  - 热点启动改为以系统配置为准（不再用模块参数临时覆盖）。
+  - 旧版已保存的热点参数在首次启动时自动迁移进系统存储；此后 `config.conf` 不再保存 SSID/密码/安全类型/频段/信道/隐藏/最大连接数（这些属于 Android，不属于模块）。
+- **Hotspot Compatibility Layer（`lib/compat.sh`）**：不针对具体机型/ROM/Android 版本写死，运行时能力检测。
+  - 统一接口：`hotspot_get_capabilities / get_config / set_config / get_state / start / stop / restart`；
+  - 能力清单 JSON：Android API、cmd wifi 启停、系统配置读写、2.4/5/6 GHz、隐藏 SSID、信道控制、最大连接数、同步级别（A 双向同步 / B 只读 / C 仅开关状态）；
+  - 启动 Backend 自动选择：`cmd wifi start-softap` 可用 → 主路径；不可用（旧系统）→ `cmd connectivity tether start` 降级；
+  - 前端按能力动态显示：设备不支持 6 GHz / 隐藏 SSID / 固定信道 / 最大连接数时，对应选项自动隐藏或禁用，不再出现「按钮能点、底层报错」。
+- **新增 6 GHz 频段**：频段下拉支持 6 GHz（仅自动信道；`valid_channel` 对 6G 只允许 0）。
+- **README 口径修正**：不再承诺「支持所有安卓手机」，改为「通用兼容架构 + 按设备能力自动降级」，公布已验证机型（Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU）。
+- **回归测试扩充**：新增系统 SoftAp 解析/写入/新增段/open 网络/新版标签、能力检测 JSON、统一接口可用性断言（57 → 87 用例全部通过）。
+
+# # v1.7.5-beta（2026-09-22）稳定性修复版
 
 - **修复代理默认范围错误（P0）**：全新安装默认仅代理热点设备（`PROXY_SCOPE` 默认 `hotspot`），不会再一开启就把手机本机一起加入代理；前端/后端/文档口径统一。旧配置已显式设置 `PROXY_SCOPE` 的保留原值。
 - **修复 MAC 白名单切换残留（P0）**：白名单→黑名单切换时旧 `mifi_acl` 链残留、设备仍被旧白名单阻断的问题。新增统一入口 `apply_mac_policy()`：每次应用前先清理黑名单 DROP 规则与白名单链，再按当前模式重建；守护进程主循环、热点启动异步验证、设备操作均改走该入口。

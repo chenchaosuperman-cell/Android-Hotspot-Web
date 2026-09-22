@@ -47,7 +47,7 @@ else
   fi
 fi
 CMD_OK=false
-if [ -x /system/bin/cmd ] && [ -x "$IPT" ] && [ -x /system/bin/date ]; then
+if [ -x "$CMD_WIFI" ] && [ -x "$IPT" ] && [ -x /system/bin/date ]; then
   CMD_OK=true
 fi
 
@@ -102,7 +102,7 @@ ADAPT_SDK=$(getprop ro.build.version.sdk 2>/dev/null)
 ADAPT_BB=no; [ -n "$BB" ] && [ -x "$BB" ] && ADAPT_BB=yes
 ADAPT_IP=no; /system/bin/ip --version >/dev/null 2>&1 && ADAPT_IP=yes
 ADAPT_IPT=no; command -v iptables >/dev/null 2>&1 && ADAPT_IPT=yes
-ADAPT_WIFI=no; /system/bin/cmd wifi help 2>/dev/null | "$BB" grep -q 'start-softap' && ADAPT_WIFI=yes
+ADAPT_WIFI=no; "$CMD_WIFI" wifi help 2>/dev/null | "$BB" grep -q 'start-softap' && ADAPT_WIFI=yes
 ADAPT_SU=no; command -v su >/dev/null 2>&1 && ADAPT_SU=yes
 printf '"adapt":{"frame":"%s","android":"%s","sdk":"%s","busybox":%s,"ip":%s,"iptables":%s,"softap":%s,"su":%s},' \
   "$(json_escape "$ADAPT_FRAME")" "$(json_escape "$ADAPT_ANDROID")" "$(json_escape "$ADAPT_SDK")" \

@@ -55,15 +55,10 @@ save_config() {
   fi
   tmp="$CONFIG.tmp.$$"
   {
-    printf 'SSID_B64=%s\n' "$SSID_B64"
-    printf 'PASS_B64=%s\n' "$PASS_B64"
-    printf 'SECURITY=%s\n' "$SECURITY"
-    printf 'BAND=%s\n' "$BAND"
-    printf 'HIDDEN=%s\n' "${HIDDEN:-0}"
+    # v1.7.6：热点参数（SSID/密码/安全/频段/信道/隐藏/最大连接数）不写入 config.conf，
+    # 唯一数据源为系统 WifiConfigStore.xml（Hotspot Compatibility Layer）。
     printf 'AUTOSTART=%s\n' "$AUTOSTART"
     printf 'PORT=%s\n' "$PORT"
-    printf 'CHANNEL=%s\n' "${CHANNEL:-0}"
-    printf 'MAX_CLIENTS=%s\n' "${MAX_CLIENTS:-0}"
     printf 'KEEPALIVE=%s\n' "${KEEPALIVE:-1}"
     printf 'IDLE_SHUTDOWN=%s\n' "${IDLE_SHUTDOWN:-0}"
     printf 'SCHED_ENABLE=%s\n' "${SCHED_ENABLE:-0}"
@@ -151,7 +146,7 @@ restart_hotspot_async() {
     load_config
     SSID=$(b64url_decode "$SSID_B64")
     PASS=$(b64url_decode "$PASS_B64")
-    STOP_OUT=$("$BB" timeout 10 /system/bin/cmd wifi stop-softap 2>&1)
+    STOP_OUT=$("$BB" timeout 10 "$CMD_WIFI" wifi stop-softap 2>&1)
     printf '%s stop-softap\n%s\n' "$(date)" "$STOP_OUT" >> "$LOG"
     sleep 1
     # Keep loopback management address until hotspot is ready
@@ -233,7 +228,7 @@ case "$ACTION" in
     valid_b64url "$NEW_SSID_B64" || { printf '{"ok":false,"message":"热点名称格式错误"}'; exit 0; }
     case "$NEW_PASS_B64" in *[!A-Za-z0-9_-]*) printf '{"ok":false,"message":"密码格式错误"}'; exit 0 ;; esac
     case "$NEW_SECURITY" in open|wpa2|wpa3|wpa3_transition) : ;; *) printf '{"ok":false,"message":"不支持的加密方式"}'; exit 0 ;; esac
-    case "$NEW_BAND" in 2|5|any) : ;; *) printf '{"ok":false,"message":"不支持的频段"}'; exit 0 ;; esac
+    case "$NEW_BAND" in 2|5|6|any) : ;; *) printf '{"ok":false,"message":"不支持的频段"}'; exit 0 ;; esac
     case "$NEW_HIDDEN" in 0|1) : ;; *) NEW_HIDDEN=0 ;; esac
     if [ "$NEW_HIDDEN" = "1" ] && ! softap_hidden_supported; then
       printf '{"ok":false,"message":"当前系统不支持隐藏 SSID（cmd wifi 无 -h 支持），已保持广播模式"}'
@@ -295,6 +290,11 @@ case "$ACTION" in
     # P1-4(1.5.12)：记录备份时配置指纹，异步回滚前对比——期间用户若又改过配置则不回滚
     "$BB" md5sum "$CONFIG" 2>/dev/null | "$BB" cut -d' ' -f1 > "$CONFIG.bak.md5" 2>/dev/null
     save_config || { release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"; printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
+    # 一套配置：经 Hotspot Compatibility Layer 写入系统 WifiConfigStore.xml（系统设置 ↔ Web 共用一份）
+    if ! hotspot_set_config "$NEW_SSID" "$NEW_SECURITY" "$NEW_PASS" "$NEW_BAND" "$NEW_CHANNEL" "$NEW_HIDDEN" "$NEW_MAX"; then
+      release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"
+      printf '{"ok":false,"message":"系统热点配置写入失败（系统 API 未接受），已还原模块配置"}'; exit 0
+    fi
     printf '1\n' > "$DESIRED_FILE"
     chmod 0600 "$DESIRED_FILE"
     write_operation working "正在应用热点配置并验证生效"

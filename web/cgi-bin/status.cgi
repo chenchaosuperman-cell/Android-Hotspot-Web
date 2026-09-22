@@ -310,9 +310,11 @@ MOD_VERSION=$("$BB" sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | 
 read_device_info
 printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%s,' \
   "$MOD_VERSION" "$(json_escape "$DEVICE_MODEL")" "$(json_escape "$OS_VERSION")" "$RUNNING"
-printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,"hiddenSupported":%s,' \
-  "$(json_escape "$SSID")" "$([ -n "$PASS_B64" ] && echo true || echo false)" "$(json_escape "$SECURITY")" "$(json_escape "$BAND")" "${CHANNEL:-0}" "$([ "${HIDDEN:-0}" = "1" ] && echo true || echo false)" "$(softap_hidden_supported && echo true || echo false)"
-printf '"maxClients":%s,"keepalive":%s,"idleShutdown":%s,"holdOff":%s,' "${MAX_CLIENTS:-0}" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${HOLD_OFF:-0}" = "1" ] && echo true || echo false)"
+# v1.7.6：热点配置唯一数据源 = 系统 WifiConfigStore.xml（Hotspot Compatibility Layer）
+hotspot_get_config
+printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,"hiddenSupported":%s,"caps":%s,' \
+  "$(json_escape "$sys_ssid")" "$([ "$sys_security" != "open" ] && [ -n "$sys_password" ] && echo true || echo false)" "$(json_escape "$sys_security")" "$(json_escape "$sys_band")" "${sys_channel:-0}" "$([ "${sys_hidden:-0}" = "1" ] && echo true || echo false)" "$(softap_hidden_supported && echo true || echo false)" "$(hotspot_get_capabilities)"
+printf '"maxClients":%s,"keepalive":%s,"idleShutdown":%s,"holdOff":%s,' "${sys_maxclients:-0}" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${HOLD_OFF:-0}" = "1" ] && echo true || echo false)"
 printf '"sched":{"enable":%s,"on":"%s","off":"%s","mode":"%s","onWd":"%s","offWd":"%s","onWe":"%s","offWe":"%s"},' \
   "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${SCHED_ON:-2300}")" "$(json_escape "${SCHED_OFF:-0700}")" "$(json_escape "${SCHED_MODE:-daily}")" "$(json_escape "${SCHED_ON_WD:-2300}")" "$(json_escape "${SCHED_OFF_WD:-0700}")" "$(json_escape "${SCHED_ON_WE:-2300}")" "$(json_escape "${SCHED_OFF_WE:-0700}")"
 printf '"autostart":%s,"iface":"%s","ip":"%s","nativeIp":"%s","port":%s,"battery":%s,"charging":%s,' \

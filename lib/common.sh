@@ -16,6 +16,8 @@ OP_LOCK="$DATA_DIR/operation.lock"
 CONTROL_REQUEST="$DATA_DIR/control.request"
 STABLE_IP=192.168.43.1
 IPT=/system/bin/iptables
+# Hotspot Compatibility Layer 统一走系统 cmd（可被测试覆盖为 mock）
+CMD_WIFI=/system/bin/cmd
 
 # ── Web 管理端口访问控制（v1.7.2）──────────────────────────────
 # 仅放行本机(lo)、真实热点接口与 USB 共享接口，其余接口一律 DROP。
@@ -395,20 +397,16 @@ load_config() {
       esac
     done < "$CONFIG"
   fi
-  SSID_B64=${SSID_B64:-WGlhb21pMTQtTWlGaQ}
-  PASS_B64=${PASS_B64:-ODc2NTQzMjE}
+  # v1.7.6：热点参数（SSID/密码/安全/频段/信道/隐藏/最大连接数）不再保存于 config.conf，
+  # 唯一数据源为系统 WifiConfigStore.xml（Hotspot Compatibility Layer）。
+  # 旧配置文件中的历史字段仍由上方 cfg_apply_key 解析到变量，供首次启动时迁移到系统。
   LOWBATT_ENABLE=${LOWBATT_ENABLE:-0}
   LOWBATT_THRESHOLD=${LOWBATT_THRESHOLD:-20}
   DATA_PLAN_MB=${DATA_PLAN_MB:-0}
   DATA_PLAN_DAY=${DATA_PLAN_DAY:-1}
   DATA_LIMIT_ACTION=${DATA_LIMIT_ACTION:-stop}
-  SECURITY=${SECURITY:-wpa2}
-  BAND=${BAND:-2}
-  HIDDEN=${HIDDEN:-0}
   AUTOSTART=${AUTOSTART:-1}
   PORT=${PORT:-8080}
-  CHANNEL=${CHANNEL:-0}
-  MAX_CLIENTS=${MAX_CLIENTS:-0}
   KEEPALIVE=${KEEPALIVE:-1}
   IDLE_SHUTDOWN=${IDLE_SHUTDOWN:-0}
   SCHED_ENABLE=${SCHED_ENABLE:-0}
@@ -551,6 +549,7 @@ valid_channel() {
   case "$band" in
     2) case "$channel" in 1|3|6|9|11|13) return 0 ;; esac ;;
     5) case "$channel" in 36|40|44|48|149|153|157|161|165) return 0 ;; esac ;;
+    6) case "$channel" in 0) return 0 ;; esac ;;
     any) return 1 ;;
   esac
   return 1
@@ -640,11 +639,134 @@ release_operation_lock() {
   rm -rf "$OP_LOCK"
 }
 
+# ============================================================
+# 系统 SoftAP 配置（一套配置：Web 与系统设置共用 WifiConfigStore.xml）
+# Android 11+ 热点配置持久化于 /data/misc/apexdata/com.android.wifi/WifiConfigStore.xml，
+# 系统设置（Wi-Fi 热点）与本模块读写同一份，杜绝"两套配置"。
+# SYS_WIFI_STORE 可被测试覆盖；解析/写入均不依赖 root 特性（纯文件操作）。
+# ============================================================
+SYS_WIFI_STORE=/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml
+
+# 安全类型：系统 SoftApConfiguration SecurityType → 模块 security 值
+# 0=OPEN 1=WPA2_PSK 2=WPA3_SAE 4=WPA2_WPA3_PSK(Android13+)
+sys_security_type_name() {
+  case "$1" in
+    0) printf 'open' ;;
+    2) printf 'wpa3' ;;
+    4) printf 'wpa3_transition' ;;
+    *) printf 'wpa2' ;;
+  esac
+}
+# 模块 security 值 → 系统 SecurityType
+sys_security_type_val() {
+  case "$1" in
+    open) printf '0' ;;
+    wpa3) printf '2' ;;
+    wpa3_transition) printf '4' ;;
+    *) printf '1' ;;
+  esac
+}
+# 系统 Band（SoftApConfiguration: 0=2.4G 1=5G 2=6G 3=any）→ 模块 band
+sys_band_name() {
+  case "$1" in
+    0) printf '2' ;;
+    1) printf '5' ;;
+    2) printf '6' ;;
+    *) printf 'any' ;;
+  esac
+}
+# 模块 band → 系统 Band
+sys_band_val() {
+  case "$1" in
+    2) printf '0' ;;
+    5) printf '1' ;;
+    6) printf '2' ;;
+    *) printf '3' ;;
+  esac
+}
+
+# 读取系统 SoftAP 段 → 设置 sys_ssid/sys_security/sys_password/sys_band/sys_channel/sys_hidden/sys_maxclients/sys_ok
+# sys_ok=1 成功；=0 文件缺失或无 SoftAp 段（调用方按系统默认处理）。
+# 兼容两种标签：旧版 <string name="WifiSsid">&quot;X&quot;</string>（引号实体包裹）、
+# 新版（SoftApConfToXmlMigration）<string name="SSID">X</string>。
+sys_softap_get() {
+  sys_ok=0
+  sys_ssid=; sys_security=wpa2; sys_password=; sys_band=any; sys_channel=0; sys_hidden=0; sys_maxclients=0
+  [ -r "$SYS_WIFI_STORE" ] || return 0
+  IN_AP=0
+  while IFS= read -r LINE; do
+    case "$LINE" in
+      *'<SoftAp>'*) IN_AP=1; continue ;;
+      *'</SoftAp>'*) IN_AP=0; continue ;;
+    esac
+    [ "$IN_AP" = "1" ] || continue
+    case "$LINE" in
+      *'<string name="WifiSsid">'*)
+        # WifiSsid 序列化约定：内容带外层 &quot; 包裹（引号实体），需剥掉后再解码实体
+        V=${LINE#*'<string name="WifiSsid">'}; V=${V%%'</string>'*}
+        V=$(printf '%s' "$V" | "$BB" sed 's/&quot;/"/g;s/&amp;/\&/g;s/&lt;/</g;s/&gt;/>/g')
+        case "$V" in
+          '"'*) V=${V#'"'} ;;
+        esac
+        case "$V" in
+          *'"') V=${V%'"'} ;;
+        esac
+        sys_ssid=$V; sys_ok=1 ;;
+      *'<string name="SSID">'*)
+        V=${LINE#*'<string name="SSID">'}; V=${V%%'</string>'*}
+        V=$(printf '%s' "$V" | "$BB" sed 's/&quot;/"/g;s/&amp;/\&/g;s/&lt;/</g;s/&gt;/>/g')
+        sys_ssid=$V; sys_ok=1 ;;
+      *'<string name="Passphrase">'*)
+        V=${LINE#*'<string name="Passphrase">'}; V=${V%%'</string>'*}
+        V=$(printf '%s' "$V" | "$BB" sed 's/&quot;/"/g;s/&amp;/\&/g;s/&lt;/</g;s/&gt;/>/g')
+        sys_password=$V ;;
+      *'<boolean name="HiddenSSID"'*)
+        case "$LINE" in *'value="true"'*) sys_hidden=1 ;; *) sys_hidden=0 ;; esac ;;
+      *'<int name="SecurityType"'*)
+        V=${LINE#*'value="'}; V=${V%%'"'*}
+        sys_security=$(sys_security_type_name "$V") ;;
+      *'<int name="Band"'*)
+        V=${LINE#*'value="'}; V=${V%%'"'*}
+        sys_band=$(sys_band_name "$V") ;;
+      *'<int name="Channel"'*)
+        V=${LINE#*'value="'}; V=${V%%'"'*}
+        case "$V" in ''|*[!0-9]*) V=0 ;; esac
+        sys_channel=$V ;;
+      *'<int name="MaxNumberOfClients"'*)
+        V=${LINE#*'value="'}; V=${V%%'"'*}
+        case "$V" in ''|*[!0-9]*) V=0 ;; esac
+        sys_maxclients=$V ;;
+    esac
+  done < "$SYS_WIFI_STORE" 2>/dev/null
+  return 0
+}
+
+# XML 转义（ssid/密码 写入前）
+sys_xml_escape() {
+  printf '%s' "$1" | "$BB" sed 's/&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g'
+}
+
+# 从系统 SoftAP 段输出当前配置 KEY=VAL（status/UI 用）
+sys_softap_status() {
+  sys_softap_get
+  printf 'ssid=%s\n' "$sys_ssid"
+  printf 'security=%s\n' "$sys_security"
+  printf 'band=%s\n' "$sys_band"
+  printf 'channel=%s\n' "$sys_channel"
+  printf 'hidden=%s\n' "$sys_hidden"
+  printf 'maxClients=%s\n' "$sys_maxclients"
+  if [ "$sys_security" = "open" ]; then
+    printf 'passwordSet=0\n'
+  else
+    [ -n "$sys_password" ] && printf 'passwordSet=1\n' || printf 'passwordSet=0\n'
+  fi
+}
+
 # 隐藏 SSID 能力检测（软检测，不执行真命令）：cmd wifi help 中 start-softap 是否支持 -h。
 # 仅解析 help 文本；即使误判，启动失败时 run_softap 会自动回滚为广播 SSID。
 softap_hidden_supported() {
   local OUT SEG
-  OUT=$(/system/bin/cmd wifi help 2>/dev/null)
+  OUT=$("$CMD_WIFI" wifi help 2>/dev/null)
   case "$OUT" in
     *'start-softap'*)
       SEG=${OUT#*start-softap}
@@ -657,50 +779,50 @@ softap_hidden_supported() {
 }
 
 run_softap() {
-  ssid=$1
-  security=$2
-  password=$3
-  band=$4
-  channel=$5
-  maxclients=$6
-  EXTRA=
-  case "$channel" in ''|0|any) ;; *[!0-9]*) : ;; *) EXTRA="$EXTRA -c $channel" ;; esac
-  case "$maxclients" in ''|0) ;; *[!0-9]*) : ;; *) EXTRA="$EXTRA -m $maxclients" ;; esac
-  # 隐藏 SSID（不广播热点名称）：cmd wifi start-softap 支持 -h 选项
-  [ "${HIDDEN:-0}" = "1" ] && EXTRA="$EXTRA -h"
-
-  RC=0
-  if [ "$security" = "open" ]; then
-    /system/bin/cmd wifi start-softap "$ssid" open -b "$band" $EXTRA
-    RC=$?
-  else
-    /system/bin/cmd wifi start-softap "$ssid" "$security" "$password" -b "$band" $EXTRA
-    RC=$?
-  fi
-  # 隐藏 SSID 启动失败 → 自动回滚为广播 SSID 重试一次（持久化 HIDDEN=0 + 通知）
-  if [ "$RC" -ne 0 ] && [ "${HIDDEN:-0}" = "1" ]; then
-    echo "$(date) start-softap with -h failed rc=$RC, retrying without -h" >> "$LOG"
-    if [ "$security" = "open" ]; then
-      /system/bin/cmd wifi start-softap "$ssid" open -b "$band"
-    else
-      /system/bin/cmd wifi start-softap "$ssid" "$security" "$password" -b "$band"
-    fi
-    RC=$?
-    if [ "$RC" -eq 0 ]; then
-      HIDDEN=0
-      if [ ! -f "$CONFIG" ]; then
-        printf 'HIDDEN=0\n' > "$CONFIG" 2>/dev/null
-        chmod 0600 "$CONFIG" 2>/dev/null
-      elif "$BB" grep -q '^HIDDEN=' "$CONFIG" 2>/dev/null; then
-        "$BB" sed -i 's/^HIDDEN=.*/HIDDEN=0/' "$CONFIG" 2>/dev/null
+  # 一套配置：热点参数以系统 SoftApConfiguration 为唯一数据源（系统设置 ↔ Web 同步）。
+  # 主路径：cmd wifi start-softap 无参启动 —— 系统 tethering 使用已保存配置，
+  # 与系统"设置"应用开启热点行为完全一致。
+  # 迁移：系统从未配置热点（XML 无 SoftAp 段）且模块携带有旧参数（首次安装/旧版升级）
+  # 时，先带参启动一次（系统 API 持久化）完成迁移，之后一律以系统配置为准。
+  NEW_SSID_ARG=$1; NEW_SEC_ARG=$2; NEW_PASS_ARG=$3; NEW_BAND_ARG=$4; NEW_CHANNEL_ARG=$5; NEW_MAX_ARG=$6
+  if [ -n "$NEW_SSID_ARG" ] && ! sys_softap_present; then
+    echo "$(date) run_softap: migrating module hotspot config to system SoftApConfiguration" >> "$LOG" 2>/dev/null
+    hotspot_set_config "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" "$NEW_BAND_ARG" "$NEW_CHANNEL_ARG" "${HIDDEN:-0}" "$NEW_MAX_ARG" || {
+      echo "$(date) run_softap: migration failed, falling back to direct start" >> "$LOG" 2>/dev/null
+      if [ "$NEW_SEC_ARG" = "open" ]; then
+        "$CMD_WIFI" wifi start-softap "$NEW_SSID_ARG" open -b "$NEW_BAND_ARG" 2>/dev/null
       else
-        printf 'HIDDEN=0\n' >> "$CONFIG" 2>/dev/null
+        "$CMD_WIFI" wifi start-softap "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" -b "$NEW_BAND_ARG" 2>/dev/null
       fi
-      echo "$(date) hidden-ssid unsupported: rolled back to broadcast SSID, HIDDEN=0 persisted" >> "$LOG"
-      [ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && notify_all_async "热点隐藏SSID回滚" "系统不支持隐藏 SSID（cmd wifi 无 -h 支持），已自动回滚为广播名称。如需重试可在热点设置中重新开启。" 2>/dev/null &
+      return $?
+    }
+  fi
+  # 正常路径：无参启动（用系统配置）
+  "$CMD_WIFI" wifi start-softap 2>/dev/null
+  RC=$?
+  if [ "$RC" -ne 0 ] && [ -n "$NEW_SSID_ARG" ]; then
+    # 无参启动失败（个别 ROM 无参行为差异）→ 退化为带参启动（系统配置值）
+    sys_softap_get
+    if [ "$sys_ok" = "1" ] && [ -n "$sys_ssid" ]; then
+      EXTRA=
+      case "$sys_channel" in ''|0) ;; *) EXTRA="$EXTRA -c $sys_channel" ;; esac
+      case "$sys_maxclients" in ''|0) ;; *) EXTRA="$EXTRA -m $sys_maxclients" ;; esac
+      [ "$sys_hidden" = "1" ] && EXTRA="$EXTRA -h"
+      if [ "$sys_security" = "open" ]; then
+        "$CMD_WIFI" wifi start-softap "$sys_ssid" open -b "$sys_band" $EXTRA 2>/dev/null
+      else
+        "$CMD_WIFI" wifi start-softap "$sys_ssid" "$sys_security" "$sys_password" -b "$sys_band" $EXTRA 2>/dev/null
+      fi
+      RC=$?
     fi
   fi
   return $RC
+}
+
+# 系统是否已存在 SoftAp 配置（XML 只读探测）
+sys_softap_present() {
+  sys_softap_get
+  [ "$sys_ok" = "1" ] && [ -n "$sys_ssid" ]
 }
 
 # ---------- 客户端 MAC 访问策略（黑名单 DROP / 白名单仅放行） ----------
@@ -1294,7 +1416,7 @@ softap_state_ok() {
     ENABLED) return 0 ;;
     DISABLED) return 1 ;;
   esac
-  CMD_STS=$("$BB" timeout 5 /system/bin/cmd wifi status 2>/dev/null)
+  CMD_STS=$("$BB" timeout 5 "$CMD_WIFI" wifi status 2>/dev/null)
   case "$CMD_STS" in
     *"disabled"*|*"Disabled"*|*"DISABLED"*) [ -z "$(get_hotspot_iface)" ] && return 1 ;;
   esac
@@ -3907,7 +4029,7 @@ stop_hotspot_real() {
   BEFORE_IFACE=$(get_hotspot_iface)
   rm -f "$SOFTAP_CACHE" 2>/dev/null
   echo "$(date) hotspot stop: trying wifi stop-softap" >> "$LOG"
-  WIFI_OUT=$( "$BB" timeout 10 /system/bin/cmd wifi stop-softap 2>&1 )
+  WIFI_OUT=$( "$BB" timeout 10 "$CMD_WIFI" wifi stop-softap 2>&1 )
   WIFI_RC=$?
   printf '%s wifi stop-softap rc=%s\n%s\n' "$(date)" "$WIFI_RC" "$WIFI_OUT" >> "$LOG"
   if wait_softap_stopped; then
@@ -3919,7 +4041,7 @@ stop_hotspot_real() {
   fi
   rm -f "$SOFTAP_CACHE" 2>/dev/null
   echo "$(date) hotspot stop: wifi stop-softap ineffective, trying connectivity tether stop" >> "$LOG"
-  TETHER_OUT=$( "$BB" timeout 10 /system/bin/cmd connectivity tether stop 2>&1 )
+  TETHER_OUT=$( "$BB" timeout 10 "$CMD_WIFI" connectivity tether stop 2>&1 )
   TETHER_RC=$?
   printf '%s tether stop rc=%s\n%s\n' "$(date)" "$TETHER_RC" "$TETHER_OUT" >> "$LOG"
   if wait_softap_stopped; then
@@ -3932,3 +4054,8 @@ stop_hotspot_real() {
   echo "$(date) hotspot stop failed: hotspot still active" >> "$LOG"
   return 1
 }
+
+# Hotspot Compatibility Layer（统一接口：能力检测/读/写/状态/启停）
+if [ -r "$MODDIR/lib/compat.sh" ]; then
+  . "$MODDIR/lib/compat.sh" || echo "compat.sh source failed" >> "$LOG" 2>/dev/null
+fi

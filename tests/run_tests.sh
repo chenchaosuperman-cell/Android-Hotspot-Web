@@ -25,6 +25,9 @@ ok() { # desc rc
 }
 
 echo "== 加载 lib/common.sh =="
+# 让 common.sh 能找到 compat.sh（测试环境用仓库目录模拟 MODDIR，须在 source 前设置）
+MODDIR=$ROOT
+export MODDIR
 # shellcheck disable=SC1091
 . "$ROOT/lib/common.sh" 2>/dev/null || { echo "source 失败：请确认在仓库根目录下运行"; exit 1; }
 # 测试机 mock：macOS/Linux 无 /system/bin/*，
@@ -196,6 +199,135 @@ assert_eq '升级后 新字段 PROXY_SELF=0' '0' "$PROXY_SELF"
 assert_eq '升级后 新字段 MAC_MODE=blacklist' 'blacklist' "$MAC_MODE"
 assert_eq '升级后 新字段 ALLOWED_MACS 空' '' "$ALLOWED_MACS"
 rm -rf "$TMPDIR_CFG3"
+
+echo
+echo "== Hotspot Compatibility Layer（v1.7.6）=="
+# 测试环境：DATA_DIR 覆盖为临时目录（sys_softap_set 的备份目录），SYS_WIFI_STORE 覆盖为 mock XML
+TMP_SYS_DIR=$(mktemp -d /tmp/sysap_cfg.XXXXXX) || exit 1
+DATA_DIR="$TMP_SYS_DIR"
+export DATA_DIR
+cat > "$TMP_SYS_DIR/store.xml" <<'XMLEOF'
+<WifiConfigStoreData>
+<int name="Version" value="3" />
+<SoftAp>
+<string name="WifiSsid">&quot;Xiaomi14-MiFi&quot;</string>
+<boolean name="HiddenSSID" value="false" />
+<int name="SecurityType" value="1" />
+<string name="Passphrase">87654321</string>
+<int name="MaxNumberOfClients" value="0" />
+</SoftAp>
+<string name="KeepMe">xyz</string>
+</WifiConfigStoreData>
+XMLEOF
+SYS_WIFI_STORE="$TMP_SYS_DIR/store.xml"
+export SYS_WIFI_STORE
+
+sys_softap_get
+assert_eq 'sys 解析 Android13 WifiSsid(实体包裹)' 'Xiaomi14-MiFi' "$sys_ssid"
+assert_eq 'sys 解析 安全类型 1=wpa2' 'wpa2' "$sys_security"
+assert_eq 'sys 解析 密码' '87654321' "$sys_password"
+assert_eq 'sys 解析 无Band字段→any' 'any' "$sys_band"
+assert_eq 'sys 解析 hidden=false' '0' "$sys_hidden"
+assert_eq 'sys 解析 ok=1' '1' "$sys_ok"
+
+# 修改系统配置走系统 API（mock cmd wifi 记录调用参数；热点关闭 → 带参启动保存后停止）
+MOCK_LOG="$TMP_SYS_DIR/mock_cmd.log"
+: > "$MOCK_LOG"
+LOG="$TMP_SYS_DIR/service.log"
+export LOG
+cat > "$TMP_SYS_DIR/cmdwifi" <<CMDEOF
+#!/bin/sh
+printf '%s\n' "\$*" >> "$MOCK_LOG"
+exit 0
+CMDEOF
+chmod +x "$TMP_SYS_DIR/cmdwifi"
+CMD_WIFI="$TMP_SYS_DIR/cmdwifi"
+export CMD_WIFI
+
+hotspot_set_config "New Hotspot" "wpa3" "Pass@123" "5" "149" "1" "8"
+assert_eq 'set_config rc=0' '0' "$?"
+# 期望调用：带参启动（含 -h）+ 保存后停止（WAS_ON=0）
+"$BB" grep -q 'start-softap New Hotspot wpa3 Pass@123 -b 5 -c 149 -m 8 -h' "$MOCK_LOG"; ok 'set_config 带参启动（系统API持久化）' $?
+"$BB" grep -q 'stop-softap' "$MOCK_LOG"; ok 'set_config 热点关闭时保存后停止' $?
+
+# 密码留空 → 读取系统旧密码（XML 只读）再带参启动
+: > "$MOCK_LOG"
+SYS_WIFI_STORE="$TMP_SYS_DIR/store.xml"
+hotspot_set_config "New Hotspot" "wpa2" "" "2" "0" "0" "0"
+assert_eq 'set_config 留空密码 rc=0' '0' "$?"
+"$BB" grep -q 'start-softap New Hotspot wpa2 87654321 -b 2' "$MOCK_LOG"; ok 'set_config 留空密码沿用系统密码' $?
+
+# open 网络 → 无密码参数
+: > "$MOCK_LOG"
+hotspot_set_config "Open-Net" "open" "" "2" "0" "0" "0"
+"$BB" grep -q 'start-softap Open-Net open -b 2' "$MOCK_LOG"; ok 'set_config open 网络无密码' $?
+# 注意：非 open 时 open 分支不应带密码（grep 不含密码参数即可）——上面已覆盖
+
+# run_softap：系统已有配置 → 无参启动（用系统配置）
+: > "$MOCK_LOG"
+run_softap "" "" "" "" "" ""
+"$BB" grep -q 'start-softap$' "$MOCK_LOG"; ok 'run_softap 系统已有配置 → 无参启动' $?
+
+# run_softap：系统无 SoftAp 段且带旧参数 → 先迁移（带参启动）再无参启动
+: > "$MOCK_LOG"
+cat > "$TMP_SYS_DIR/store4.xml" <<'XMLEOF'
+<WifiConfigStoreData>
+<int name="Version" value="3" />
+</WifiConfigStoreData>
+XMLEOF
+SYS_WIFI_STORE="$TMP_SYS_DIR/store4.xml"
+run_softap "Migrated-AP" "wpa2" "12345678" "any" "0" "0"
+"$BB" grep -q 'start-softap Migrated-AP wpa2 12345678 -b any' "$MOCK_LOG"; ok 'run_softap 迁移带参启动（旧配置→系统API）' $?
+"$BB" grep -q 'stop-softap' "$MOCK_LOG"; ok 'run_softap 迁移后恢复关闭（保存不启动）' $?
+
+# 新版 SSID 标签（SoftApConfToXmlMigration 风格）
+cat > "$TMP_SYS_DIR/store3.xml" <<'XMLEOF'
+<WifiConfigStoreData>
+<int name="Version" value="3" />
+<SoftAp>
+<string name="SSID">Modern-AP</string>
+<int name="SecurityType" value="4" />
+<string name="Passphrase">12345678</string>
+<int name="Band" value="3" />
+</SoftAp>
+</WifiConfigStoreData>
+XMLEOF
+SYS_WIFI_STORE="$TMP_SYS_DIR/store3.xml"
+sys_softap_get
+assert_eq 'sys 新版SSID标签解析' 'Modern-AP' "$sys_ssid"
+assert_eq 'sys 新版 安全类型4=wpa3_transition' 'wpa3_transition' "$sys_security"
+assert_eq 'sys 新版 Band3=any' 'any' "$sys_band"
+
+# 能力检测 JSON（mock cmd wifi：用假命令模拟 Android 13 风格 help）
+cat > "$TMP_SYS_DIR/cmdwifi" <<'CMDEOF'
+#!/bin/sh
+if [ "$1" = "wifi" ] && [ "$2" = "help" ]; then
+  cat <<'HELP'
+cmd wifi help
+  start-softap <ssid> (open|wpa2|wpa3) <passphrase> [-b 2|5|6|any] [-c channel] [-m max_clients] [-h]
+  stop-softap
+HELP
+fi
+exit 0
+CMDEOF
+chmod +x "$TMP_SYS_DIR/cmdwifi"
+# mock 提供了 start-softap help → startStop=true
+hotspot_detect_capabilities
+CAPS=$HOTSPOT_CAPS_JSON
+case "$CAPS" in *'"startStop":true'*) ok 'caps cmd wifi 支持 start-softap → startStop=true' 0 ;; *) ok 'caps cmd wifi 支持 start-softap → startStop=true' 1 ;; esac
+# 真正无 cmd wifi（路径不存在）→ startStop=false
+CMD_WIFI=/nonexistent/cmd
+hotspot_detect_capabilities
+CAPS=$HOTSPOT_CAPS_JSON
+case "$CAPS" in *'"startStop":false'*) ok 'caps 无 cmd wifi → startStop=false' 0 ;; *) ok 'caps 无 cmd wifi → startStop=false' 1 ;; esac
+case "$CAPS" in *'"readConfig":true'*) ok 'caps 系统XML可读 → readConfig=true' 0 ;; *) ok 'caps 系统XML可读 → readConfig=true' 1 ;; esac
+case "$CAPS" in *'"writeConfig":true'*) ok 'caps 系统XML可写 → writeConfig=true' 0 ;; *) ok 'caps 系统XML可写 → writeConfig=true' 1 ;; esac
+case "$CAPS" in *'"syncLevel":"A"'*) ok 'caps 同步级别 A（读写）' 0 ;; *) ok 'caps 同步级别 A（读写）' 1 ;; esac
+case "$CAPS" in *'"android":'*'"band2g":'*'"hiddenSsid":'*'"channelControl":'*'"maxClients":'*) ok 'caps JSON 字段齐全' 0 ;; *) ok 'caps JSON 字段齐全' 1 ;; esac
+# 统一接口可用性
+hotspot_get_capabilities >/dev/null 2>&1; ok '接口 hotspot_get_capabilities' $?
+hotspot_get_config >/dev/null 2>&1; ok '接口 hotspot_get_config' $?
+rm -rf "$TMP_SYS_DIR"
 
 echo
 echo "== 结果：$PASS 通过 / $FAIL 失败 =="

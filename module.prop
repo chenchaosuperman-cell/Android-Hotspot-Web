@@ -1,7 +1,7 @@
 id=xiaomi_mifi_web
 name=Android-Hotspot-Web
-version=1.7.5-beta
-versionCode=1725
+version=1.7.6-beta
+versionCode=1726
 author=chenchaosuperman
-description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, MAC blacklist/whitelist, scheduling, SMS forward, Mihomo proxy, PushPlus/DingTalk/Bark notifications, hidden SSID, device diagnostics. Primarily tested on Xiaomi 14 / HyperOS 3 / Android 16. v1.7.4-beta: MAC whitelist, data exhaustion forecast, device adaptation check; v1.7.5-beta: stability fixes (proxy default scope hotspot, MAC policy cleanup); v1.7.3-beta: hidden SSID.
+description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, MAC blacklist/whitelist, scheduling, SMS forward, Mihomo proxy, PushPlus/DingTalk/Bark notifications, hidden SSID, device diagnostics. Generic Android compatibility via Hotspot Compatibility Layer (capability-driven; system WifiConfigStore.xml as single source of truth). Verified: Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU. v1.7.6-beta: one-config with system hotspot settings, Hotspot Compatibility Layer (7 unified APIs), 6GHz support.
 updateJson=https://raw.githubusercontent.com/chenchaosuperman-cell/Android-Hotspot-Web/main/update.json
