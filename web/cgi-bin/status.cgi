@@ -115,6 +115,23 @@ else
   PLAN_DAYS_LEFT=$((_LDM-_DD+_eff2))
 fi
 
+# 流量耗尽预测：日均消耗 = 账期已用字节 / 已过天数；预计可用天数 = 剩余字节 / 日均
+PREDICT_DAYS=0
+if [ "$PLAN_PERCENT" -ge 0 ] 2>/dev/null && [ -n "$PLAN_PERIOD_DAY" ]; then
+  _PSE=$($DATE_CMD -d "$(printf '%s-%s-%s' "${PLAN_PERIOD_DAY:0:4}" "${PLAN_PERIOD_DAY:4:2}" "${PLAN_PERIOD_DAY:6:2}")" +%s 2>/dev/null)
+  _TDE=$($DATE_CMD +%s 2>/dev/null)
+  if [ -n "$_PSE" ] && [ -n "$_TDE" ] && [ "$_PSE" -gt 0 ] 2>/dev/null && [ "$_TDE" -gt "$_PSE" ] 2>/dev/null; then
+    _EL=$(( (_TDE - _PSE) / 86400 ))
+    [ "$_EL" -lt 1 ] && _EL=1
+    _AVG=$(( PLAN_PERIOD_USED / _EL ))
+    _REMAIN_B=$(( PLAN_TOTAL * 1048576 - PLAN_PERIOD_BYTES ))
+    [ "$_REMAIN_B" -lt 0 ] && _REMAIN_B=0
+    if [ "$_AVG" -gt 0 ] 2>/dev/null; then
+      PREDICT_DAYS=$(( _REMAIN_B / _AVG ))
+    fi
+  fi
+fi
+
 IDLE_LEFT=$(cat "$IDLE_FILE" 2>/dev/null | "$BB" tr -d ' ')
 case "$IDLE_LEFT" in ''|*[!0-9]*) IDLE_LEFT=0 ;; esac
 
@@ -296,8 +313,8 @@ printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%
 printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,' \
   "$(json_escape "$SSID")" "$([ -n "$PASS_B64" ] && echo true || echo false)" "$(json_escape "$SECURITY")" "$(json_escape "$BAND")" "${CHANNEL:-0}" "$([ "${HIDDEN:-0}" = "1" ] && echo true || echo false)"
 printf '"maxClients":%s,"keepalive":%s,"idleShutdown":%s,"holdOff":%s,' "${MAX_CLIENTS:-0}" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${HOLD_OFF:-0}" = "1" ] && echo true || echo false)"
-printf '"sched":{"enable":%s,"on":"%s","off":"%s","mode":"%s","onWd":"%s","offWd":"%s","onWe":"%s","offWe":"%s"},' \
-  "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${SCHED_ON:-2300}")" "$(json_escape "${SCHED_OFF:-0700}")" "$(json_escape "${SCHED_MODE:-daily}")" "$(json_escape "${SCHED_ON_WD:-2300}")" "$(json_escape "${SCHED_OFF_WD:-0700}")" "$(json_escape "${SCHED_ON_WE:-2300}")" "$(json_escape "${SCHED_OFF_WE:-0700}")"
+printf '"sched":{"enable":%s,"on":"%s","off":"%s","mode":"%s","onWd":"%s","offWd":"%s","onWe":"%s","offWe":"%s"},"restartDaily":{"enable":%s,"time":"%s"},' \
+  "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${SCHED_ON:-2300}")" "$(json_escape "${SCHED_OFF:-0700}")" "$(json_escape "${SCHED_MODE:-daily}")" "$(json_escape "${SCHED_ON_WD:-2300}")" "$(json_escape "${SCHED_OFF_WD:-0700}")" "$(json_escape "${SCHED_ON_WE:-2300}")" "$(json_escape "${SCHED_OFF_WE:-0700}")" "$([ "${RESTART_DAILY_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "${RESTART_DAILY_TIME:-0300}")"
 printf '"autostart":%s,"iface":"%s","ip":"%s","nativeIp":"%s","port":%s,"battery":%s,"charging":%s,' \
   "$([ "$AUTOSTART" = "1" ] && echo true || echo false)" "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$NATIVE_IP")" "$PORT" "$BATTERY" "$CHARGING"
 printf '"desired":%s,"csrf":"%s","operation":{"state":"%s","time":%s,"message":"%s"},' \
@@ -324,21 +341,22 @@ CHAIN_UP=$($IPT -L mifi_up -n -v -x 2>/dev/null | "$BB" awk 'NR>2 && $1 ~ /^[0-9
 CHAIN_DN=$($IPT -L mifi_dn -n -v -x 2>/dev/null | "$BB" awk 'NR>2 && $1 ~ /^[0-9]+$/ {s+=$2} END {print s+0}')
 # v1.5.10：today/month 输出字节（前端 formatTrafficMb(d/1048576) 换算），不再丢失小流量
 TRAFFIC_SINCE=$("$BB" cut -d'|' -f1 "$TRAFFIC_BASE" 2>/dev/null)
-printf '"traffic":{"today":%s,"month":%s,"todayValid":%s,"monthValid":%s,"plan":%s,"planPercent":%s,"planRemain":%s,"chainUp":%s,"chainDn":%s,"planDay":%s,"daysLeft":%s,"periodUsed":%s,"periodStart":"%s","since":"%s",'   "$TRAFFIC_TODAY_BYTES" "$TRAFFIC_MONTH_BYTES" "$TRAFFIC_TODAY_VALID" "$TRAFFIC_MONTH_VALID" "$PLAN_TOTAL" "$PLAN_PERCENT" "$PLAN_REMAIN" "$CHAIN_UP" "$CHAIN_DN" "${DATA_PLAN_DAY:-1}" "$PLAN_DAYS_LEFT" "$PLAN_PERIOD_USED" "$(json_escape "$PLAN_PERIOD_DAY")" "$(json_escape "$TRAFFIC_SINCE")"
+printf '"traffic":{"today":%s,"month":%s,"todayValid":%s,"monthValid":%s,"plan":%s,"planPercent":%s,"planRemain":%s,"chainUp":%s,"chainDn":%s,"planDay":%s,"daysLeft":%s,"periodUsed":%s,"periodStart":"%s","since":"%s","predictDays":%s,'   "$TRAFFIC_TODAY_BYTES" "$TRAFFIC_MONTH_BYTES" "$TRAFFIC_TODAY_VALID" "$TRAFFIC_MONTH_VALID" "$PLAN_TOTAL" "$PLAN_PERCENT" "$PLAN_REMAIN" "$CHAIN_UP" "$CHAIN_DN" "${DATA_PLAN_DAY:-1}" "$PLAN_DAYS_LEFT" "$PLAN_PERIOD_USED" "$(json_escape "$PLAN_PERIOD_DAY")" "$(json_escape "$TRAFFIC_SINCE")" "$PREDICT_DAYS"
 printf '"days":[%s],"history":%s},' "$(build_traffic_days)" "$(build_traffic_history)"
 printf '"smsFwd":{"on":%s,"keyword":%s,"senders":%s,"keywordText":"%s","sendersText":"%s"},' "$([ "${SMS_FWD:-0}" = "1" ] && echo true || echo false)" "$([ -n "${SMS_FWD_KEYWORD_B64:-}" ] && echo true || echo false)" "$([ -n "${SMS_FWD_SENDERS_B64:-}" ] && echo true || echo false)" "$(json_escape "${SMS_FWD_KEYWORD:-}")" "$(json_escape "${SMS_FWD_SENDERS:-}")"
 printf '"lowbatt":{"enable":%s,"threshold":%s,"level":"%s","power":%s,"latch":"%s","reason":"%s","checked":%s},' "$([ "$LB_EN" = "1" ] && echo true || echo false)" "$LB_TH" "$(json_escape "$LB_LEVEL")" "$LB_POWER" "$(json_escape "$LB_LATCH")" "$(json_escape "$LB_REASON")" "$LB_CHECKED"
 printf '"idleLeft":%s,' "$IDLE_LEFT"
-printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"hotspotEvt":%s,"thresholds":"%s"},' \
-  "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
-printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s},' \
-  "$(health_json pp)" "$(health_json dt)" "$(health_json sms)"
+printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"hotspotEvt":%s,"newDevice":%s,"bark":%s,"sc":%s,"thresholds":"%s"},' \
+  "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_NEW_DEVICE:-0}" = "1" ] && echo true || echo false)" "$([ -n "${BARK_KEY_B64:-}" ] && echo true || echo false)" "$([ -n "${SERVERCHAN_KEY_B64:-}" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
+printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s,"bk":%s,"sc":%s},' \
+  "$(health_json pp)" "$(health_json dt)" "$(health_json sms)" "$(health_json bk)" "$(health_json sc)"
 printf '"proxy":%s,' "$(proxy_status_json "$IFACE")"
   printf '"signal":{"network":"%s","operator":"%s","sim":"%s","band":"%s","pci":%s,"rsrp":%s,"rsrq":%s,"sinr":%s,"level":"%s"},' \
   "$(json_escape "$SIG_NETWORK")" "$(json_escape "$SIG_OPERATOR")" "$(json_escape "$SIG_SIM")" "$(json_escape "$SIG_BAND")" "${SIG_PCI:-0}" "${SIG_RSRP:-0}" "${SIG_RSRQ:-0}" "${SIG_SINR:-0}" "$(json_escape "$SIG_LEVEL")"
 printf '"auto":{"desired":%s,"keepalive":%s,"idleMin":%s,"sched":%s,"stopReason":"%s","limitAction":"%s"},' \
   "$([ "$DESIRED" = "1" ] && echo true || echo false)" "$([ "${KEEPALIVE:-0}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)" "$(json_escape "$STOP_REASON")" "${DATA_LIMIT_ACTION:-stop}"
 printf '"blocked":[%s],' "$(build_blocked)"
+printf '"macMode":"%s","allowedMacs":"%s",' "$(json_escape "${MAC_MODE:-blacklist}")" "$(json_escape "$ALLOWED_MACS")"
 printf '"history":['
 build_history
 printf '],"clients":['

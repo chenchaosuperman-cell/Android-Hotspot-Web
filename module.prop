@@ -1,7 +1,7 @@
 id=xiaomi_mifi_web
 name=Android-Hotspot-Web
-version=1.7.3-beta
-versionCode=1722
+version=1.7.4-beta
+versionCode=1723
 author=chenchaosuperman
-description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, scheduling, SMS forward, mihomo proxy, PushPlus/DingTalk notifications. Primarily tested on Xiaomi 14 / HyperOS 3 / Android 16. v1.7.3-beta: new hidden SSID option (broadcast/stealth hotspot); v1.7.2-beta.1: fixes cold-boot status loading, bounded dumpsys collection, shared telephony snapshot, frontend request timeout, and service/action lifecycle issues.
+description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, scheduling, SMS forward, mihomo proxy, PushPlus/DingTalk/Bark/ServerChan notifications. Primarily tested on Xiaomi 14 / HyperOS 3 / Android 16. v1.7.4-beta: MAC whitelist, new-device notification, daily scheduled restart, data exhaustion forecast, login fail lockout, device adaptation check; v1.7.3-beta: hidden SSID.
 updateJson=https://raw.githubusercontent.com/chenchaosuperman-cell/Android-Hotspot-Web/main/update.json

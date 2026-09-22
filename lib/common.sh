@@ -61,6 +61,7 @@ ensure_web_fw() {
   chmod 0600 "$WEB_FW_PORT_FILE" 2>/dev/null
 }
 NOTIFY_QUEUE="$DATA_DIR/notify.queue"
+KNOWN_DEVICES="$DATA_DIR/known_devices"
 SMS_QUEUE="$DATA_DIR/sms.queue"
 SMS_BUSY="$DATA_DIR/sms.busy"
 NOTIFY_HEALTH_FILE="$DATA_DIR/notify_health"
@@ -251,6 +252,8 @@ cfg_apply_key() {
           case "$value" in 0|1) NOTIFY_LIMIT=$value ;; esac ;;
         NOTIFY_HOTSPOT_EVT)
           case "$value" in 0|1) NOTIFY_HOTSPOT_EVT=$value ;; esac ;;
+        NOTIFY_NEW_DEVICE)
+          case "$value" in 0|1) NOTIFY_NEW_DEVICE=$value ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
           # 逗号分隔 1~100，最多 5 个；非法值忽略（默认 80,90,100）
           _NT_RAW="$value"
@@ -339,6 +342,22 @@ cfg_apply_key() {
             fi
           done
           BLOCKED_MACS=$NEW ;;
+        MAC_MODE)
+          case "$value" in blacklist|whitelist) MAC_MODE=$value ;; esac ;;
+        ALLOWED_MACS)
+          NEW=
+          for m in $value; do
+            if valid_mac "$m"; then
+              if [ -z "$NEW" ]; then NEW=$m; else NEW="$NEW $m"; fi
+            fi
+          done
+          ALLOWED_MACS=$NEW ;;
+        RESTART_DAILY_ENABLE)
+          case "$value" in 0|1) RESTART_DAILY_ENABLE=$value ;; esac ;;
+        RESTART_DAILY_TIME)
+          case "$value" in ''|*[!0-9]*) : ;;
+            *) [ ${#value} -eq 4 ] && RESTART_DAILY_TIME=$value ;;
+          esac ;;
         PUSHPLUS_TOKEN_B64)
           if [ -z "$value" ]; then PUSHPLUS_TOKEN_B64=
           elif valid_b64url "$value"; then PUSHPLUS_TOKEN_B64=$value
@@ -350,6 +369,14 @@ cfg_apply_key() {
         DINGTALK_SECRET_B64)
           if [ -z "$value" ]; then DINGTALK_SECRET_B64=
           elif valid_b64url "$value"; then DINGTALK_SECRET_B64=$value
+          fi ;;
+        BARK_KEY_B64)
+          if [ -z "$value" ]; then BARK_KEY_B64=
+          elif valid_b64url "$value"; then BARK_KEY_B64=$value
+          fi ;;
+        SERVERCHAN_KEY_B64)
+          if [ -z "$value" ]; then SERVERCHAN_KEY_B64=
+          elif valid_b64url "$value"; then SERVERCHAN_KEY_B64=$value
           fi ;;
         SMS_FWD_KEYWORD_B64)
           if [ -z "$value" ]; then SMS_FWD_KEYWORD_B64=
@@ -409,15 +436,24 @@ load_config() {
   PORT80_MIGRATED=${PORT80_MIGRATED:-0}
   MIGRATE_REMOVED=${MIGRATE_REMOVED:-0}
   BLOCKED_MACS=${BLOCKED_MACS:-}
+  MAC_MODE=${MAC_MODE:-blacklist}
+  ALLOWED_MACS=${ALLOWED_MACS:-}
+  RESTART_DAILY_ENABLE=${RESTART_DAILY_ENABLE:-0}
+  RESTART_DAILY_TIME=${RESTART_DAILY_TIME:-0300}
   PUSHPLUS_TOKEN_B64=${PUSHPLUS_TOKEN_B64:-}
   DINGTALK_WEBHOOK_B64=${DINGTALK_WEBHOOK_B64:-}
   DINGTALK_SECRET_B64=${DINGTALK_SECRET_B64:-}
+  BARK_KEY_B64=${BARK_KEY_B64:-}
+  SERVERCHAN_KEY_B64=${SERVERCHAN_KEY_B64:-}
   NOTIFY_LIMIT=${NOTIFY_LIMIT:-1}
   NOTIFY_HOTSPOT_EVT=${NOTIFY_HOTSPOT_EVT:-1}
+  NOTIFY_NEW_DEVICE=${NOTIFY_NEW_DEVICE:-0}
   NOTIFY_TRAFFIC_THRESHOLDS=${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}
   PUSHPLUS_TOKEN=$(b64url_decode "$PUSHPLUS_TOKEN_B64")
   DINGTALK_WEBHOOK=$(b64url_decode "$DINGTALK_WEBHOOK_B64")
   DINGTALK_SECRET=$(b64url_decode "$DINGTALK_SECRET_B64")
+  BARK_KEY=$(b64url_decode "$BARK_KEY_B64")
+  SERVERCHAN_KEY=$(b64url_decode "$SERVERCHAN_KEY_B64")
   SMS_FWD=${SMS_FWD:-0}
   SMS_FWD_KEYWORD_B64=${SMS_FWD_KEYWORD_B64:-}
   SMS_FWD_SENDERS_B64=${SMS_FWD_SENDERS_B64:-}
@@ -642,10 +678,14 @@ run_softap() {
   fi
 }
 
-# ---------- 客户端黑名单（iptables MAC 丢弃） ----------
+# ---------- 客户端 MAC 访问策略（黑名单 DROP / 白名单仅放行） ----------
 apply_blacklist() {
   iface=$1
   [ -z "$iface" ] && return 0
+  if [ "${MAC_MODE:-blacklist}" = "whitelist" ]; then
+    apply_whitelist "$iface"
+    return $?
+  fi
   # P0-43：只 DROP FORWARD（禁止上网），不再 DROP INPUT——否则会连管理页/手机本机访问一起阻断
   # P1-44：逐条验证规则是否真正添加，任一失败记日志（调用方可据此返回“保存但未生效”）
   for mac in $BLOCKED_MACS; do
@@ -656,6 +696,23 @@ apply_blacklist() {
       fi
     fi
   done
+}
+
+# 白名单模式：专用链 mifi_acl，白名单 MAC RETURN 放行，其余 DROP。
+# 跳转插在 FORWARD 首位（先于 mifi_stats 计数链），RETURN 后继续走后续规则。
+apply_whitelist() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  $IPT -N mifi_acl 2>/dev/null || { $IPT -F mifi_acl 2>/dev/null; }
+  for mac in $ALLOWED_MACS; do
+    valid_mac "$mac" || continue
+    $IPT -C mifi_acl -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null || \
+      $IPT -A mifi_acl -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null
+  done
+  $IPT -C mifi_acl -j DROP 2>/dev/null || $IPT -A mifi_acl -j DROP 2>/dev/null
+  $IPT -C FORWARD -i "$iface" -j mifi_acl 2>/dev/null || \
+    $IPT -I FORWARD 1 -i "$iface" -j mifi_acl 2>/dev/null
+  return 0
 }
 
 clear_blacklist() {
@@ -676,6 +733,14 @@ clear_blacklist() {
       N=$((N + 1))
     done
   done
+  # 白名单模式链 mifi_acl：先删 FORWARD 跳转，再清链删除
+  N=0
+  while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -j mifi_acl 2>/dev/null; do
+    $IPT -D FORWARD -i "$iface" -j mifi_acl 2>/dev/null
+    N=$((N + 1))
+  done
+  $IPT -F mifi_acl 2>/dev/null || true
+  $IPT -X mifi_acl 2>/dev/null || true
 }
 
 unblock_one_mac() {
@@ -1218,6 +1283,31 @@ verify_softap_config() {
 # ---------- 客户端厂商识别（MAC OUI 前缀表） ----------
 # MAC 前 3 字节（大写，如 "F0:18:98"）→ 厂商名；未收录返回空。
 # 调用前先归一化大写：V=$(printf '%s' "$MAC" | tr 'a-f' 'A-F')
+# ---------- 新设备接入通知 ----------
+# 首次出现的客户端 MAC 记录到 known_devices 并推送（PushPlus/钉钉）。
+# 配置键 NOTIFY_NEW_DEVICE（0/1）；列表按 MAC 持久化，同一设备只通知一次。
+check_new_clients() {
+  [ "${NOTIFY_NEW_DEVICE:-0}" = "1" ] || return 0
+  IFACE_N=$(get_hotspot_iface)
+  [ -n "$IFACE_N" ] || return 0
+  touch "$KNOWN_DEVICES" 2>/dev/null
+  list_clients "$IFACE_N" | while IFS='|' read -r CL_IP CL_MAC CL_ST; do
+    [ -n "$CL_MAC" ] || continue
+    CL_MAC_U=$(printf '%s' "$CL_MAC" | "$BB" tr 'a-f' 'A-F')
+    case "$CL_MAC_U" in ''|00:00:00:00:00:00) continue ;; esac
+    if ! "$BB" grep -qx "$CL_MAC_U" "$KNOWN_DEVICES" 2>/dev/null; then
+      printf '%s\n' "$CL_MAC_U" >> "$KNOWN_DEVICES" 2>/dev/null
+      CL_VENDOR=$(mac_vendor "$CL_MAC_U")
+      notify_all_async "热点新设备接入" "新设备已连接热点：
+IP: ${CL_IP:-未知}
+MAC: $CL_MAC_U${CL_VENDOR:+（$CL_VENDOR）}
+时间: $(/system/bin/date '+%m-%d %H:%M')"
+      echo "$(date) new-device: $CL_MAC_U${CL_VENDOR:+($CL_VENDOR)} ${CL_IP:-?}" >> "$LOG"
+    fi
+  done
+  return 0
+}
+
 mac_vendor() {
   mac=$1
   PREFIX=$(printf '%s' "$mac" | "$BB" cut -d: -f1-3 2>/dev/null)
@@ -1938,6 +2028,68 @@ send_dingtalk() {
   return 1
 }
 
+# 发送 Bark（iPhone 推送）：POST JSON 到 https://api.day.app/{key}
+send_bark() {
+  BARK_LAST_ERR=
+  [ -n "${BARK_KEY:-}" ] || return 2
+  TITLE_ESC=$(json_escape "$1")
+  CONTENT_ESC=$(json_escape_nl "$2")
+  ERR_TMP="$DATA_DIR/.bk_err.$$"
+  R=$(/system/bin/curl -sS -m 8 -X POST "https://api.day.app/$BARK_KEY" \
+      -H "Content-Type: application/json" \
+      -d "{\"title\":\"$TITLE_ESC\",\"body\":\"$CONTENT_ESC\"}" 2>"$ERR_TMP")
+  RC=$?
+  CURL_ERR=$("$BB" cat "$ERR_TMP" 2>/dev/null | "$BB" head -c 200)
+  rm -f "$ERR_TMP"
+  if [ "$RC" -ne 0 ]; then
+    BARK_LAST_ERR="curl 错误($RC)${CURL_ERR:+: $CURL_ERR}"
+    echo "$(date) bark curl failed rc=$RC ${CURL_ERR:+err=$CURL_ERR}" >> "$LOG"
+    health_note bk 1 "$BARK_LAST_ERR"
+    return 1
+  fi
+  if printf '%s' "$R" | "$BB" grep -q '"code":200'; then
+    echo "$(date) bark ok" >> "$LOG"
+    health_note bk 0 ''
+    return 0
+  fi
+  BERR=$(printf '%s' "$R" | "$BB" head -c 200)
+  BARK_LAST_ERR="Bark 返回: $BERR"
+  echo "$(date) bark err: $BERR" >> "$LOG"
+  health_note bk 1 "$BARK_LAST_ERR"
+  return 1
+}
+
+# 发送 Server酱（微信推送）：POST 到 https://sctapi.ftqq.com/{key}.send
+send_serverchan() {
+  SERVERCHAN_LAST_ERR=
+  [ -n "${SERVERCHAN_KEY:-}" ] || return 2
+  TITLE_ESC=$(json_escape "$1")
+  CONTENT_ESC=$(json_escape_nl "$2")
+  ERR_TMP="$DATA_DIR/.sc_err.$$"
+  R=$(/system/bin/curl -sS -m 8 -X POST "https://sctapi.ftqq.com/$SERVERCHAN_KEY.send" \
+      -H "Content-Type: application/json" \
+      -d "{\"title\":\"$TITLE_ESC\",\"desp\":\"$CONTENT_ESC\"}" 2>"$ERR_TMP")
+  RC=$?
+  CURL_ERR=$("$BB" cat "$ERR_TMP" 2>/dev/null | "$BB" head -c 200)
+  rm -f "$ERR_TMP"
+  if [ "$RC" -ne 0 ]; then
+    SERVERCHAN_LAST_ERR="curl 错误($RC)${CURL_ERR:+: $CURL_ERR}"
+    echo "$(date) serverchan curl failed rc=$RC ${CURL_ERR:+err=$CURL_ERR}" >> "$LOG"
+    health_note sc 1 "$SERVERCHAN_LAST_ERR"
+    return 1
+  fi
+  if printf '%s' "$R" | "$BB" grep -q '"code":0'; then
+    echo "$(date) serverchan ok" >> "$LOG"
+    health_note sc 0 ''
+    return 0
+  fi
+  SERR=$(printf '%s' "$R" | "$BB" head -c 200)
+  SERVERCHAN_LAST_ERR="Server酱 返回: $SERR"
+  echo "$(date) serverchan err: $SERR" >> "$LOG"
+  health_note sc 1 "$SERVERCHAN_LAST_ERR"
+  return 1
+}
+
 # 向所有已配置渠道推送（$1=标题 $2=内容，内容可含真实换行）
 # 返回 0=至少一个渠道成功；1=全部失败（未配置渠道按失败计，但调用方应先判断已配置）
 notify_all() {
@@ -1947,7 +2099,11 @@ notify_all() {
   # 把标题并入正文（【标题】 内容），确保自动通知可命中关键词
   send_dingtalk "【$1】 $2"
   RC2=$?
-  [ "$RC1" = "0" ] || [ "$RC2" = "0" ]
+  send_bark "$1" "$2"
+  RC3=$?
+  send_serverchan "$1" "$2"
+  RC4=$?
+  [ "$RC1" = "0" ] || [ "$RC2" = "0" ] || [ "$RC3" = "0" ] || [ "$RC4" = "0" ]
 }
 
 # 通知队列（目录式，一消息一文件）：事件先入队，后台 worker 顺序发送，主守护循环不被 curl 阻塞。
@@ -2015,8 +2171,8 @@ notify_all_async() {
   SPID=$(self_pid); case "$SPID" in ''|*[!0-9]*) SPID=$$ ;; esac
   SEQ=$(notify_next_seq)
   # 单文件入队：文件名含时间戳/真实PID/原子序号（不依赖 $RANDOM，同秒同进程多条不会覆盖）；
-  # 内容 6 字段：title|msg|pp_state|dt_state|retry|next_ts（渠道独立状态，供失败重试）
-  printf '%s|%s|pending|pending|0|0\n' "$TB" "$MB" > "$NOTIFY_QUEUE/$TS.$SPID.$SEQ.msg" 2>/dev/null
+  # 内容 8 字段：title|msg|pp_state|dt_state|bk_state|sc_state|retry|next_ts（渠道独立状态，供失败重试）
+  printf '%s|%s|pending|pending|pending|pending|0|0\n' "$TB" "$MB" > "$NOTIFY_QUEUE/$TS.$SPID.$SEQ.msg" 2>/dev/null
   # 触发 worker：锁被占用则由现有 worker 继续消费，不会重复发送
   drain_notify_queue >/dev/null 2>&1 &
 }
@@ -2042,17 +2198,25 @@ drain_notify_queue() {
     FIRST=$(pick_due_file)
     [ -z "$FIRST" ] && break
     FILE="$NOTIFY_QUEUE/$FIRST"
-    # 兼容旧 2 字段格式（升级迁移前残留）：补渠道状态字段
+    # 兼容旧格式（升级迁移前残留）：6 字段补 bk/sc 到 8 字段，其余补全
     NF=$("$BB" awk -F'|' '{print NF}' "$FILE" 2>/dev/null)
-    case "$NF" in 6) : ;; *) printf '%s|pending|pending|0|0\n' "$($BB cat "$FILE" 2>/dev/null)" > "$FILE" 2>/dev/null ;; esac
+    case "$NF" in
+      8) : ;;
+      6) printf '%s|pending|pending|0|0\n' "$($BB cat "$FILE" 2>/dev/null)" > "$FILE" 2>/dev/null ;;
+      *) printf '%s|pending|pending|pending|pending|0|0\n' "$($BB cat "$FILE" 2>/dev/null)" > "$FILE" 2>/dev/null ;;
+    esac
     TITLE_B=$("$BB" cut -d'|' -f1 "$FILE" 2>/dev/null)
     MSG_B=$("$BB" cut -d'|' -f2 "$FILE" 2>/dev/null)
     PP=$("$BB" cut -d'|' -f3 "$FILE" 2>/dev/null)
     DT=$("$BB" cut -d'|' -f4 "$FILE" 2>/dev/null)
-    RETRY=$("$BB" cut -d'|' -f5 "$FILE" 2>/dev/null)
-    NEXT=$("$BB" cut -d'|' -f6 "$FILE" 2>/dev/null)
+    BK=$("$BB" cut -d'|' -f5 "$FILE" 2>/dev/null)
+    SC=$("$BB" cut -d'|' -f6 "$FILE" 2>/dev/null)
+    RETRY=$("$BB" cut -d'|' -f7 "$FILE" 2>/dev/null)
+    NEXT=$("$BB" cut -d'|' -f8 "$FILE" 2>/dev/null)
     case "$PP" in pending|done|failed) ;; *) PP=pending ;; esac
     case "$DT" in pending|done|failed) ;; *) DT=pending ;; esac
+    case "$BK" in pending|done|failed) ;; *) BK=pending ;; esac
+    case "$SC" in pending|done|failed) ;; *) SC=pending ;; esac
     case "$RETRY" in ''|*[!0-9]*) RETRY=0 ;; esac
     case "$NEXT" in ''|*[!0-9]*) NEXT=0 ;; esac
     NOW=$($DATE_CMD +%s 2>/dev/null || date +%s)
@@ -2076,16 +2240,30 @@ drain_notify_queue() {
       elif [ "$DRC" = "2" ]; then DT=done
       else DT=failed; CHANGED=1; fi
     fi
+    if [ "$BK" = "pending" ] || [ "$BK" = "failed" ]; then
+      BK=pending
+      send_bark "$TITLE" "$MSG"; BRC=$?
+      if [ "$BRC" = "0" ]; then BK=done
+      elif [ "$BRC" = "2" ]; then BK=done
+      else BK=failed; CHANGED=1; fi
+    fi
+    if [ "$SC" = "pending" ] || [ "$SC" = "failed" ]; then
+      SC=pending
+      send_serverchan "$TITLE" "$MSG"; SRC=$?
+      if [ "$SRC" = "0" ]; then SC=done
+      elif [ "$SRC" = "2" ]; then SC=done
+      else SC=failed; CHANGED=1; fi
+    fi
     if [ "$CHANGED" = "1" ]; then
       RETRY=$((RETRY + 1))
       if [ "$RETRY" -le 3 ]; then
         case "$RETRY" in 1) W=60 ;; 2) W=300 ;; 3) W=900 ;; esac
         NEXT=$((NOW + W))
-        printf '%s|%s|%s|%s|%s|%s\n' "$TITLE_B" "$MSG_B" "$PP" "$DT" "$RETRY" "$NEXT" > "$FILE" 2>/dev/null
-        echo "$(date) notify: 部分渠道失败，${RETRY} 次后 ${W}s 重试（pp=$PP dt=$DT title=$TITLE）" >> "$LOG"
+        printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$TITLE_B" "$MSG_B" "$PP" "$DT" "$BK" "$SC" "$RETRY" "$NEXT" > "$FILE" 2>/dev/null
+        echo "$(date) notify: 部分渠道失败，${RETRY} 次后 ${W}s 重试（pp=$PP dt=$DT bk=$BK sc=$SC title=$TITLE）" >> "$LOG"
         continue
       fi
-      echo "$(date) notify: 已达最大重试次数，丢弃（pp=$PP dt=$DT title=$TITLE）" >> "$LOG"
+      echo "$(date) notify: 已达最大重试次数，丢弃（pp=$PP dt=$DT bk=$BK sc=$SC title=$TITLE）" >> "$LOG"
       rm -f "$FILE" 2>/dev/null
       continue
     fi
@@ -2109,7 +2287,7 @@ migrate_legacy_queues() {
       TS=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f1)
       REST=$(printf '%s\n' "$LINE" | "$BB" cut -d'|' -f2-)
       case "$TS" in ''|*[!0-9]*) TS=$($DATE_CMD +%s 2>/dev/null || date +%s) ;; esac
-      printf '%s|pending|pending|0|0\n' "$REST" > "$TMPD/$TS.mig.$N.$RANDOM.msg" 2>/dev/null
+      printf '%s|pending|pending|pending|pending|0|0\n' "$REST" > "$TMPD/$TS.mig.$N.$RANDOM.msg" 2>/dev/null
     done < "$NOTIFY_QUEUE" 2>/dev/null
     rm -f "$NOTIFY_QUEUE" 2>/dev/null
     mv -f "$TMPD" "$NOTIFY_QUEUE" 2>/dev/null

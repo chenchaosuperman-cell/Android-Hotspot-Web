@@ -91,6 +91,24 @@ printf '"proxy":{"enabled":%s,"running":%s,"selfConfigured":%s,"selfActive":%s,"
   "$([ "${PROXY_ENABLE:-0}" = "1" ] && echo true || echo false)" "$PROXY_RUNNING" \
   "$([ "${PROXY_SELF:-0}" = "1" ] && echo true || echo false)" "$PROXY_SELF_ACTIVE" "$PROXY_SELF_QUIC" \
   "$(json_escape "$PROXY_SELF_BYPASS")" "$(json_escape "$PROXY_SELF_ERR")"
+# 设备适配检测：Root 框架、Android 版本、核心工具、系统服务可用性
+ADAPT_FRAME=unknown
+if [ -d /data/adb/ksu ]; then ADAPT_FRAME=KernelSU
+elif [ -d /data/adb/magisk ]; then ADAPT_FRAME=Magisk
+elif [ -d /data/adb/apatch ]; then ADAPT_FRAME=APatch
+fi
+ADAPT_ANDROID=$(getprop ro.build.version.release 2>/dev/null)
+ADAPT_SDK=$(getprop ro.build.version.sdk 2>/dev/null)
+ADAPT_BB=no; [ -n "$BB" ] && [ -x "$BB" ] && ADAPT_BB=yes
+ADAPT_IP=no; /system/bin/ip --version >/dev/null 2>&1 && ADAPT_IP=yes
+ADAPT_IPT=no; command -v iptables >/dev/null 2>&1 && ADAPT_IPT=yes
+ADAPT_WIFI=no; /system/bin/cmd wifi help 2>/dev/null | "$BB" grep -q 'start-softap' && ADAPT_WIFI=yes
+ADAPT_SU=no; command -v su >/dev/null 2>&1 && ADAPT_SU=yes
+printf '"adapt":{"frame":"%s","android":"%s","sdk":"%s","busybox":%s,"ip":%s,"iptables":%s,"softap":%s,"su":%s},' \
+  "$(json_escape "$ADAPT_FRAME")" "$(json_escape "$ADAPT_ANDROID")" "$(json_escape "$ADAPT_SDK")" \
+  "$([ "$ADAPT_BB" = yes ] && echo true || echo false)" "$([ "$ADAPT_IP" = yes ] && echo true || echo false)" \
+  "$([ "$ADAPT_IPT" = yes ] && echo true || echo false)" "$([ "$ADAPT_WIFI" = yes ] && echo true || echo false)" \
+  "$([ "$ADAPT_SU" = yes ] && echo true || echo false)"
 printf '"clientsFound":%s,"clientList":"%s","arpRaw":"%s","neighRaw":"%s",' \
   "$CLIENTS_COUNT" "$(json_escape "$CLIENTS_FOUND")" "$(json_escape "$ARP_RAW")" "$(json_escape "$NEIGH_RAW")"
 printf '"log":"%s"' "$(json_escape "$LOG_TAIL")"
