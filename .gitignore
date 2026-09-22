@@ -1,3 +1,4 @@
 bin/
 *.zip
 .DS_Store
+dist/
