@@ -146,8 +146,8 @@ restart_hotspot_async() {
     load_config
     # v1.7.6：系统 SoftApConfiguration 为唯一数据源，run_softap 无参启动
     # （config.conf 残留旧热点字段时，run_softap 内部自动迁移到系统后清除）
-    STOP_OUT=$("$BB" timeout 10 "$CMD_WIFI" wifi stop-softap 2>&1)
-    printf '%s stop-softap\n%s\n' "$(date)" "$STOP_OUT" >> "$LOG"
+    # v1.7.6：停止走系统 Tethering 路径（hotspot_stop → connectivity tether stop）
+    hotspot_stop >/dev/null 2>&1
     sleep 1
     # Keep loopback management address until hotspot is ready
     OUT=$(run_softap 2>&1)
@@ -285,12 +285,19 @@ case "$ACTION" in
       release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"
       printf '{"ok":false,"message":"系统热点配置写入失败（系统 API 未接受），已还原模块配置"}'; exit 0
     fi
-    printf '1\n' > "$DESIRED_FILE"
-    chmod 0600 "$DESIRED_FILE"
-    write_operation working "正在应用热点配置并验证生效"
-
-    printf '{"ok":true,"message":"配置已保存，正在验证生效，结果稍后显示"}'
-    restart_hotspot_async 1
+    # 热点开着 → 重启一次应用新配置；关着 → 仅持久化（不偷偷开启，下次启动生效）
+    softap_state_snapshot 2>/dev/null
+    if [ "$SNAP_AP_STATE" = "ENABLED" ]; then
+      printf '1\n' > "$DESIRED_FILE"
+      chmod 0600 "$DESIRED_FILE"
+      write_operation working "正在应用热点配置并验证生效"
+      printf '{"ok":true,"message":"配置已保存，正在重启热点应用新配置，结果稍后显示"}'
+      restart_hotspot_async 1
+    else
+      printf '0\n' > "$DESIRED_FILE"
+      chmod 0600 "$DESIRED_FILE"
+      printf '{"ok":true,"message":"配置已保存（热点当前关闭，下次开启时生效）"}'
+    fi
     ;;
   start_softap)
     # 轻量开启：用已保存配置直接启动（不修改热点参数）；手动开启即解除“手动保持关闭”

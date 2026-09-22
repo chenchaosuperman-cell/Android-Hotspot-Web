@@ -14,6 +14,16 @@
 - **残留清理**：`service.sh` 全新生成配置、`start_hotspot()`、`action.sh hotspot start`、`control.cgi` 配置导入导出与密码读取全部移除对 `SSID_B64/PASS_B64/SECURITY/BAND/CHANNEL/HIDDEN/MAX_CLIENTS` 的依赖（仅在升级迁移时由 `cfg_apply_key` 读取一次）；`get_password` 改从系统读。
 - **新增 6 GHz 频段**；README 口径改为「通用兼容架构 + 按设备能力自动降级」，公布已验证机型（Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU）。
 - **回归测试**：重写为 Binder Bridge mock（模拟 Framework 持久化闭环：Web 改 → 系统配置变 → 重启/关开仍一致），新增迁移、留空密码沿用系统密码、open 网络、caps 降级断言（87 → 92 用例全部通过）。
+- **rc2 — AOSP 签名对齐（依据代码级验收修正）**：
+  - `setSoftApConfiguration` 修正为标准 AOSP 两参签名 `(SoftApConfiguration, String packageName)`，运行时枚举方法签名并兼容单参/OEM 变体；不再假设所有 ROM 相同。
+  - `SoftApConfiguration.Builder` 改为真实 AOSP 接口：`setPassphrase(String,int)`（密码+加密方式一起）、`setChannel(int,int)`（信道+频段一起）；OEM 变体（`setPassphrase(String)`+`setSecurityType(int)`、`setChannel(int)`）作为兼容路径，运行时探测。
+  - 常量修正：SecurityType `OPEN=0 / WPA2=1 / WPA3_TRANSITION=2 / WPA3=3 / OWE_TRANSITION=4 / OWE=5`；Band `2G=1 / 5G=2 / 6G=4 / ANY=7`（禁止 0，`setBand(0)` 会抛 IllegalArgumentException）。运行时优先反射 Framework 常量字段，内置值仅兜底。
+  - 热点开关与配置彻底分离：**Generic Backend = 系统 Tethering**（`cmd connectivity tether start/stop`，内部即 TetheringManager.startTethering，与 Android 设置行为一致），启动后轮询 dumpsys/bridge 确认真实 ENABLED；`cmd wifi start-softap` 仅作 capability 验证后的 OEM/老系统 fallback（带参，从系统配置读取），删除"无参 start-softap"错误设计。
+  - 保存配置**不再先关闭热点**：先 Framework 持久化 → 读回验证 → 成功才由控制层按需重启一次（热点开着→重启应用新配置；关着→仅保存不偷偷开启）；写失败/验证失败时热点保持原运行状态。
+  - 能力检测改为 **probe 实测**：`SoftApBridge probe` 枚举 IWifiManager 方法签名、Builder 方法、反射 Framework 安全/频段常量；`readConfig/writeConfig`/同步级别由 probe 结果决定（不再凭 dex 文件存在），hidden/channel/max/频段能力由 SoftApConfiguration 层决定（不再依赖 cmd wifi help）。
+  - 跨厂商接口名：`action.sh status` / 状态读取统一走 `hotspot_get_state` / `get_hotspot_iface`（bridge tether-state 优先，支持 wlan*/ap0/softap0/swlan0 等），不再写死 wlan[1-9]。
+  - 业务层全部 stop 调用统一走 `hotspot_stop`（tether 优先）。
+  - 回归测试增至 115 用例（新增 AOSP 常量映射、set 不关热点、写失败保持状态、tether 主路径、probe 驱动降级断言），全部通过。
 
 # # v1.7.5-beta（2026-09-22）稳定性修复版
 

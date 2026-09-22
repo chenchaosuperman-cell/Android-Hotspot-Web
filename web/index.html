@@ -293,7 +293,7 @@ section[data-tab=home]{display:block}
     <section class="card" data-tab="settings">
       <h2 class="section-title">高级设置</h2>
       <label class="switchline"><input id="hidden" type="checkbox"><span>隐藏 SSID（不广播热点名称，需手动输入名称和密码连接；仅隐藏名称广播，不是安全机制）</span></label>
-      <div id="hiddenUnsup" class="hint" style="display:none;color:var(--warn-fg)">当前系统不支持隐藏 SSID（cmd wifi 无 -h 支持），开关已禁用</div>
+      <div id="hiddenUnsup" class="hint" style="display:none;color:var(--warn-fg)">当前系统不支持隐藏 SSID（SoftApConfiguration 无此能力），开关已禁用</div>
       <div class="hint" style="margin:8px 0 14px">随「热点设置」中的保存一起生效。</div>
       <div class="field" style="margin-top:10px"><label>代理范围（科学上网）</label>
         <select id="proxyScope"><option value="hotspot">仅热点设备（默认）</option><option value="self">仅手机本机</option><option value="both">热点设备＋手机本机</option></select>
@@ -308,7 +308,7 @@ section[data-tab=home]{display:block}
         <div id="rateDevices"><div class="empty">暂未检测到设备</div></div>
       </details>
     </section>
-    <section class="card" data-tab="settings"><details class="adv-state"><summary>帮助与说明</summary><div class="label" style="margin-top:8px">管理页仅在热点局域网内可用；固定管理地址每次连接保持不变，备用网关地址可能变化。移动数据是否共享给热点客户端取决于 HyperOS 的路由策略。当前版本使用系统 <code>cmd wifi start-softap</code> 接口。</div><div class="hint" style="margin:8px 0 0">配置最后保存：<span id="cfgSaved">—</span></div></details></section>
+    <section class="card" data-tab="settings"><details class="adv-state"><summary>帮助与说明</summary><div class="label" style="margin-top:8px">管理页仅在热点局域网内可用；固定管理地址每次连接保持不变，备用网关地址可能变化。移动数据是否共享给热点客户端取决于 HyperOS 的路由策略。热点配置直接读取并写入 Android 系统热点设置；实际支持项目根据当前设备和系统能力自动适配。</div><div class="hint" style="margin:8px 0 0">配置最后保存：<span id="cfgSaved">—</span></div></details></section>
   </main>
   <div id="modal" style="display:none;position:fixed;inset:0;z-index:998;background:rgba(10,14,22,.55);align-items:center;justify-content:center;padding:24px" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div style="background:var(--card);border:1px solid var(--card-border);border-radius:16px;padding:18px;width:min(360px,92%);box-shadow:var(--shadow)">

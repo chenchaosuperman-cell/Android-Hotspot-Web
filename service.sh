@@ -153,9 +153,8 @@ start_hotspot() {
   # HyperOS build, WifiShellCommand can fail its Binder transaction when the
   # remote service receives such an FD. Capture through an anonymous pipe and
   # append the text afterwards instead.
-  STOP_OUT=$("$CMD_WIFI" wifi stop-softap 2>&1)
-  STOP_RC=$?
-  printf '%s stop-softap rc=%s\n%s\n' "$(date)" "$STOP_RC" "$STOP_OUT" >> "$LOG"
+  # v1.7.6：停止走系统 Tethering 路径（hotspot_stop）
+  hotspot_stop >/dev/null 2>&1
   sleep 1
   START_OUT=$(run_softap 2>&1)
   START_RC=$?
@@ -470,7 +469,7 @@ while true; do
         fi
         if [ "$SHOULD_CLOSE" = "1" ] && [ "$DESIRED" = "1" ]; then
           echo "$(date) schedule: out of window, stopping" >> "$LOG"
-          "$CMD_WIFI" wifi stop-softap >> "$LOG" 2>&1
+          hotspot_stop >> "$LOG" 2>&1
           remove_management_alias "$IFACE"
           echo 0 > "$DESIRED_FILE"
           printf 'schedule\n' > "$STOP_REASON_FILE" 2>/dev/null
@@ -559,7 +558,7 @@ while true; do
     if [ "$DESIRED" = "1" ] && [ "$PLAN_TOTAL" -gt 0 ] 2>/dev/null && [ "$PLAN_PERCENT" -ge 100 ] 2>/dev/null; then
       if [ "${DATA_LIMIT_ACTION:-stop}" != "notify" ]; then
         echo "$(date) data limit reached (账期 ${PLAN_PERIOD_BYTES}B >= ${PLAN_TOTAL}MB), stopping" >> "$LOG"
-        "$CMD_WIFI" wifi stop-softap >> "$LOG" 2>&1
+        hotspot_stop >> "$LOG" 2>&1
         remove_management_alias "$IFACE"
         echo 0 > "$DESIRED_FILE"
         printf 'limit\n' > "$STOP_REASON_FILE" 2>/dev/null
@@ -659,7 +658,7 @@ while true; do
         if [ "$IDLE_SECS" -ge "$LIMIT_S" ]; then
           rm -f "$IDLE_FILE" "$IDLE_SINCE"
           echo "$(date) idle shutdown: no clients for ${IDLE_SHUTDOWN}m" >> "$LOG"
-          "$CMD_WIFI" wifi stop-softap >> "$LOG" 2>&1
+          hotspot_stop >> "$LOG" 2>&1
           remove_management_alias "$IFACE"
           echo 0 > "$DESIRED_FILE"
           printf 'idle\n' > "$STOP_REASON_FILE" 2>/dev/null

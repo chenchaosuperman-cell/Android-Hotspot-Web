@@ -648,12 +648,15 @@ release_operation_lock() {
 SYS_WIFI_STORE=/data/misc/apexdata/com.android.wifi/WifiConfigStore.xml
 
 # 安全类型：系统 SoftApConfiguration SecurityType → 模块 security 值
-# 0=OPEN 1=WPA2_PSK 2=WPA3_SAE 4=WPA2_WPA3_PSK(Android13+)
+# AOSP: 0=OPEN 1=WPA2_PSK 2=WPA3_SAE_TRANSITION 3=WPA3_SAE 4=WPA3_OWE_TRANSITION 5=WPA3_OWE
 sys_security_type_name() {
   case "$1" in
     0) printf 'open' ;;
-    2) printf 'wpa3' ;;
-    4) printf 'wpa3_transition' ;;
+    1) printf 'wpa2' ;;
+    2) printf 'wpa3_transition' ;;
+    3) printf 'wpa3' ;;
+    4) printf 'owe_transition' ;;
+    5) printf 'owe' ;;
     *) printf 'wpa2' ;;
   esac
 }
@@ -661,27 +664,29 @@ sys_security_type_name() {
 sys_security_type_val() {
   case "$1" in
     open) printf '0' ;;
-    wpa3) printf '2' ;;
-    wpa3_transition) printf '4' ;;
+    wpa3) printf '3' ;;
+    wpa3_transition) printf '2' ;;
+    owe_transition) printf '4' ;;
+    owe) printf '5' ;;
     *) printf '1' ;;
   esac
 }
-# 系统 Band（SoftApConfiguration: 0=2.4G 1=5G 2=6G 3=any）→ 模块 band
+# 系统 Band（AOSP: 1=2.4G 2=5G 4=6G 7=any）→ 模块 band
 sys_band_name() {
   case "$1" in
-    0) printf '2' ;;
-    1) printf '5' ;;
-    2) printf '6' ;;
+    1) printf '2' ;;
+    2) printf '5' ;;
+    4) printf '6' ;;
     *) printf 'any' ;;
   esac
 }
 # 模块 band → 系统 Band
 sys_band_val() {
   case "$1" in
-    2) printf '0' ;;
-    5) printf '1' ;;
-    6) printf '2' ;;
-    *) printf '3' ;;
+    2) printf '1' ;;
+    5) printf '2' ;;
+    6) printf '4' ;;
+    *) printf '7' ;;
   esac
 }
 
@@ -779,56 +784,11 @@ softap_hidden_supported() {
 }
 
 run_softap() {
-  # 一套配置：热点参数以系统 SoftApConfiguration 为唯一数据源（系统设置 ↔ Web 同步）。
-  # 主路径：cmd wifi start-softap 无参启动 —— 系统 tethering 使用已保存配置，
-  # 与系统"设置"应用开启热点行为完全一致。
-  # 迁移：系统从未配置热点（XML 无 SoftAp 段）且模块携带有旧参数（首次安装/旧版升级）
-  # 时，先带参启动一次（系统 API 持久化）完成迁移，之后一律以系统配置为准。
-  NEW_SSID_ARG=$1; NEW_SEC_ARG=$2; NEW_PASS_ARG=$3; NEW_BAND_ARG=$4; NEW_CHANNEL_ARG=$5; NEW_MAX_ARG=$6
-  # 无显式参数但模块 config.conf 仍残留旧热点字段（旧版升级）→ 用旧值完成迁移
-  if [ -z "$NEW_SSID_ARG" ] && [ -n "${SSID_B64:-}" ] && ! hotspot_config_present; then
-    NEW_SSID_ARG=$(b64url_decode "$SSID_B64")
-    NEW_SEC_ARG=${SECURITY:-wpa2}
-    NEW_PASS_ARG=$(b64url_decode "${PASS_B64:-}")
-    NEW_BAND_ARG=${BAND:-any}
-    NEW_CHANNEL_ARG=${CHANNEL:-0}
-    NEW_MAX_ARG=${MAX_CLIENTS:-0}
-    HIDDEN=${HIDDEN:-0}
-  fi
-  if [ -n "$NEW_SSID_ARG" ] && ! hotspot_config_present; then
-    echo "$(date) run_softap: migrating module hotspot config to system SoftApConfiguration" >> "$LOG" 2>/dev/null
-    hotspot_set_config "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" "$NEW_BAND_ARG" "$NEW_CHANNEL_ARG" "${HIDDEN:-0}" "$NEW_MAX_ARG" || {
-      echo "$(date) run_softap: migration failed, falling back to direct start" >> "$LOG" 2>/dev/null
-      if [ "$NEW_SEC_ARG" = "open" ]; then
-        "$CMD_WIFI" wifi start-softap "$NEW_SSID_ARG" open -b "$NEW_BAND_ARG" 2>/dev/null
-      else
-        "$CMD_WIFI" wifi start-softap "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" -b "$NEW_BAND_ARG" 2>/dev/null
-      fi
-      return $?
-    }
-  fi
-  # 正常路径：无参启动（用系统配置）
-  "$CMD_WIFI" wifi start-softap 2>/dev/null
-  RC=$?
-  if [ "$RC" -ne 0 ] && [ -n "$NEW_SSID_ARG" ]; then
-    # 无参启动失败（个别 ROM 无参行为差异）→ 退化为带参启动（系统配置值）
-    sys_softap_get
-    if [ "$sys_ok" = "1" ] && [ -n "$sys_ssid" ]; then
-      EXTRA=
-      case "$sys_channel" in ''|0) ;; *) EXTRA="$EXTRA -c $sys_channel" ;; esac
-      case "$sys_maxclients" in ''|0) ;; *) EXTRA="$EXTRA -m $sys_maxclients" ;; esac
-      [ "$sys_hidden" = "1" ] && EXTRA="$EXTRA -h"
-      if [ "$sys_security" = "open" ]; then
-        "$CMD_WIFI" wifi start-softap "$sys_ssid" open -b "$sys_band" $EXTRA 2>/dev/null
-      else
-        "$CMD_WIFI" wifi start-softap "$sys_ssid" "$sys_security" "$sys_password" -b "$sys_band" $EXTRA 2>/dev/null
-      fi
-      RC=$?
-    fi
-  fi
-  return $RC
+  # v1.7.6：热点启动统一走 Hotspot Compatibility Layer 的 hotspot_start
+  # （Generic Backend = 系统 Tethering；迁移/回退逻辑在 lib/compat.sh）
+  hotspot_start "$@"
+  return $?
 }
-
 
 
 # ---------- 客户端 MAC 访问策略（黑名单 DROP / 白名单仅放行） ----------
@@ -4034,19 +3994,7 @@ wait_softap_stopped() {
 stop_hotspot_real() {
   BEFORE_IFACE=$(get_hotspot_iface)
   rm -f "$SOFTAP_CACHE" 2>/dev/null
-  echo "$(date) hotspot stop: trying wifi stop-softap" >> "$LOG"
-  WIFI_OUT=$( "$BB" timeout 10 "$CMD_WIFI" wifi stop-softap 2>&1 )
-  WIFI_RC=$?
-  printf '%s wifi stop-softap rc=%s\n%s\n' "$(date)" "$WIFI_RC" "$WIFI_OUT" >> "$LOG"
-  if wait_softap_stopped; then
-    remove_management_alias "$BEFORE_IFACE" 2>/dev/null
-    clear_blacklist "$BEFORE_IFACE" 2>/dev/null
-    ensure_management_loopback
-    echo "$(date) hotspot stop: stopped by wifi service" >> "$LOG"
-    return 0
-  fi
-  rm -f "$SOFTAP_CACHE" 2>/dev/null
-  echo "$(date) hotspot stop: wifi stop-softap ineffective, trying connectivity tether stop" >> "$LOG"
+  echo "$(date) hotspot stop: trying connectivity tether stop (system tethering path)" >> "$LOG"
   TETHER_OUT=$( "$BB" timeout 10 "$CMD_WIFI" connectivity tether stop 2>&1 )
   TETHER_RC=$?
   printf '%s tether stop rc=%s\n%s\n' "$(date)" "$TETHER_RC" "$TETHER_OUT" >> "$LOG"
@@ -4057,10 +4005,21 @@ stop_hotspot_real() {
     echo "$(date) hotspot stop: stopped by connectivity service" >> "$LOG"
     return 0
   fi
+  rm -f "$SOFTAP_CACHE" 2>/dev/null
+  echo "$(date) hotspot stop: tether stop ineffective, trying wifi stop-softap" >> "$LOG"
+  WIFI_OUT=$( "$BB" timeout 10 "$CMD_WIFI" wifi stop-softap 2>&1 )
+  WIFI_RC=$?
+  printf '%s wifi stop-softap rc=%s\n%s\n' "$(date)" "$WIFI_RC" "$WIFI_OUT" >> "$LOG"
+  if wait_softap_stopped; then
+    remove_management_alias "$BEFORE_IFACE" 2>/dev/null
+    clear_blacklist "$BEFORE_IFACE" 2>/dev/null
+    ensure_management_loopback
+    echo "$(date) hotspot stop: stopped by wifi service" >> "$LOG"
+    return 0
+  fi
   echo "$(date) hotspot stop failed: hotspot still active" >> "$LOG"
   return 1
 }
-
 # Hotspot Compatibility Layer（统一接口：能力检测/读/写/状态/启停）
 if [ -r "$MODDIR/lib/compat.sh" ]; then
   . "$MODDIR/lib/compat.sh" || echo "compat.sh source failed" >> "$LOG" 2>/dev/null

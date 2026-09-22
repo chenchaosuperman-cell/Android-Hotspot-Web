@@ -23,10 +23,12 @@ cmd="$1"; sub="$2"
 
 case "$cmd" in
   status)
-    # 只有绑定了 192.168.43.1 的 wlan[1-9]+ 热点接口才算热点运行
-    # （v1.7.2：必须限定接口名为 wlan 热点接口，避免 lo/其它接口误判）
-    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | /system/bin/awk -v s="$STABLE_IP" '$2 ~ /^wlan[1-9][0-9]*$/ && $4 ~ "^"s"/" {print $2; exit}')
-    RUNNING=false; [ -n "$IFACE" ] && RUNNING=true
+    # v1.7.6：状态统一走 Hotspot Compatibility Layer（不写死接口名，跨厂商）
+    . "$MODDIR/lib/common.sh" 2>/dev/null
+    hotspot_get_state 2>/dev/null
+    RUNNING=false
+    case "$SNAP_AP_STATE" in ENABLED|ENABLED_AND_SUSPENDED) RUNNING=true ;; esac
+    IFACE=$(get_hotspot_iface)
     DESIRED=$(/system/bin/cat "$DESIRED_FILE" 2>/dev/null); [ "$DESIRED" = "1" ] || DESIRED=0
     MOFF=false; [ -f "$MANUAL_OFF_FILE" ] && MOFF=true
     if [ "$sub" = "--json" ]; then
@@ -49,7 +51,8 @@ case "$cmd" in
       stop)
         echo 1 > "$MANUAL_OFF_FILE" && chmod 0600 "$MANUAL_OFF_FILE"
         echo 0 > "$DESIRED_FILE" && chmod 0600 "$DESIRED_FILE"
-        "$CMD_WIFI" wifi stop-softap >/dev/null 2>&1
+        . "$MODDIR/lib/common.sh" 2>/dev/null
+        hotspot_stop >/dev/null 2>&1
         echo "hotspot stop requested (manual-off this boot)"
         ;;
       *) echo "usage: action.sh hotspot start|stop"; exit 1 ;;
