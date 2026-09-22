@@ -314,10 +314,15 @@ hotspot_start() {
   # 迁移：系统从未配置 + 模块旧参数 → 经 Framework 持久化一次（此后 config.conf 不再保存）
   if [ -n "$NEW_SSID_ARG" ] && ! hotspot_config_present; then
     echo "$(date) hotspot_start: migrating module hotspot config to system SoftApConfiguration" >> "$LOG" 2>/dev/null
-    hotspot_set_config "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" "$NEW_BAND_ARG" "$NEW_CHANNEL_ARG" "$NEW_HIDDEN_ARG" "$NEW_MAX_ARG" || {
+    if ! hotspot_set_config "$NEW_SSID_ARG" "$NEW_SEC_ARG" "$NEW_PASS_ARG" "$NEW_BAND_ARG" "$NEW_CHANNEL_ARG" "$NEW_HIDDEN_ARG" "$NEW_MAX_ARG"; then
       echo "$(date) hotspot_start: migration failed, abort start (system config missing)" >> "$LOG" 2>/dev/null
       return 1
-    }
+    fi
+    # 迁移成功：清除 config.conf 中的旧热点字段（仅此一次，密码不再留在模块配置）
+    if [ -n "$CONFIG" ] && [ -f "$CONFIG" ]; then
+      "$BB" sed -i -E '/^(SSID_B64|PASS_B64|SECURITY|BAND|CHANNEL|HIDDEN|MAX_CLIENTS)=/d' "$CONFIG" 2>/dev/null
+      echo "$(date) hotspot_start: old hotspot fields removed from config.conf" >> "$LOG" 2>/dev/null
+    fi
   fi
 
   # Generic Backend：系统 Tethering（ConnectivityManager/TetheringManager.startTethering 路径）
