@@ -14,6 +14,7 @@
 - UI：首页温度模块改为紧凑横向状态卡（无仪表盘/圆环/火焰）；左侧主数据「最高温度」大字号，右上角 正常/偏高/过热 状态标签，下方并排电池/CPU 温度，底部细进度条 + 一句建议；阈值 <45 正常（绿）/45-54 偏高（橙）/≥55 过热（红，含提醒）；仅状态色变化，卡片背景与整体风格不变；温度数据不可用时整卡隐藏；移除旧 compactInfo 单行状态栏残留（HTML/CSS/JS）
 - 移除：「热点异常提醒」推送功能彻底删除（开关/卡片/保存按钮/配置字段 NOTIFY_HOTSPOT_EVT/状态字段 hotspotEvt/导入导出支持/后台推送触发/recover_notify_ts 防重复时间戳），消息页仅保留短信转发、PushPlus、钉钉、Bark、低电量提醒、流量提醒；保活自动恢复与启动失败检测/日志保留，不再推送
 - 升级兼容：service 启动时自动清理旧配置中 NOTIFY_HOTSPOT_EVT= 行与 recover_notify_ts 残留；uninstall 同步清理
+- UI：首页四卡片改为全宽度统一两行两列（电量/设备 一行、频段/自动策略 一行），间距 12px 与全站一致，参考手机端两列布局样式
 - UI：首页四卡片（电量/设备/频段/自动策略）移至「本账期流量」卡片下方；卡片缩小（padding 12px、数值 18px、标签 11px、圆角 18px），gap 统一 12px，手机两行两列、桌面一行四列不变，间距与全站卡片一致
 - 修复：首页四卡片（stat-grid）为 div 而非 section，tab 切换仅处理 section[data-tab]，导致四卡片在设备/流量/科学/消息页残留显示；改为 [data-tab] 统一控制并给 stat-grid 补 data-tab=home
 - 测试：134 PASS / 0 FAIL（含软AP五态映射、failureReason=0、stop 拒绝假成功、connector 能力消费）
