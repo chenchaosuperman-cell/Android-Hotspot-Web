@@ -144,6 +144,12 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
       <div class="form-submit-wrap"><button class="primary form-submit" id="applyHotspot" onclick="applyHotspot()" type="button">保存并重启热点</button></div>
     </section>
     <section class="card" data-tab="settings">
+      <h2 class="section-title">WiFi高级设置</h2>
+      <label class="switchline"><input id="hidden" type="checkbox"><span>隐藏 SSID（不广播热点名称，需手动输入名称和密码连接；仅隐藏名称广播，不是安全机制）</span></label>
+      <div id="hiddenUnsup" class="hint" style="display:none;color:var(--warn-fg)">当前系统不支持隐藏 SSID（SoftApConfiguration 无此能力），开关已禁用</div>
+      <div class="hint" style="margin:8px 0 14px">随「热点设置」中的保存一起生效。</div>
+    </section>
+    <section class="card" data-tab="settings">
       <h2 class="section-title">定时与自动</h2>
       <label class="switchline"><input id="autostart" type="checkbox" onchange="saveAutostart()"><span>开机自动启动热点（手机重启后自动开启；手动关闭仅本次开机有效）</span></label>
       <label class="switchline"><input id="keepalive" type="checkbox" checked onchange="saveKeepalive()"><span>热点保活（热点意外掉线时自动拉起）</span></label>
@@ -334,12 +340,6 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
       <div class="form-submit-wrap"><button class="secondary form-submit" onclick="changePort()" type="button">保存端口</button></div>
       <div class="actions" style="margin-bottom:8px"><button class="secondary mini" onclick="restartModule()" type="button">重启模块服务</button></div>
       <div class="hint" style="margin:0">改端口后请用新端口重新访问；重启模块会短暂中断页面。</div>
-    </section>
-    <section class="card" data-tab="settings">
-      <h2 class="section-title">高级设置</h2>
-      <label class="switchline"><input id="hidden" type="checkbox"><span>隐藏 SSID（不广播热点名称，需手动输入名称和密码连接；仅隐藏名称广播，不是安全机制）</span></label>
-      <div id="hiddenUnsup" class="hint" style="display:none;color:var(--warn-fg)">当前系统不支持隐藏 SSID（SoftApConfiguration 无此能力），开关已禁用</div>
-      <div class="hint" style="margin:8px 0 14px">随「热点设置」中的保存一起生效。</div>
     </section>
     <section class="card" data-tab="settings">
       <h2 class="section-title">实验功能</h2>
