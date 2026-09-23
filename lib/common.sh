@@ -1556,7 +1556,15 @@ softap_state_ok() {
   # v1.7.2-beta.1：接受调用方已算好的 IP（status.cgi 已一次 ip 调用取得），避免再 fork ip
   IP_ADDR=$2
   [ -n "$IP_ADDR" ] || IP_ADDR=$(get_iface_ip "$iface")
-  [ -n "$IP_ADDR" ] || return 1
+  # v1.7.9：HyperOS 热点接口 wlan2 启动后只有 IPv6 链路本地地址（fe80::），
+  # IPv4 管理别名 192.168.43.1/32 由模块在验证通过后 switch_management_to_hotspot 挂载。
+  # 因此接口形态是热点接口（wlanX/apX）时不得因无 IPv4 判失败——那会让启动验证
+  # 永远失败（先有鸡还是先有蛋），并把管理别名错误留在 lo。接口存在 + 系统状态
+  # ENABLED 即视为运行；无 IPv4 只影响管理别名挂载（由调用方后续处理）。
+  case "$iface" in
+    wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*) : ;;
+    *) [ -n "$IP_ADDR" ] || return 1 ;;
+  esac
   # v1.7.2-beta.1：CGI 只读——只用现有 softap.cache 判定（supervisor 每 tick 刷新），
   # 缓存缺失/过期时若接口已有 IP 视为运行；绝不触发 dumpsys wifi（真机 1s+ 卡顿）。
   if [ "${CGI_READONLY:-0}" = "1" ]; then
@@ -4212,6 +4220,7 @@ stop_hotspot_real() {
       remove_management_alias "$BEFORE_IFACE" 2>/dev/null
       clear_blacklist "$BEFORE_IFACE" 2>/dev/null
       ensure_management_loopback
+      : > "$HOTSPOT_IFACE_FILE" 2>/dev/null
       echo "$(date) hotspot stop: stopped by connectivity service" >> "$LOG"
       return 0
     fi
@@ -4227,6 +4236,7 @@ stop_hotspot_real() {
     remove_management_alias "$BEFORE_IFACE" 2>/dev/null
     clear_blacklist "$BEFORE_IFACE" 2>/dev/null
     ensure_management_loopback
+    : > "$HOTSPOT_IFACE_FILE" 2>/dev/null
     echo "$(date) hotspot stop: stopped by wifi service" >> "$LOG"
     return 0
   fi

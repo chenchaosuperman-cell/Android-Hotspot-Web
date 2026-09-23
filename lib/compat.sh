@@ -461,17 +461,22 @@ get_hotspot_iface() {
         ;;
     esac
   fi
-  # 2) 固定管理别名所在接口（模块只把 192.168.43.1/32 挂到热点接口）
+  # 2) 固定管理别名所在接口（模块只把 192.168.43.1/32 挂到热点接口；
+  #    stop 后别名挂在 lo，lo 绝不是热点接口——必须排除，否则验证循环拿到
+  #    lo 的 127.0.0.1 恒非空 IP，热点刚启动就被误判成功/失败）
   if [ -z "$IFACE" ]; then
-    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | "$BB" awk -v s="$STABLE_IP/32" '$4 == s {print $2; exit}')
+    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | "$BB" awk -v s="$STABLE_IP/32" '$2 != "lo" && $4 == s {print $2; exit}')
   fi
   # 3) supervisor 状态缓存（第 7 项：HOTSPOT_IFACE_FILE）
   if [ -z "$IFACE" ] && [ -n "$HOTSPOT_IFACE_FILE" ] && [ -s "$HOTSPOT_IFACE_FILE" ]; then
     IFACE=$("$BB" tr -d '\r\n' < "$HOTSPOT_IFACE_FILE" 2>/dev/null)
   fi
-  # 4) ip 枚举兜底：接口名模式 + 必须已有 IPv4 地址
+  # 4) ip 枚举兜底：接口名模式 + 必须已有地址（IPv4 或 IPv6 链路本地均可）。
+  #    v1.7.9：HyperOS 热点接口 wlan2 启动后只有 IPv6 链路本地（fe80::），
+  #    IPv4 管理别名由模块后挂；若用 ip -o -4 addr show 会永远匹配不到，
+  #    导致启动验证失败并误报"热点启动失败"。改用全量地址枚举。
   if [ -z "$IFACE" ]; then
-    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null \
+    IFACE=$(/system/bin/ip -o addr show 2>/dev/null \
       | "$BB" awk '$2 ~ /^(wlan[1-9][0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*)$/ && $4 != "" {print $2; exit}')
   fi
   printf '%s' "$IFACE"

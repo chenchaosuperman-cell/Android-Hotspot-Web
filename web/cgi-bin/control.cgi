@@ -87,13 +87,25 @@ restart_hotspot_async() {
     COUNT=0
     while [ "$COUNT" -lt 12 ]; do
       VERIFY_IFACE=$(get_hotspot_iface)
-      VERIFY_IP=$(get_iface_ip "$VERIFY_IFACE")
-      [ -n "$VERIFY_IP" ] && break
+      # v1.7.9：get_hotspot_iface 已排除 lo（stop 后管理别名挂在 lo 上，
+      # lo 的 127.0.0.1 恒非空，旧逻辑会立即 break，热点未就绪即开始核验）。
+      # 这里显式要求接口名是热点形态（wlanX/apX），lo 一律跳过继续等待。
+      # 注意：不能以 VERIFY_IP（IPv4）为成功条件——HyperOS 的 wlan2 启动后
+      # 只有 IPv6 链路本地地址，IPv4 管理别名由验证通过后挂载；以接口形态为
+      # 准，拿到 wlanX/apX 即视为热点接口已就绪。
+      case "$VERIFY_IFACE" in
+        wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*) break ;;
+        *) VERIFY_IFACE= ;;
+      esac
       COUNT=$((COUNT + 1))
       sleep 1
     done
+    # v1.7.9：进入核验前强制刷新快照（rm 缓存），否则 softap_state_ok 读到
+    # 15 秒旧缓存（stop 刚执行完，缓存仍是 DISABLED），热点已起来也被误判失败。
+    rm -f "$SOFTAP_CACHE" 2>/dev/null
+    softap_state_snapshot 2>/dev/null
     OK=0
-    if [ "$RC" -eq 0 ] && [ -n "$VERIFY_IP" ] && softap_state_ok "$VERIFY_IFACE"; then
+    if [ "$RC" -eq 0 ] && [ -n "$VERIFY_IFACE" ] && softap_state_ok "$VERIFY_IFACE"; then
       PARAM_ERR=$(verify_hotspot_params "$SSID" "$SECURITY" "$BAND" "$CHANNEL")
       if [ -z "$PARAM_ERR" ]; then
         OK=1
