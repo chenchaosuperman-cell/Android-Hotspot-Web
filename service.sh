@@ -544,11 +544,20 @@ while true; do
       fi
     fi
 
-    # v1.7.9：自建 DHCP 守护——热点开着但 udhcpd 意外退出时自动拉起。
-    # 背景：udhcpd 是模块自建 DHCP（热点半开兜底），只在热点启动时拉起一次；
-    # 若中途被系统回收/异常退出，新设备连热点拿不到 IP（表现为能连 WiFi 但没网、
-    # 后台也进不去）。busybox 多进程进程名不叫 udhcpd，须按 cmdline 含配置路径判断。
+    # v1.7.9：自建 DHCP 守护 + 转发默认路由确保（热点开着期间每轮执行）。
+    # 背景1（DHCP）：udhcpd 是模块自建 DHCP（热点半开兜底），只在热点启动时拉起一次；
+    # 若中途被系统回收/异常退出，新设备连热点拿不到 IP（能连 WiFi 但没网、后台进不去）。
+    # 背景2（路由）：Android 热点重启/网络变化会清空 local_network 等路由表，转发流量
+    # （客户端→热点）查表落到 unreachable → 能连 WiFi 但完全无外网。需从上游接口所在
+    # 表取默认路由补进 local_network（fwmark=0 转发流量的查询表），并每轮确保。
     if [ -n "$IFACE" ]; then
+      if ! /system/bin/ip route show table local_network 2>/dev/null | "$BB" grep -q '^default'; then
+        UP=$(get_upstream_iface)
+        if [ -n "$UP" ]; then
+          GW=$(/system/bin/ip route show table "$UP" 2>/dev/null | "$BB" awk '/^default/{print $3; exit}')
+          [ -n "$GW" ] && /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
+        fi
+      fi
       DHCP_ALIVE=0
       for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
         CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
