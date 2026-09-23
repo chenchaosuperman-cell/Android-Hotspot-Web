@@ -199,6 +199,43 @@ https://gh-proxy.com/$GS_RAW"
   rm -f "$GS_TMP" "$TMPD/geosite_dl_ok.$$"
 fi
 
+# v1.7.9：校验安装包自带的 Mihomo / GeoSite / GeoIP 文件（避免损坏文件直接运行）。
+# 打包时 bin/ 内文件固定版本（见下方 SHA-256），与 customize.sh 下载分支使用同一官方校验值；
+# 自带文件与官方值不符（传输/打包损坏）时删除该文件并降级提示，绝不带病运行。
+SHA_BIN=$(command -v sha256sum 2>/dev/null || echo /system/bin/sha256sum)
+verify_bundled_file() {
+  f=$1; want=$2
+  [ -s "$f" ] || return 1
+  GOT=$($SHA_BIN "$f" 2>/dev/null | awk '{print $1}')
+  [ -n "$GOT" ] && [ "$GOT" = "$want" ]
+}
+# Mihomo 自带文件：ELF magic + 官方 SHA-256（MIHOMO_BIN_SHA）
+if [ -f "$MIHOMO_BIN" ]; then
+  if ! verify_bundled_file "$MIHOMO_BIN" "$MIHOMO_BIN_SHA"; then
+    MAGIC=$(od -An -tx1 -N4 "$MIHOMO_BIN" 2>/dev/null | tr -d ' \n')
+    if [ "$MAGIC" != "7f454c46" ] || ! verify_bundled_file "$MIHOMO_BIN" "$MIHOMO_BIN_SHA"; then
+      ui_print "- WARN: bundled mihomo is corrupted (SHA-256 mismatch), removing to prevent running damaged binary"
+      rm -f "$MIHOMO_BIN"
+    fi
+  fi
+fi
+# GeoSite 自带文件：官方 SHA-256（GEOSITE_SHA）
+if [ -f "$GEOSITE_BIN" ]; then
+  if ! verify_bundled_file "$GEOSITE_BIN" "$GEOSITE_SHA"; then
+    ui_print "- WARN: bundled geosite.dat is corrupted (SHA-256 mismatch), removing"
+    rm -f "$GEOSITE_BIN"
+  fi
+fi
+# GeoIP 自带文件：官方 mihomo GeoIP 数据 SHA-256（2026-09-20 从官方 release 镜像核验）
+GEOIP_BIN="$MODPATH/bin/geoip.metadb"
+GEOIP_SHA="8a1a379152ec01860db519cddcc6ed1481aaf5b2e0f07ee12874c9d25480b5c8"
+if [ -f "$GEOIP_BIN" ]; then
+  if ! verify_bundled_file "$GEOIP_BIN" "$GEOIP_SHA"; then
+    ui_print "- WARN: bundled geoip.metadb is corrupted (SHA-256 mismatch), removing"
+    rm -f "$GEOIP_BIN"
+  fi
+fi
+
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$MODPATH/service.sh" 0 0 0755
 set_perm "$MODPATH/action.sh" 0 0 0755

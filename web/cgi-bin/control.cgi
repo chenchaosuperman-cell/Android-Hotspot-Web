@@ -12,6 +12,8 @@ if [ ! -r "$MODDIR/lib/common.sh" ]; then
 fi
 . "$MODDIR/lib/common.sh"
 header_json
+# v1.7.9：POST body 在顶层读取一次（子 shell 无法回传变量；body 只能消费一次）
+cgi_read_body
 
 EXPECTED_CSRF=$(read_csrf_token)
 # BusyBox httpd builds differ in which HTTP_* headers they expose to CGI.
@@ -24,6 +26,9 @@ if [ "${REQUEST_METHOD:-}" != "POST" ] || [ -z "$EXPECTED_CSRF" ] || \
 fi
 
 ACTION=$(get_param action)
+# v1.7.9：系统 SoftApConfiguration 备份文件（写系统配置前生成；写失败或
+# 启动失败时用于恢复原系统配置——config.conf 回滚不覆盖系统持久化配置）。
+SYS_CFG_BAK="$DATA_DIR/.syscfg.bak"
 # P1-6(1.5.11)：配置事务锁——锁覆盖 加锁→load_config→修改→save→解锁 全过程，
 # 两个并发请求不会出现“先后读旧配置、后写者覆盖前者字段”的丢失更新。
 CFG_TXN=0
@@ -76,7 +81,13 @@ restart_hotspot_async() {
     # v1.7.6：系统 SoftApConfiguration 为唯一数据源，run_softap 无参启动
     # （config.conf 残留旧热点字段时，run_softap 内部自动迁移到系统后清除）
     # v1.7.6：停止走系统 Tethering 路径（hotspot_stop → connectivity tether stop）
-    hotspot_stop >/dev/null 2>&1
+    # v1.7.9：必须确认旧热点已经成功停止再启动，否则 start-softap 可能因状态冲突
+    # 失败或新旧热点交替异常。hotspot_stop 内部已等待确认（bridge/snapshot）。
+    if ! hotspot_stop >/dev/null 2>&1; then
+      write_operation error "热点重启失败：旧热点未能成功停止"
+      release_operation_lock
+      exit 0
+    fi
     sleep 1
     # Keep loopback management address until hotspot is ready
     OUT=$(run_softap 2>&1)
@@ -106,7 +117,9 @@ restart_hotspot_async() {
     softap_state_snapshot 2>/dev/null
     OK=0
     if [ "$RC" -eq 0 ] && [ -n "$VERIFY_IFACE" ] && softap_state_ok "$VERIFY_IFACE"; then
-      PARAM_ERR=$(verify_hotspot_params "$SSID" "$SECURITY" "$BAND" "$CHANNEL")
+      # v1.7.9：校验调用方已算好的 NEW_*（$SSID/$SECURITY 等是 load_config 旧字段，
+      # config.conf 已不存热点参数，校验它们等于校验空值，形同虚设）
+      PARAM_ERR=$(verify_hotspot_params "$NEW_SSID" "$NEW_SECURITY" "$NEW_BAND" "$NEW_CHANNEL")
       if [ -z "$PARAM_ERR" ]; then
         OK=1
         switch_management_to_hotspot "$VERIFY_IFACE"
@@ -151,8 +164,22 @@ restart_hotspot_async() {
         fi
         rm -f "$CONFIG.bak.md5"
       fi
+      # v1.7.9：系统 SoftApConfiguration 已持久化为新值，启动失败必须恢复原系统配置
+      if [ "$ROLLBACK" = "1" ] && [ -s "$SYS_CFG_BAK" ]; then
+        OLD_SSID=$(b64url_decode "$("$BB" sed -n 's/^ssid_b64=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)")
+        OLD_SEC=$("$BB" sed -n 's/^security=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_PASS=$(b64url_decode "$("$BB" sed -n 's/^password_b64=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)")
+        OLD_BAND=$("$BB" sed -n 's/^band=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_CH=$("$BB" sed -n 's/^channel=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_HID=$("$BB" sed -n 's/^hidden=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_MAX=$("$BB" sed -n 's/^maxclients=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        hotspot_set_config "$OLD_SSID" "$OLD_SEC" "$OLD_PASS" "$OLD_BAND" "$OLD_CH" "$OLD_HID" "$OLD_MAX" >/dev/null 2>&1
+        printf '%s hotspot start failed; original system config restored\n' "$(date)" >> "$LOG"
+      fi
+      rm -f "$SYS_CFG_BAK" 2>/dev/null
     elif [ "$ROLLBACK" = "1" ]; then
       rm -f "$CONFIG.bak"
+      rm -f "$SYS_CFG_BAK" 2>/dev/null
     fi
     release_operation_lock
   ) </dev/null >/dev/null 2>&1 &
@@ -182,7 +209,9 @@ case "$ACTION" in
     case "$NEW_CHANNEL" in ''|0|any) NEW_CHANNEL=0 ;; *[!0-9]*) printf '{"ok":false,"message":"信道格式错误"}'; exit 0 ;; esac
     valid_channel "$NEW_BAND" "$NEW_CHANNEL" || { printf '{"ok":false,"message":"信道 %s 与频段不匹配（2.4G: 1/3/6/9/11/13；5G: 36/40/44/48/149/153/157/161/165）"}' "$NEW_CHANNEL"; exit 0; }
     case "$NEW_MAX" in ''|0) NEW_MAX=0 ;; *[!0-9]*) printf '{"ok":false,"message":"最大连接数格式错误"}'; exit 0 ;; esac
-    valid_max_clients "$NEW_MAX" || { printf '{"ok":false,"message":"最大连接数需在0–32之间"}'; exit 0; }
+    # v1.7.9：上限用系统能力值（能力缓存 maxClientsLimit），不再写死 32
+    MC_LIMIT=$(get_max_clients_limit)
+    valid_max_clients "$NEW_MAX" "$MC_LIMIT" || { printf '{"ok":false,"message":"最大连接数需在0–%s之间"}' "$MC_LIMIT"; exit 0; }
 
     NEW_SSID=$(b64url_decode "$NEW_SSID_B64")
     if [ -n "$NEW_PASS_B64" ]; then
@@ -213,6 +242,21 @@ case "$ACTION" in
       exit 0
     fi
 
+    # v1.7.9：写系统配置前备份原系统 SoftApConfiguration（写失败/启动失败时恢复）
+    rm -f "$SYS_CFG_BAK" 2>/dev/null
+    hotspot_get_config
+    if [ "$sys_ok" = "1" ]; then
+      {
+        printf 'ssid_b64=%s\n' "$(printf '%s' "$sys_ssid" | "$BB" base64 -w0 2>/dev/null | "$BB" tr '+/' '-_')"
+        printf 'security=%s\n' "$sys_security"
+        printf 'password_b64=%s\n' "$(printf '%s' "$sys_password" | "$BB" base64 -w0 2>/dev/null | "$BB" tr '+/' '-_')"
+        printf 'band=%s\n' "$sys_band"
+        printf 'channel=%s\n' "$sys_channel"
+        printf 'hidden=%s\n' "$sys_hidden"
+        printf 'maxclients=%s\n' "$sys_maxclients"
+      } > "$SYS_CFG_BAK" 2>/dev/null
+      chmod 0600 "$SYS_CFG_BAK" 2>/dev/null
+    fi
     # v1.7.6：热点参数经 hotspot_set_config 写入系统，不再写入模块 config.conf
     AUTOSTART=$NEW_AUTOSTART
     # 手动开启：解除本次开机手动关闭，恢复自动策略
@@ -226,11 +270,44 @@ case "$ACTION" in
     save_config || { release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"; printf '{"ok":false,"message":"配置写入失败，请检查磁盘空间或稍后重试"}'; exit 0; }
     # 一套配置：经 Hotspot Compatibility Layer 调 Framework setSoftApConfiguration 持久化（系统设置 ↔ Web 共用一份）
     if ! hotspot_set_config "$NEW_SSID" "$NEW_SECURITY" "$NEW_PASS" "$NEW_BAND" "$NEW_CHANNEL" "$NEW_HIDDEN" "$NEW_MAX"; then
-      release_operation_lock; rm -f "$CONFIG.bak" "$CONFIG.bak.md5"
-      printf '{"ok":false,"message":"系统热点配置写入失败（系统 API 未接受），已还原模块配置"}'; exit 0
+      # v1.7.9：恢复原系统配置（部分 ROM 写入 API 接受后读回验证失败，系统配置可能已被改动）
+      if [ -s "$SYS_CFG_BAK" ]; then
+        OLD_SSID=$(b64url_decode "$("$BB" sed -n 's/^ssid_b64=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)")
+        OLD_SEC=$("$BB" sed -n 's/^security=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_PASS=$(b64url_decode "$("$BB" sed -n 's/^password_b64=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)")
+        OLD_BAND=$("$BB" sed -n 's/^band=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_CH=$("$BB" sed -n 's/^channel=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_HID=$("$BB" sed -n 's/^hidden=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        OLD_MAX=$("$BB" sed -n 's/^maxclients=//p' "$SYS_CFG_BAK" 2>/dev/null | "$BB" head -1)
+        hotspot_set_config "$OLD_SSID" "$OLD_SEC" "$OLD_PASS" "$OLD_BAND" "$OLD_CH" "$OLD_HID" "$OLD_MAX" >/dev/null 2>&1
+        printf '%s system config write failed; original system config restored\n' "$(date)" >> "$LOG"
+      fi
+      # v1.7.9：写失败时模块 config.conf 已 save_config 新值，回滚为备份旧值，
+      # 保持模块配置与系统配置一致；并删系统配置缓存（supervisor 重建旧值）。
+      if [ -s "$CONFIG.bak" ]; then
+        cp "$CONFIG.bak" "$CONFIG" 2>/dev/null
+        chmod 0600 "$CONFIG" 2>/dev/null
+      fi
+      rm -f "$CONFIG_CACHE_FILE" "$SYS_CFG_BAK" "$CONFIG.bak" "$CONFIG.bak.md5"
+      release_operation_lock
+      printf '{"ok":false,"message":"系统热点配置写入失败（系统 API 未接受），已恢复原系统配置"}'; exit 0
     fi
+    # v1.7.9：删系统配置缓存，强制 supervisor 下一 tick 重建（否则 25s TTL 内
+    # 页面仍读到旧配置）
+    rm -f "$CONFIG_CACHE_FILE" 2>/dev/null
     # 热点开着 → 重启一次应用新配置；关着 → 仅持久化（不偷偷开启，下次启动生效）
     softap_state_snapshot 2>/dev/null
+    # v1.7.9：HyperOS dumpsys 偶发解析不出状态（rec/map 全空且接口存在时不判
+    # DISABLED→STATE 空）。快照空时回退 supervisor 状态缓存/热点接口判定，
+    # 避免把还开着的热点误判为"关闭"写 DESIRED=0，导致 supervisor 误停热点。
+    if [ -z "$SNAP_AP_STATE" ]; then
+      SNAP_AP_STATE=$("$BB" sed -n 's/^SNAP_AP_STATE=//p' "$STATE_CACHE_FILE" 2>/dev/null | "$BB" head -1)
+    fi
+    if [ -z "$SNAP_AP_STATE" ]; then
+      case "$(get_hotspot_iface 2>/dev/null)" in
+        wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*) SNAP_AP_STATE=ENABLED ;;
+      esac
+    fi
     if [ "$SNAP_AP_STATE" = "ENABLED" ]; then
       printf '1\n' > "$DESIRED_FILE"
       chmod 0600 "$DESIRED_FILE"
@@ -240,6 +317,9 @@ case "$ACTION" in
     else
       printf '0\n' > "$DESIRED_FILE"
       chmod 0600 "$DESIRED_FILE"
+      # v1.7.9：热点关闭时不走 restart_hotspot_async，必须显式释放操作锁
+      # （否则 120s 内后续 start_softap/stop 全部被"已有操作正在执行"拒绝）
+      release_operation_lock
       printf '{"ok":true,"message":"配置已保存（热点当前关闭，下次开启时生效）"}'
     fi
     ;;

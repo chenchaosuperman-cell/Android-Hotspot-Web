@@ -32,6 +32,7 @@ HOTSPOT_CAPS_JSON=
 # v1.7.9：能力/状态缓存（supervisor 预热；status.cgi 只读，避免每次请求起 app_process/dumpsys）
 CAPS_CACHE_FILE="${DATA_DIR:-}/hotspot_caps.cache"
 STATE_CACHE_FILE="${DATA_DIR:-}/system_hotspot.cache"
+CONFIG_CACHE_FILE="${DATA_DIR:-}/hotspot_config.cache"
 HOTSPOT_IFACE_FILE="${DATA_DIR:-}/hotspot_iface.cache"
 CAPS_CACHE_TTL=600
 
@@ -303,6 +304,24 @@ sys_bridge_get() {
 $OUT
 EOF
   [ "$PRESENT" = "1" ] && [ -n "$sys_ssid" ] && sys_ok=1
+  # v1.7.9：非 CGI 调用时写系统配置缓存（supervisor 主 tick 预热；status.cgi
+  # 只读此缓存，不再每次轮询起 app_process get-config）。
+  if [ -n "$CONFIG_CACHE_FILE" ] && [ -d "${CONFIG_CACHE_FILE%/*}" ] && [ "${CGI_READONLY:-0}" != "1" ]; then
+    TMP_CC="$CONFIG_CACHE_FILE.tmp.$$"
+    {
+      printf 'present=%s\n' "$PRESENT"
+      printf 'ssid_b64=%s\n' "$(printf '%s' "$sys_ssid" | "$BB" base64 -w0 2>/dev/null | "$BB" tr '+/' '-_')"
+      printf 'security=%s\n' "$sys_security"
+      printf 'password_b64=%s\n' "$(printf '%s' "$sys_password" | "$BB" base64 -w0 2>/dev/null | "$BB" tr '+/' '-_')"
+      printf 'band=%s\n' "$sys_band"
+      printf 'channel=%s\n' "$sys_channel"
+      printf 'hidden=%s\n' "$sys_hidden"
+      printf 'maxclients=%s\n' "$sys_maxclients"
+    } > "$TMP_CC" 2>/dev/null
+    chmod 0600 "$TMP_CC" 2>/dev/null
+    mv -f "$TMP_CC" "$CONFIG_CACHE_FILE" 2>/dev/null
+    rm -f "$TMP_CC" 2>/dev/null
+  fi
   return 0
 }
 
@@ -316,7 +335,46 @@ sys_bridge_set() {
 
 # ---- 接口 2：读取系统热点配置（变量见 sys_softap_get / sys_bridge_get）----
 # 优先 Framework（真实内存配置）；bridge 不可用时降级只读解析 WifiConfigStore.xml。
+CONFIG_CACHE_TTL=25
+# 从配置文件读入 sys_*（共用段，CGI 与非 CGI 复用）
+_read_config_cache() {
+  sys_ok=0
+  sys_ssid=; sys_security=wpa2; sys_password=; sys_band=any; sys_channel=0; sys_hidden=0; sys_maxclients=0
+  PRESENT=0
+  while IFS= read -r LINE; do
+    case "$LINE" in
+      present=*) PRESENT=${LINE#present=} ;;
+      ssid_b64=*) sys_ssid=$(b64url_decode "${LINE#ssid_b64=}") ;;
+      security=*) sys_security=${LINE#security=} ;;
+      password_b64=*) sys_password=$(b64url_decode "${LINE#password_b64=}") ;;
+      band=*) sys_band=${LINE#band=} ;;
+      channel=*) sys_channel=${LINE#channel=} ;;
+      hidden=*) sys_hidden=${LINE#hidden=} ;;
+      maxclients=*) sys_maxclients=${LINE#maxclients=} ;;
+    esac
+  done < "$CONFIG_CACHE_FILE"
+  [ "$PRESENT" = "1" ] && [ -n "$sys_ssid" ] && sys_ok=1
+}
+
 hotspot_get_config() {
+  # v1.7.9：CGI 只读轮询——直接读 supervisor 预热的系统配置缓存，
+  # 不在此进程起 app_process（get-config），避免每次状态轮询都 fork app_process。
+  if [ "${CGI_READONLY:-0}" = "1" ] && [ -s "$CONFIG_CACHE_FILE" ]; then
+    _read_config_cache
+    return 0
+  fi
+  # v1.7.9：非 CGI（supervisor 预热）同样按 TTL 复用缓存，避免每 5s tick
+  # 都起一次 app_process get-config；配置保存后 control.cgi 会删缓存强制重建。
+  if [ -s "$CONFIG_CACHE_FILE" ]; then
+    CC_MT=$("$BB" stat -c %Y "$CONFIG_CACHE_FILE" 2>/dev/null)
+    CC_NOW=$(/system/bin/date +%s 2>/dev/null || date +%s)
+    case "$CC_MT" in ''|*[!0-9]*) CC_MT=0 ;; esac
+    CC_AGE=$((CC_NOW - CC_MT))
+    if [ "$CC_MT" -gt 0 ] && [ "$CC_AGE" -ge 0 ] && [ "$CC_AGE" -lt "$CONFIG_CACHE_TTL" ]; then
+      _read_config_cache
+      return 0
+    fi
+  fi
   if sys_bridge_get; then
     return 0
   fi
@@ -357,6 +415,10 @@ hotspot_set_config() {
     echo "$(date) hotspot_set_config: setSoftApConfiguration failed (bridge unavailable or API rejected)" >> "$LOG" 2>/dev/null
     return 1
   fi
+
+  # v1.7.9：写成功后立即删系统配置缓存，读回验证必须走实时 bridge——
+  # 否则 25s TTL 缓存窗口内读到旧配置，把成功写入误判为失败。
+  rm -f "$CONFIG_CACHE_FILE" 2>/dev/null
 
   # 确保 probe 已跑（密码可读性 / 最大连接数能力判定）
   [ -n "${BRIDGE_P_GET:-}" ] || sys_bridge_probe 2>/dev/null
@@ -403,8 +465,13 @@ hotspot_set_config() {
 # 任何"failure reason: 0"都不判失败；只有 state=14（FAILED）才算启动失败。
 hotspot_get_state() {
   SNAP_AP_STATE=
-  # CGI 只读轮询：先读 supervisor 后台刷新的快照缓存（避免每次起 app_process）
+  # v1.7.9：CGI 只读轮询——先读 supervisor 每 tick 写的 system_hotspot.cache
+  # （永远新鲜，5s 刷新），非空即返回；避免起 app_process 或触发 dumpsys。
   if [ "${CGI_READONLY:-0}" = "1" ]; then
+    if [ -s "$STATE_CACHE_FILE" ]; then
+      SNAP_AP_STATE=$("$BB" sed -n 's/^SNAP_AP_STATE=//p' "$STATE_CACHE_FILE" 2>/dev/null | "$BB" head -1)
+      [ -n "$SNAP_AP_STATE" ] && return 0
+    fi
     softap_state_snapshot "$@"
     [ -n "$SNAP_AP_STATE" ] && return 0
   fi

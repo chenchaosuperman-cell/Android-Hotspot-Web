@@ -145,7 +145,11 @@ migrate_legacy_hotspot_config
 rm -f "$DATA_DIR/recover_notify_ts" 2>/dev/null
 if [ -f "$CONFIG" ]; then
   TMP_CONF="$CONFIG.tmp.$$"
-  "$BB" grep -v '^NOTIFY_HOTSPOT_EVT=' "$CONFIG" > "$TMP_CONF" 2>/dev/null && mv "$TMP_CONF" "$CONFIG" 2>/dev/null
+  "$BB" grep -v '^NOTIFY_HOTSPOT_EVT=' "$CONFIG" > "$TMP_CONF" 2>/dev/null
+  # v1.7.9：grep 重定向创建的临时文件默认 0644，直接 mv 会让 config.conf 从 0600 变为 0644（敏感配置泄露）；
+  # 写临时文件前先 chmod 0600，mv 后保持权限不变。
+  chmod 0600 "$TMP_CONF" 2>/dev/null
+  mv -f "$TMP_CONF" "$CONFIG" 2>/dev/null
   rm -f "$TMP_CONF" 2>/dev/null
 fi
 # 启动时清理上次异常退出可能残留的通知 busy 标记，避免后续通知被静默丢弃
@@ -164,7 +168,12 @@ start_hotspot() {
   # remote service receives such an FD. Capture through an anonymous pipe and
   # append the text afterwards instead.
   # v1.7.6：停止走系统 Tethering 路径（hotspot_stop）
-  hotspot_stop >/dev/null 2>&1
+  # v1.7.9：必须确认旧热点已经成功停止再启动，否则 start-softap 可能因
+  # 状态冲突失败或新旧热点交替异常。hotspot_stop 内部已等待确认（bridge/snapshot）。
+  if ! hotspot_stop >/dev/null 2>&1; then
+    echo "$(date) hotspot start aborted: previous hotspot failed to stop" >> "$LOG"
+    return 1
+  fi
   sleep 1
   START_OUT=$(run_softap 2>&1)
   START_RC=$?
@@ -282,11 +291,34 @@ else
   ensure_management_loopback
 fi
 
+# v1.7.9：统一关闭入口（网页外路径：定时/流量/空闲关闭共用）。
+# 调兼容层 hotspot_stop；失败时保留 DESIRED=1（保活仍可拉起），不写
+# STOP_REASON/不写"已关闭"，避免"系统还开着热点却显示已关闭"的假成功。
+# 成功时清理管理别名、写 DESIRED=0 + 策略关闭原因。
+try_stop_hotspot() {
+  _reason=$1
+  _iface=$2
+  if hotspot_stop; then
+    [ -n "$_iface" ] && remove_management_alias "$_iface" 2>/dev/null
+    echo 0 > "$DESIRED_FILE"
+    chmod 0600 "$DESIRED_FILE"
+    printf '%s\n' "$_reason" > "$STOP_REASON_FILE" 2>/dev/null
+    chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
+    return 0
+  fi
+  echo "$(date) hotspot stop FAILED (reason=$_reason); desired kept on, no false 'stopped' report" >> "$LOG"
+  return 1
+}
+
 # Keep both the LAN admin page and the desired hotspot state alive.
 # HyperOS reports a 600-second idle SoftAP shutdown timeout; the watchdog
 # restarts it when keepalive is enabled. Schedule and idle shutdown are
 # evaluated on the same 15-second tick.
 TICK=0
+# v1.7.9：能力缓存刷新与主任务各用独立 tick（原共用 TICK 导致：主任务每 3 轮
+# 清零 TICK，能力缓存 120 tick 永远达不到 → 缓存永不强制刷新；且主任务周期
+# 被双重累加变成 10s 而非 15s，所有周期任务（定时/保活/流量/空闲/通知）时间错乱）。
+CAP_TICK=0
 IDLE_SECS=0
 while true; do
   sleep 5
@@ -294,6 +326,9 @@ while true; do
   # 由 supervisor 每 tick 采集（softap 15s / telephony 60s 缓存限频），
   # status.cgi 只读缓存文件，避免 CGI 子进程同步执行慢 dumpsys 导致页面 8s 超时。
   softap_state_snapshot >/dev/null 2>&1
+  # v1.7.9：预热系统热点配置缓存（hotspot_get_config 内部写 CONFIG_CACHE_FILE；
+  # status.cgi 只读缓存，不再每次轮询起 app_process get-config）
+  hotspot_get_config >/dev/null 2>&1
   # v1.7.9：状态/接口缓存（status.cgi 只读，不在 CGI 进程里起 app_process/dumpsys）
   {
     printf 'SNAP_AP_STATE=%s\n' "${SNAP_AP_STATE:-}"
@@ -303,9 +338,9 @@ while true; do
   if [ -n "$IFACE_C" ]; then
     printf '%s\n' "$IFACE_C" > "$HOTSPOT_IFACE_FILE" 2>/dev/null
   fi
-  # 能力缓存：每 120 tick（约 10 分钟）强制重探测一次并回写
-  TICK=$((TICK + 1))
-  if [ $((TICK % 120)) -eq 0 ]; then
+  # 能力缓存：每 120 tick（约 10 分钟）强制重探测一次并回写（独立 CAP_TICK）
+  CAP_TICK=$((CAP_TICK + 1))
+  if [ $((CAP_TICK % 120)) -eq 0 ]; then
     HOTSPOT_CAPS_JSON=
     hotspot_get_capabilities >/dev/null 2>&1
   fi
@@ -326,7 +361,9 @@ while true; do
     case "$CONTROL_ACTION" in
       stop)
         echo "$(date) supervisor: processing hotspot stop request" >> "$LOG"
-        if stop_hotspot_real; then
+        # v1.7.9：与定时/流量/空闲关闭统一走兼容层 hotspot_stop（bridge 优先，
+        # fallback stop_hotspot_real），不再直用旧 Shell 实现。
+        if hotspot_stop; then
           printf '0\n' > "$DESIRED_FILE"
           chmod 0600 "$DESIRED_FILE"
           printf 'manual\n' > "$STOP_REASON_FILE"
@@ -494,13 +531,10 @@ while true; do
         fi
         if [ "$SHOULD_CLOSE" = "1" ] && [ "$DESIRED" = "1" ]; then
           echo "$(date) schedule: out of window, stopping" >> "$LOG"
-          hotspot_stop >> "$LOG" 2>&1
-          remove_management_alias "$IFACE"
-          echo 0 > "$DESIRED_FILE"
-          printf 'schedule\n' > "$STOP_REASON_FILE" 2>/dev/null
-          chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
-          DESIRED=0
-          IFACE=
+          if try_stop_hotspot schedule "$IFACE"; then
+            DESIRED=0
+            IFACE=
+          fi
         fi
         rm -f "$IDLE_FILE" "$IDLE_SINCE" "$SKIP_WINDOW_FILE"
       fi
@@ -572,12 +606,9 @@ while true; do
     if [ "$DESIRED" = "1" ] && [ "$PLAN_TOTAL" -gt 0 ] 2>/dev/null && [ "$PLAN_PERCENT" -ge 100 ] 2>/dev/null; then
       if [ "${DATA_LIMIT_ACTION:-stop}" != "notify" ]; then
         echo "$(date) data limit reached (账期 ${PLAN_PERIOD_BYTES}B >= ${PLAN_TOTAL}MB), stopping" >> "$LOG"
-        hotspot_stop >> "$LOG" 2>&1
-        remove_management_alias "$IFACE"
-        echo 0 > "$DESIRED_FILE"
-        printf 'limit\n' > "$STOP_REASON_FILE" 2>/dev/null
-        chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
-        rm -f "$IDLE_FILE"
+        if try_stop_hotspot limit "$IFACE"; then
+          rm -f "$IDLE_FILE"
+        fi
       fi
     fi
 
@@ -670,14 +701,11 @@ while true; do
         [ "$IDLE_SECS" -lt 0 ] && IDLE_SECS=0
         LIMIT_S=$((IDLE_SHUTDOWN * 60))
         if [ "$IDLE_SECS" -ge "$LIMIT_S" ]; then
-          rm -f "$IDLE_FILE" "$IDLE_SINCE"
           echo "$(date) idle shutdown: no clients for ${IDLE_SHUTDOWN}m" >> "$LOG"
-          hotspot_stop >> "$LOG" 2>&1
-          remove_management_alias "$IFACE"
-          echo 0 > "$DESIRED_FILE"
-          printf 'idle\n' > "$STOP_REASON_FILE" 2>/dev/null
-          chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
-          IDLE_SECS=0
+          if try_stop_hotspot idle "$IFACE"; then
+            rm -f "$IDLE_FILE" "$IDLE_SINCE"
+            IDLE_SECS=0
+          fi
         else
           # 倒计时预告：剩余分钟（向上取整，最少 1），status.cgi 读取并在页面提示
           LEFT=$(((LIMIT_S - IDLE_SECS + 59) / 60))

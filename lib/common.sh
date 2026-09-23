@@ -228,9 +228,30 @@ json_escape_nl() {
   printf '%s' "$1" | "$BB" tr '\r' ' ' | "$BB" awk '{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); gsub(/[[:cntrl:]]/,""); printf "%s\\n", $0}'
 }
 
+# v1.7.9：POST body 读取必须在 CGI 顶层（非命令替换）调用一次——body 只能从
+# stdin 消费一次，且函数内通过命令替换设置全局变量不会传回父 shell。
+cgi_read_body() {
+  if [ "${REQUEST_METHOD:-}" = "POST" ] && [ -z "$CGI_BODY_READ" ] && [ -z "$CGI_BODY" ]; then
+    CGI_BODY_READ=1
+    CL=${CONTENT_LENGTH:-0}
+    case "$CL" in ''|*[!0-9]*) CL=0 ;; esac
+    if [ "$CL" -gt 0 ] 2>/dev/null; then
+      CGI_BODY=$("$BB" head -c "$CL" 2>/dev/null)
+    fi
+  fi
+}
+
 get_param() {
   key=$1
-  RAW=$(printf '&%s&' "${QUERY_STRING:-}" | "$BB" sed -n "s/.*&${key}=\([^&]*\)&.*/\1/p")
+  RAW=
+  # v1.7.9：POST 请求敏感参数（token/密码/订阅地址等）改放 body，不再拼进 URL。
+  # 调用方需先顶层执行 cgi_read_body（见 control.cgi），此处只读全局 CGI_BODY。
+  if [ -n "$CGI_BODY" ]; then
+    RAW=$(printf '&%s&' "$CGI_BODY" | "$BB" sed -n "s/.*&${key}=\([^&]*\)&.*/\1/p")
+  fi
+  if [ -z "$RAW" ]; then
+    RAW=$(printf '&%s&' "${QUERY_STRING:-}" | "$BB" sed -n "s/.*&${key}=\([^&]*\)&.*/\1/p")
+  fi
   [ -n "$RAW" ] || return 0
   url_decode "$RAW"
 }
@@ -1266,14 +1287,20 @@ get_thermal_info() {
         [ "$((V / 1000))" -gt "$GX" ] 2>/dev/null && GX=$((V / 1000)) ;;
     esac
   done
-  case "$BT" in ''|*[!0-9]*) BT=0 ;; esac
-  MX=$BT
-  [ "$CT" -gt "$MX" ] 2>/dev/null && MX=$CT
-  [ "$GX" -gt "$MX" ] 2>/dev/null && MX=$GX
+  # v1.7.9：无传感器读数时置空（前端显示 —，不再误显示 0°C）；
+  # 系统温度状态只由 CPU/GPU 决定（电池温度随充电波动，不代表系统负载，
+  # 计入门槛会导致充电时误报"偏高/过热"）。
+  case "$BT" in ''|*[!0-9]*) BT= ;; *) [ "$BT" -gt 0 ] 2>/dev/null || BT= ;; esac
+  case "$CT" in ''|*[!0-9]*) CT= ;; *) [ "$CT" -gt 0 ] 2>/dev/null || CT= ;; esac
+  case "$GX" in ''|*[!0-9]*) GX= ;; *) [ "$GX" -gt 0 ] 2>/dev/null || GX= ;; esac
+  MX=$CT
+  [ -n "$GX" ] && { [ -z "$MX" ] || [ "$GX" -gt "$MX" ] 2>/dev/null; } && MX=$GX
   THERM_BATTERY=$BT
   THERM_CPU=$CT
   THERM_MAX=$MX
-  if [ "$MX" -ge 55 ] 2>/dev/null; then
+  if [ -z "$MX" ]; then
+    THERM_STATUS=unknown
+  elif [ "$MX" -ge 55 ] 2>/dev/null; then
     THERM_STATUS=hot
   elif [ "$MX" -ge 45 ] 2>/dev/null; then
     THERM_STATUS=warm
@@ -1462,6 +1489,18 @@ softap_state_snapshot() {
         '') SNAP_AP_SSID= ;;
         *) SNAP_AP_SSID=$(printf '%s' "$SNAP_AP_SSID_B64" | "$BB" base64 -d 2>/dev/null) ;;
       esac
+      # v1.7.9：缓存读取路径同样补接口兜底——旧缓存 STATE 为空会被 15s 复用
+      # 窗口持续带出，supervisor 写 system_hotspot.cache 恒空，status.cgi 读
+      # 缓存落空后仍会 fallback 起 app_process。热点形态接口存在→ENABLED；
+      # 无接口但配置存在→DISABLED。
+      if [ -z "$SNAP_AP_STATE" ]; then
+        case "$(get_hotspot_iface 2>/dev/null)" in
+          wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*) SNAP_AP_STATE=ENABLED ;;
+        esac
+      fi
+      if [ -z "$SNAP_AP_STATE" ] && [ -n "$SNAP_AP_SSID" ] && [ -z "$(get_hotspot_iface 2>/dev/null)" ]; then
+        SNAP_AP_STATE=DISABLED
+      fi
       return 0
     fi
   fi
@@ -1526,6 +1565,24 @@ softap_state_snapshot() {
   case "$AP_SSID" in
     ''|null|NULL|{}|mCurrentSoftApInfoMap|SoftApInfo|SoftApConfiguration|wlan0|wlan1|wlan2) AP_SSID= ;;
   esac
+  # v1.7.9：HyperOS dumpsys 偶发全空（rec/map/mWifiApState 均无）时用接口兜底。
+  # 热点形态接口存在 → ENABLED（热点在跑）；无接口但系统"曾配置过 SoftAP"
+  # （本次 SSID 或上次快照 SNAP_AP_SSID_B64 非空）→ "已配置但未运行"= DISABLED。
+  # supervisor 每 tick 写 system_hotspot.cache 正确状态，status.cgi 只读缓存
+  # 即得 ON/OFF，不再 fallback 起 app_process/dumpsys。
+  if [ -z "$AP_STATE" ]; then
+    case "$(get_hotspot_iface 2>/dev/null)" in
+      wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*) AP_STATE=ENABLED ;;
+    esac
+  fi
+  if [ -z "$AP_STATE" ]; then
+    HAS_CFG=
+    [ -n "$AP_SSID" ] && HAS_CFG=1
+    [ -z "$HAS_CFG" ] && [ -n "$SNAP_AP_SSID_B64" ] && HAS_CFG=1
+    if [ -n "$HAS_CFG" ] && [ -z "$(get_hotspot_iface 2>/dev/null)" ]; then
+      AP_STATE=DISABLED
+    fi
+  fi
   # 安全模式：WifiApInfo/WifiConfiguration 中 security 或 allowedKeyManagement
   AP_SECURITY=$("$BB" grep -o 'security=[0-9]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" cut -d= -f2)
   AP_CHANNEL=$("$BB" grep -o 'mWifiApInfo[^}]*channel=[0-9]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" sed -n 's/.*channel=\([0-9]*\).*/\1/p')

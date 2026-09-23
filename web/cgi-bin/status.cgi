@@ -332,10 +332,19 @@ CFG_SAVED=$("$BB" tr -d '\r\n' < "$DATA_DIR/config.saved" 2>/dev/null)
 printf '"cfgSaved":"%s",' "$(json_escape "$CFG_SAVED")"
 printf '"activeClientCount":%s,"connectedClientCount":%s,"manualOff":%s,"tcSupported":%s,' "$(count_online_clients "$IFACE")" "$(count_connected_clients "$IFACE")" "$([ -f "$MANUAL_OFF_FILE" ] && echo true || echo false)" "$([ -n "$(command -v tc 2>/dev/null)" ] && echo true || echo false)"
 printf '"tether":{"fwd":%s,"nat":%s,"hotspotNat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_HOTSPOT_NAT" "$TETHER_PKTS"
-printf '"sys":{"memTotal":%s,"memAvail":%s,"load":"%s","uptime":"%s","storTotal":%s,"storAvail":%s,"thermal":"%s"},' \
-  "${SYS_MEM_TOTAL:-0}" "${SYS_MEM_AVAIL:-0}" "$(json_escape "$SYS_LOAD")" "$(json_escape "$SYS_UPTIME")" "${SYS_STOR_TOTAL:-0}" "${SYS_STOR_AVAIL:-0}" "$(json_escape "$SYS_THERMAL")"
+# v1.7.9：CPU 温度无传感器时输出 JSON null（不再输出空串/0）
+TH_SYS=${SYS_THERMAL:-}
+case "$TH_SYS" in ''|*[!0-9]*) TH_SYS=null ;; *) TH_SYS="$(json_escape "$TH_SYS")" ;; esac
+printf '"sys":{"memTotal":%s,"memAvail":%s,"load":"%s","uptime":"%s","storTotal":%s,"storAvail":%s,"thermal":%s},' \
+  "${SYS_MEM_TOTAL:-0}" "${SYS_MEM_AVAIL:-0}" "$(json_escape "$SYS_LOAD")" "$(json_escape "$SYS_UPTIME")" "${SYS_STOR_TOTAL:-0}" "${SYS_STOR_AVAIL:-0}" "$TH_SYS"
 # v1.7.2-beta.1：温度细分为电池/CPU/最高/状态，不再只给一个笼统的 SoC 温度
-printf '"thermal":{"battery":%s,"cpu":%s,"max":%s,"status":"%s"},' "${THERM_BATTERY:-0}" "${THERM_CPU:-0}" "${THERM_MAX:-0}" "${THERM_STATUS:-normal}"
+# v1.7.9：传感器不可用时输出 JSON null（前端显示 —），不再输出 0°C
+TH_BAT=${THERM_BATTERY:-}; TH_CPU=${THERM_CPU:-}; TH_MAX=${THERM_MAX:-}; TH_ST=${THERM_STATUS:-unknown}
+case "$TH_BAT" in ''|*[!0-9]*) TH_BAT=null ;; esac
+case "$TH_CPU" in ''|*[!0-9]*) TH_CPU=null ;; esac
+case "$TH_MAX" in ''|*[!0-9]*) TH_MAX=null ;; esac
+case "$TH_ST" in normal|warm|hot) : ;; *) TH_ST=unknown ;; esac
+printf '"thermal":{"battery":%s,"cpu":%s,"max":%s,"status":"%s"},' "$TH_BAT" "$TH_CPU" "$TH_MAX" "$TH_ST"
 printf '"sim":{"operator":"%s","data":%s,"signal":"%s"},' "$(json_escape "$SIM_OPERATOR")" "${SIM_DATA:-0}" "$(json_escape "$SIM_SIGNAL")"
 printf '"cell":{"rx":%s,"tx":%s},' "$CELL_RX" "$CELL_TX"
 printf '"usage":{"bytes":%s,"mb":%s,"limitMb":%s,"limitAction":"%s","over":%s},' "$USAGE_BYTES" "$USAGE_MB" "${DATA_PLAN_MB:-0}" "${DATA_LIMIT_ACTION:-stop}" "$USAGE_OVER"

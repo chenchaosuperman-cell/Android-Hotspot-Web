@@ -31,8 +31,8 @@ echo "✓ 代理数据完整"
 # ---------- 2. 打包 ----------
 mkdir -p "$DIST"
 rm -f "$DIST/$ZIP_LITE" "$DIST/$ZIP_FULL"
-zip -qr "$DIST/$ZIP_LITE" . -x 'bin/*' -x '.git/*' -x "$DIST/*" -x 'release.sh' -x '.DS_Store'
-zip -qr "$DIST/$ZIP_FULL" . -x '.git/*' -x "$DIST/*" -x 'release.sh' -x '.DS_Store'
+zip -qr "$DIST/$ZIP_LITE" . -x 'bin/*' -x '.git/*' -x "$DIST/*" -x 'release.sh' -x '.DS_Store' -x 'tools/softap_bridge/classes/*' -x '*.class'
+zip -qr "$DIST/$ZIP_FULL" . -x '.git/*' -x "$DIST/*" -x 'release.sh' -x '.DS_Store' -x 'tools/softap_bridge/classes/*' -x '*.class'
 echo "✓ 精简版: $DIST/$ZIP_LITE ($(du -h "$DIST/$ZIP_LITE" | cut -f1))"
 echo "✓ 完整版: $DIST/$ZIP_FULL ($(du -h "$DIST/$ZIP_FULL" | cut -f1))"
 

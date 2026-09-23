@@ -132,6 +132,14 @@ for CHAIN in mifi_stats mifi_up mifi_dn mifi_acl; do
   /system/bin/iptables -X "$CHAIN" 2>/dev/null || true
 done
 if [ -x "$IPT6" ] || command -v "$IPT6" >/dev/null 2>&1; then
+  # v1.7.9：mifi_ipv6 按热点接口挂 FORWARD 跳转（fw6_ensure -i $iface），
+  # 必须先按接口逐个摘除带接口引用，再摘全局引用，否则 -X 删链会因引用残留失败。
+  for IFACE in $IFACES; do
+    [ -n "$IFACE" ] || continue
+    while "$IPT6" -C FORWARD -i "$IFACE" -j mifi_ipv6 2>/dev/null; do
+      "$IPT6" -D FORWARD -i "$IFACE" -j mifi_ipv6 2>/dev/null || break
+    done
+  done
   while "$IPT6" -C FORWARD -j mifi_ipv6 2>/dev/null; do
     "$IPT6" -D FORWARD -j mifi_ipv6 2>/dev/null || break
   done
