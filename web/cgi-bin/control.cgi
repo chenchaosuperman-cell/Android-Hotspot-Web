@@ -123,6 +123,8 @@ restart_hotspot_async() {
       if [ -z "$PARAM_ERR" ]; then
         OK=1
         switch_management_to_hotspot "$VERIFY_IFACE"
+        # v1.7.9：系统 DHCP 未建立时自建 DHCP/NAT（修复热点半开——设备连上无网）
+        ensure_hotspot_dhcp "$VERIFY_IFACE"
         flush_stats_chain
         ensure_stats_chain "$VERIFY_IFACE"
         apply_mac_policy "$VERIFY_IFACE"

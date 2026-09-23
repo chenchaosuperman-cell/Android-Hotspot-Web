@@ -578,12 +578,134 @@ save_config() {
 }
 
 
+# 默认路由上游接口（Android policy routing：default 路由在非 main table，
+# `ip route show default` 只查 main table 会返回空 → 必须 table all 探测）。
+# WiFi 并发中继时优先 wlan*（手机默认路由的上行 Wi-Fi）；否则取第一条 default。
+get_upstream_iface() {
+  UP=$(/system/bin/ip -4 route show table all 2>/dev/null | "$BB" grep '^default' \
+    | "$BB" grep -oE 'dev [^ ]+' | "$BB" awk '{print $2}' | "$BB" head -n5)
+  for I in $UP; do
+    case "$I" in wlan[0-9]*) printf '%s' "$I"; return ;; esac
+  done
+  printf '%s' "$UP" | "$BB" head -n1
+}
+
+# v1.7.9：热点下游接口识别（修复 WiFi 并发下识别错接口）：
+#   热点下游接口 = Tethering 已共享接口 - 默认路由上游接口 - lo - 移动数据接口
+# 识别优先级（禁止固定 wlan2 / 禁止用"第一个 wlan*"）：
+#   1) bridge tether-state 的 ifaces（系统 Tethering 共享接口，快、可靠）
+#   2) ip 层探测：非上游的 wlan*/ap*/softap* 接口（排除 rmnet/移动数据/lo）
+#   3) dumpsys wifi 的 SoftApManager role=ROLE_SOFTAP_TETHERED（最终权威）
+# 无法可靠识别 → 返回空，调用方停止应用模块规则（不猜测接口）。
 get_hotspot_iface() {
-  if /system/bin/ip -o -4 addr show dev wlan2 2>/dev/null | "$BB" awk -v stable="$STABLE_IP" '$4 !~ "^" stable "/" {found=1} END {exit !found}'; then
-    printf 'wlan2'
-    return
+  # 默认路由上游接口（明确排除：它是手机的上行，不是热点下游）
+  UP=$(get_upstream_iface)
+  # 1) bridge tether-state（最快、反映系统 Tethering 真实共享接口）
+  if bridge_available; then
+    TIF=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null       | "$BB" sed -n 's/^ifaces=//p' | "$BB" cut -d, -f1 | "$BB" tr -d ' \r\n')
+    case "$TIF" in
+      wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*)
+        [ "$TIF" != "$UP" ] || TIF=
+        case "$TIF" in rmnet*|ccmni*|wwan*|miw_oem*|p2p*|lo) TIF= ;; esac
+        [ -n "$TIF" ] && { printf '%s' "$TIF"; return; }
+        ;;
+    esac
   fi
-  /system/bin/ip -o -4 addr show 2>/dev/null | "$BB" awk -v stable="$STABLE_IP" '$2 ~ /^wlan[1-9][0-9]*$/ && $4 !~ "^" stable "/" {print $2; exit}'
+  # 2) ip 层探测：非上游接口且带热点网段（scope link 路由），排除移动数据
+  for IF in $(/system/bin/ip -o link show 2>/dev/null | "$BB" sed -n 's/^[0-9]*: \([a-zA-Z0-9_]*\):.*/\1/p'); do
+    case "$IF" in
+      wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*)
+        [ "$IF" != "$UP" ] || continue
+        if /system/bin/ip -o -4 route show dev "$IF" scope link 2>/dev/null | "$BB" grep -q ' src '; then
+          printf '%s' "$IF"; return
+        fi
+        ;;
+    esac
+  done
+  # 3) dumpsys wifi SoftApManager role=ROLE_SOFTAP_TETHERED（最终权威，较慢）
+  IF2=$("$BB" timeout 5 /system/bin/dumpsys wifi 2>/dev/null     | "$BB" grep -oE 'SoftApManager\{[^}]*iface=[a-zA-Z0-9_]+ role=ROLE_SOFTAP_TETHERED'     | "$BB" head -n1 | "$BB" grep -oE 'iface=[a-zA-Z0-9_]+' | "$BB" cut -d= -f2 | "$BB" tr -d ' \r\n')
+  case "$IF2" in
+    wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*)
+      [ "$IF2" != "$UP" ] || IF2=
+      case "$IF2" in rmnet*|ccmni*|wwan*|miw_oem*|p2p*|lo) IF2= ;; esac
+      [ -n "$IF2" ] && { printf '%s' "$IF2"; return; }
+      ;;
+  esac
+  return 0
+}
+
+# v1.7.9：热点自建 DHCP/NAT 兜底（修复"热点半开"——SoftAP 起来但系统 Tethering
+# 因 Binder 调用者身份限制不建 DHCP，设备连上拿不到地址）。
+# 仅在系统 DHCP 未建立时启用（接口上没有系统网段 IPv4）；系统路径正常（如 Settings
+# 开的 172.18.100.120/24）则不动任何系统配置，只应用模块规则。
+# 自建内容：管理网段 $STABLE_IP/24 + udhcpd DHCP + MASQUERADE(→默认路由上游) + ip_forward。
+# 返回 0=已就绪（系统 DHCP 正常或自建成功）；1=无法自建（调用方记日志，不猜测）。
+ensure_hotspot_dhcp() {
+  iface=$1
+  [ -n "$iface" ] || return 1
+  # 接口上已有系统网段地址（非模块管理别名）→ 系统 DHCP 已建，不干预
+  SYS_IP=$(/system/bin/ip -o -4 addr show dev "$iface" 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '{split($4,a,"/"); if (a[1]!=s) {print a[1]; exit}}')
+  [ -n "$SYS_IP" ] && return 0
+  # 1) 管理网段地址（含网关，供 DHCP 与后台使用）
+  /system/bin/ip addr replace "$STABLE_IP/24" dev "$iface" 2>/dev/null
+  # 2) 上游接口（默认路由；WiFi 并发时为 wlan0，蜂窝 IPv4 时为其 rmnet/ccmni）
+  #    Android policy routing：必须 table all 探测 default（main table 为空）
+  UP=$(get_upstream_iface)
+  [ -n "$UP" ] && [ "$UP" != "$iface" ] || return 1
+  # 3) ip_forward + 转发放行（记录原值供 cleanup 恢复；不重置系统其他链）
+  FWD_BEFORE=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null | "$BB" tr -d ' ')
+  printf '%s' "$FWD_BEFORE" > "$DATA_DIR/ip_forward.orig" 2>/dev/null
+  echo 1 > /proc/sys/net/ipv4/ip_forward
+  $IPT -t nat -C POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null     || $IPT -t nat -A POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null
+  $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null     || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
+  $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null     || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  # 4) DHCP：busybox udhcpd（系统 dnsmasq 参数受限不可靠）
+  kill_udhcpd 2>/dev/null
+  {
+    printf 'interface %s\n' "$iface"
+    printf 'start %s.2\n' "${STABLE_IP%.*}"
+    printf 'end %s.254\n' "${STABLE_IP%.*}"
+    printf 'opt subnet 255.255.255.0\n'
+    printf 'opt router %s\n' "$STABLE_IP"
+    printf 'opt dns 8.8.8.8 8.8.4.4\n'
+    printf 'opt lease 86400\n'
+  } > "$DATA_DIR/udhcpd.conf" 2>/dev/null
+  rm -f "$DATA_DIR/udhcpd.leases" "$DATA_DIR/udhcpd.pid" 2>/dev/null
+  "$BB" udhcpd -f "$DATA_DIR/udhcpd.conf" >> "$DATA_DIR/udhcpd.log" 2>&1 &
+  echo "$(date) ensure_hotspot_dhcp: self-built DHCP/NAT on $iface (upstream $UP, subnet ${STABLE_IP%.*}.0/24)" >> "$LOG" 2>/dev/null
+  return 0
+}
+
+# 停止自建 DHCP/NAT（热点关闭/重启前调用；只清模块自建项，不动系统链）
+cleanup_hotspot_dhcp() {
+  iface=$1
+  kill_udhcpd 2>/dev/null
+  [ -n "$iface" ] || return 0
+  UP=$(get_upstream_iface)
+  if [ -n "$UP" ]; then
+    $IPT -t nat -D POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null
+    $IPT -D FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
+    $IPT -D FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  fi
+  /system/bin/ip addr del "$STABLE_IP/24" dev "$iface" 2>/dev/null
+  # 恢复 ip_forward 原值（仅还原到模块启动前的值，避免影响系统其他转发）
+  if [ -r "$DATA_DIR/ip_forward.orig" ]; then
+    ORIG=$(cat "$DATA_DIR/ip_forward.orig" 2>/dev/null | "$BB" tr -d ' ')
+    case "$ORIG" in 0|1) printf '%s' "$ORIG" > /proc/sys/net/ipv4/ip_forward 2>/dev/null ;; esac
+    rm -f "$DATA_DIR/ip_forward.orig" 2>/dev/null
+  fi
+  return 0
+}
+
+# 停掉模块启动的 udhcpd（按配置文件路径匹配，避免误杀系统 DHCP）。
+# 注意：busybox 多进程的进程名都是 busybox，pidof udhcpd 匹配不到，
+# 必须 ps 扫描 cmdline（含 udhcpd 关键字）再按配置路径过滤。
+kill_udhcpd() {
+  for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
+    CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
+    case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) kill "$P" 2>/dev/null ;; esac
+  done
+  return 0
 }
 
 get_iface_ip() {
@@ -4277,6 +4399,7 @@ stop_hotspot_real() {
       remove_management_alias "$BEFORE_IFACE" 2>/dev/null
       clear_blacklist "$BEFORE_IFACE" 2>/dev/null
       ensure_management_loopback
+      cleanup_hotspot_dhcp "$BEFORE_IFACE" 2>/dev/null
       : > "$HOTSPOT_IFACE_FILE" 2>/dev/null
       echo "$(date) hotspot stop: stopped by connectivity service" >> "$LOG"
       return 0
@@ -4293,6 +4416,7 @@ stop_hotspot_real() {
     remove_management_alias "$BEFORE_IFACE" 2>/dev/null
     clear_blacklist "$BEFORE_IFACE" 2>/dev/null
     ensure_management_loopback
+    cleanup_hotspot_dhcp "$BEFORE_IFACE" 2>/dev/null
     : > "$HOTSPOT_IFACE_FILE" 2>/dev/null
     echo "$(date) hotspot stop: stopped by wifi service" >> "$LOG"
     return 0

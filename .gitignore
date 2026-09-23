@@ -3,3 +3,4 @@ bin/
 .DS_Store
 dist/
 tools/softap_bridge/classes/
+tools/softap_bridge/build_stub/

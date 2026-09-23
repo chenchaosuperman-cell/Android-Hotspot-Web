@@ -310,23 +310,62 @@ public class SoftApBridge {
         }
     }
 
-    // 反射构造 TetheringRequestParcel：字段名随版本演变，缺失字段忽略。
+    // v1.7.9：反射构造 TetheringRequestParcel。字段名随 ROM/版本演变，实测双名兼容：
+    //   新（Android 16 / HyperOS）：tetheringType / requestType / exemptFromEntitlementCheck
+    //   旧（Android 12-15）：type / shouldShowProvisioningUi / isExemptFromEntitlementCheck
+    // 旧实现只认 type/isExemptFromEntitlementCheck，在本 ROM 上全部 set 失败（字段不存在），
+    // 请求类型默认 0 且未豁免 entitlement → Tethering 拒绝（result=18），模块 fallback 到
+    // cmd wifi start-softap：SoftAP 起来但系统 Tethering（DHCP/NAT）不建立，设备无网。
+    static void _setIntField(Object o, String[] names, int v) throws Exception {
+        for (String n : names) {
+            try {
+                java.lang.reflect.Field fd = o.getClass().getDeclaredField(n);
+                fd.setAccessible(true);
+                Class<?> ft = fd.getType();
+                if (ft == int.class) { fd.setInt(o, v); return; }
+                if (ft == long.class) { fd.setLong(o, v); return; }
+                return;
+            } catch (NoSuchFieldException e) { /* 试下一个候选名 */ }
+        }
+    }
+    static void _setBoolField(Object o, String[] names, boolean v) throws Exception {
+        for (String n : names) {
+            try {
+                java.lang.reflect.Field fd = o.getClass().getDeclaredField(n);
+                fd.setAccessible(true);
+                if (fd.getType() == boolean.class) { fd.setBoolean(o, v); return; }
+                return;
+            } catch (NoSuchFieldException e) { /* 试下一个候选名 */ }
+        }
+    }
+    static void _setStringField(Object o, String[] names, String v) throws Exception {
+        for (String n : names) {
+            try {
+                java.lang.reflect.Field fd = o.getClass().getDeclaredField(n);
+                fd.setAccessible(true);
+                if (fd.getType() == String.class) { fd.set(o, v); return; }
+                return;
+            } catch (NoSuchFieldException e) { /* 试下一个候选名 */ }
+        }
+    }
     static Object buildTetheringRequest(int type) throws Exception {
         Class<?> reqCls = Class.forName("android.net.TetheringRequestParcel");
         Object req = reqCls.getConstructor().newInstance();
-        String[] bools = new String[]{"shouldShowProvisioningUi", "preferDun", "isExemptFromEntitlementCheck"};
-        try {
-            java.lang.reflect.Field tf = reqCls.getDeclaredField("type");
-            tf.setAccessible(true);
-            tf.setInt(req, type);
-        } catch (NoSuchFieldException e) { /* 老版本无此字段 */ }
-        for (String f : bools) {
-            try {
-                java.lang.reflect.Field fd = reqCls.getDeclaredField(f);
-                fd.setAccessible(true);
-                fd.setBoolean(req, false);
-            } catch (NoSuchFieldException e) { /* 忽略 */ }
-        }
+        _setIntField(req, new String[]{"tetheringType", "type"}, type);
+        _setBoolField(req, new String[]{"showProvisioningUi", "shouldShowProvisioningUi"}, false);
+        // v1.7.9：不再设 exemptFromEntitlementCheck（=false，与系统 Settings 一致）。
+        // 实测该 ROM 上设 true 会跳过 entitlement/provisioning 流程，导致 Tethering
+        // 状态机不完整（wlan2 serving state 停在 INVALID、IpServer 不启动、DHCP 不建立）。
+        // uid=1000 + callerPkg=com.android.settings 可正常通过 entitlement（不豁免）。
+        // uid 字段（新 ROM 存在时设为 system uid=1000，模拟系统路径）。
+        // 实测 uid=0（root）时 Tethering 状态机报 Invalid serving state、IpServer 不启动、
+        // DHCP 不建立（连接的设备拿不到地址）；uid=1000 与系统 Settings 一致可正常流转。
+        _setIntField(req, new String[]{"uid"}, 1000);
+        // HyperOS 扩展字段：系统 Settings 开热点实测会传 interfaceName 与
+        // localIPv4Address（固定网段 172.18.100.120/24）。不带时 Tethering 状态机
+        // 报 Invalid serving state、IpServer 不启动、DHCP 不建立。
+        _setStringField(req, new String[]{"interfaceName"}, "wlan2");
+        _setStringField(req, new String[]{"localIPv4Address"}, "172.18.100.120/24");
         return req;
     }
 

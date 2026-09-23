@@ -633,9 +633,12 @@ hotspot_start() {
         *) FALL_SEC=$sys_security ;;
       esac
       if [ "$FALL_SEC" = "open" ]; then
-        "$CMD_WIFI" wifi start-softap "$sys_ssid" open -b "$sys_band" $EXTRA 2>/dev/null
+        # v1.7.9：cmd wifi start-softap 在 HyperOS 上可能因 Binder 挂起永不返回，
+        # 必须 timeout 兜底（15s 内未返回则终止，避免 start_hotspot 永久卡死
+        # 导致 ensure_hotspot_dhcp 永远执行不到——热点半开无网）。
+        "$BB" timeout 15 "$CMD_WIFI" wifi start-softap "$sys_ssid" open -b "$sys_band" $EXTRA 2>/dev/null
       else
-        "$CMD_WIFI" wifi start-softap "$sys_ssid" "$FALL_SEC" "$sys_password" -b "$sys_band" $EXTRA 2>/dev/null
+        "$BB" timeout 15 "$CMD_WIFI" wifi start-softap "$sys_ssid" "$FALL_SEC" "$sys_password" -b "$sys_band" $EXTRA 2>/dev/null
       fi
       return $?
     fi
@@ -663,7 +666,13 @@ hotspot_stop() {
         # 仍 tethered 则返回失败（绝不"超时就假装关闭成功"）。
         if bridge_available; then
           T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
-          case "$T_OUT" in *'tethered=0'*|*'tether_state=0'*|*'tether_state=1'*) return 0 ;; esac
+          case "$T_OUT" in
+            *'tethered=0'*|*'tether_state=0'*|*'tether_state=1'*)
+              # v1.7.9：停止自建 DHCP/NAT（若启用）
+              _CLEAN_IFACE=$(get_hotspot_iface 2>/dev/null)
+              [ -n "$_CLEAN_IFACE" ] && cleanup_hotspot_dhcp "$_CLEAN_IFACE"
+              return 0 ;;
+          esac
         fi
         echo "$(date) hotspot_stop: system still reports hotspot active after $STOP_CONFIRM_MAX s" >> "$LOG" 2>/dev/null
         return 1

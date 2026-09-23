@@ -193,6 +193,8 @@ start_hotspot() {
         fi
       fi
       add_management_alias "$AP_IFACE"
+      # v1.7.9：系统 DHCP 未建立时自建 DHCP/NAT（修复热点半开——设备连上无网）
+      ensure_hotspot_dhcp "$AP_IFACE"
       flush_stats_chain
       ensure_stats_chain "$AP_IFACE"
       apply_blacklist "$AP_IFACE"
@@ -219,6 +221,8 @@ start_hotspot() {
         fi
       fi
       add_management_alias "$AP_IFACE"
+      # v1.7.9：系统 DHCP 未建立时自建 DHCP/NAT（修复热点半开——设备连上无网）
+      ensure_hotspot_dhcp "$AP_IFACE"
       flush_stats_chain
       ensure_stats_chain "$AP_IFACE"
       apply_blacklist "$AP_IFACE"
