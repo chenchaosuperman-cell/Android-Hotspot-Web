@@ -290,8 +290,6 @@ cfg_apply_key() {
           case "$value" in 0|1) KEEPALIVE=$value ;; esac ;;
         NOTIFY_LIMIT)
           case "$value" in 0|1) NOTIFY_LIMIT=$value ;; esac ;;
-        NOTIFY_HOTSPOT_EVT)
-          case "$value" in 0|1) NOTIFY_HOTSPOT_EVT=$value ;; esac ;;
         NOTIFY_TRAFFIC_THRESHOLDS)
           # 逗号分隔 1~100，最多 5 个；非法值忽略（默认 80,90,100）
           _NT_RAW="$value"
@@ -467,7 +465,6 @@ load_config() {
   DINGTALK_SECRET_B64=${DINGTALK_SECRET_B64:-}
   BARK_KEY_B64=${BARK_KEY_B64:-}
   NOTIFY_LIMIT=${NOTIFY_LIMIT:-1}
-  NOTIFY_HOTSPOT_EVT=${NOTIFY_HOTSPOT_EVT:-1}
   NOTIFY_TRAFFIC_THRESHOLDS=${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}
   PUSHPLUS_TOKEN=$(b64url_decode "$PUSHPLUS_TOKEN_B64")
   DINGTALK_WEBHOOK=$(b64url_decode "$DINGTALK_WEBHOOK_B64")
@@ -521,7 +518,6 @@ save_config() {
     printf 'BARK_KEY_B64=%s\n' "${BARK_KEY_B64:-}"
     printf 'NOTIFY_TRAFFIC_THRESHOLDS=%s\n' "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
     printf 'NOTIFY_LIMIT=%s\n' "${NOTIFY_LIMIT:-1}"
-    printf 'NOTIFY_HOTSPOT_EVT=%s\n' "${NOTIFY_HOTSPOT_EVT:-1}"
     printf 'SMS_FWD=%s\n' "${SMS_FWD:-0}"
     printf 'SMS_FWD_KEYWORD_B64=%s\n' "${SMS_FWD_KEYWORD_B64:-}"
     printf 'SMS_FWD_SENDERS_B64=%s\n' "${SMS_FWD_SENDERS_B64:-}"

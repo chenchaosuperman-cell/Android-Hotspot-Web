@@ -31,6 +31,8 @@ fi
 
 # ── 接口集合：记录优先 + 宽枚举 ──
 IFACES=
+# v1.7.9：清除已删除的"热点异常提醒"防重复时间戳残留
+rm -f "$DATA_DIR/recover_notify_ts" 2>/dev/null
 for F in "$DATA_DIR/usage_iface" "$DATA_DIR/hotspot_iface" "$DATA_DIR/proxy/iface"; do
   if [ -r "$F" ]; then
     V=$(cat "$F" 2>/dev/null | tr -d ' \r\n')

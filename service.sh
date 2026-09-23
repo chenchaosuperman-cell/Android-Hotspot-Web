@@ -141,6 +141,13 @@ migrate_removed_once
 # v1.7.6 一次性迁移：config.conf 中遗留的旧热点字段（SSID_B64/PASS_B64 等）写入系统
 # SoftApConfiguration 后清除（不依赖 hotspot_start 带参路径；成功写 marker，失败下次重试）
 migrate_legacy_hotspot_config
+# v1.7.9：彻底移除"热点异常提醒"推送；升级时清理旧配置字段与防重复时间戳（幂等）
+rm -f "$DATA_DIR/recover_notify_ts" 2>/dev/null
+if [ -f "$CONFIG" ]; then
+  TMP_CONF="$CONFIG.tmp.$$"
+  "$BB" grep -v '^NOTIFY_HOTSPOT_EVT=' "$CONFIG" > "$TMP_CONF" 2>/dev/null && mv "$TMP_CONF" "$CONFIG" 2>/dev/null
+  rm -f "$TMP_CONF" 2>/dev/null
+fi
 # 启动时清理上次异常退出可能残留的通知 busy 标记，避免后续通知被静默丢弃
 rm -f "$DATA_DIR/notify.busy" 2>/dev/null
 # P1-55/P1-56：清理可能残留的序号锁/健康写锁（mkdir 原子目录，正常退出自行删除）
@@ -510,21 +517,10 @@ while true; do
       ensure_management_loopback
     fi
         echo "$(date) keepalive: hotspot recovered" >> "$LOG"
-        # 10分钟内不重复发"热点已自动恢复"通知
-        RECOVER_NOTIFY_FILE="$DATA_DIR/recover_notify_ts"
-        NOW_S=$($DATE_CMD +%s 2>/dev/null || date +%s)
-        LAST_RECOVER=$(cat "$RECOVER_NOTIFY_FILE" 2>/dev/null)
-        case "$LAST_RECOVER" in ''|*[!0-9]*) LAST_RECOVER=0 ;; esac
-        if [ $((NOW_S - LAST_RECOVER)) -gt 600 ]; then
-          printf '%s\n' "$NOW_S" > "$RECOVER_NOTIFY_FILE"
-          chmod 0600 "$RECOVER_NOTIFY_FILE" 2>/dev/null
-          [ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && notify_all_async "热点已自动恢复" "时间: $(date '+%m-%d %H:%M')" 2>/dev/null &
-        fi
       else
         IFACE=
         DESIRED=0
         echo "$(date) keepalive: start failed, desired reset to off" >> "$LOG"
-        [ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && notify_all_async "热点启动失败" "时间: $(date '+%m-%d %H:%M') 保活重启失败，热点已关闭，需手动开启" 2>/dev/null &
       fi
     fi
 

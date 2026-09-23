@@ -355,8 +355,8 @@ printf '"days":[%s],"history":%s},' "$(build_traffic_days)" "$(build_traffic_his
 printf '"smsFwd":{"on":%s,"keyword":%s,"senders":%s,"keywordText":"%s","sendersText":"%s"},' "$([ "${SMS_FWD:-0}" = "1" ] && echo true || echo false)" "$([ -n "${SMS_FWD_KEYWORD_B64:-}" ] && echo true || echo false)" "$([ -n "${SMS_FWD_SENDERS_B64:-}" ] && echo true || echo false)" "$(json_escape "${SMS_FWD_KEYWORD:-}")" "$(json_escape "${SMS_FWD_SENDERS:-}")"
 printf '"lowbatt":{"enable":%s,"threshold":%s,"level":"%s","power":%s,"latch":"%s","reason":"%s","checked":%s},' "$([ "$LB_EN" = "1" ] && echo true || echo false)" "$LB_TH" "$(json_escape "$LB_LEVEL")" "$LB_POWER" "$(json_escape "$LB_LATCH")" "$(json_escape "$LB_REASON")" "$LB_CHECKED"
 printf '"idleLeft":%s,' "$IDLE_LEFT"
-printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"hotspotEvt":%s,"bark":%s,"thresholds":"%s"},' \
-  "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ "${NOTIFY_HOTSPOT_EVT:-1}" = "1" ] && echo true || echo false)" "$([ -n "${BARK_KEY_B64:-}" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
+printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"bark":%s,"thresholds":"%s"},' \
+  "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ -n "${BARK_KEY_B64:-}" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
 printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s,"bk":%s},' \
   "$(health_json pp)" "$(health_json dt)" "$(health_json sms)" "$(health_json bk)"
 printf '"proxy":%s,' "$(proxy_status_json "$IFACE")"
