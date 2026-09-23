@@ -11,14 +11,35 @@ if [ ! -r "$MODDIR/lib/common.sh" ]; then
   exit 0
 fi
 . "$MODDIR/lib/common.sh"
-header_json
+# v1.7.9：生成模式（STATUS_GEN=1，supervisor 后台预生成缓存）不输出 HTTP header，
+# 缓存文件只含纯 JSON 正文，CGI 读缓存时由 header_json 统一输出。
+[ "${STATUS_GEN:-0}" != "1" ] && header_json
+# v1.7.9：优先读 supervisor 预生成的完整 JSON 缓存（<30 秒新鲜），
+# 避免每轮轮询 fork 27+ 子进程（真机 6-8s）拖过前端超时导致"Load failed 自动重试"。
+# 生成模式（STATUS_GEN=1）跳过本段，走下方完整组装逻辑。
+if [ "${STATUS_GEN:-0}" != "1" ] && [ -r "$DATA_DIR/status.json.cache" ]; then
+  C_MT=$("$BB" stat -c %Y "$DATA_DIR/status.json.cache" 2>/dev/null)
+  NOW_S=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  case "$C_MT" in ''|*[!0-9]*) C_MT=0 ;; esac
+  if [ "$C_MT" -gt 0 ] && [ $((NOW_S - C_MT)) -lt 30 ]; then
+    cat "$DATA_DIR/status.json.cache"
+    exit 0
+  fi
+fi
 load_config
 
 # v1.7.2-beta.1：CGI 只读模式——sim/sig/telephony 快照由 supervisor 后台预热，
 # CGI 命中缓存即用、未命中返回空字段，绝不执行 dumpsys 或大文件 grep 重建。
 CGI_READONLY=1
 
-IFACE=$(get_hotspot_iface)
+# v1.7.9：热点接口直接读 supervisor 每轮刷新的缓存（0 秒）；get_hotspot_iface 内部
+# dumpsys 在真机上卡 1-5 秒，会把状态接口拖过前端 8 秒超时（页面报"状态接口连续
+# 请求失败，正在自动重试"）。缓存缺失/非法时才走慢路径兜底。
+IFACE=$(cat "$DATA_DIR/hotspot_iface.cache" 2>/dev/null)
+case "$IFACE" in
+  wlan[0-9]*|ap[0-9]*|swlan[0-9]*|softap[0-9]*|wlan_ap[0-9]*) : ;;
+  *) IFACE=$(get_hotspot_iface) ;;
+esac
 # v1.7.2-beta.1：一次 ip 调用取全部 IPv4 地址，避免 get_native_hotspot_ip/get_iface_ip/get_management_ip
 # 各自 fork ip 子进程（真机每次 ~0.15s，4-5 次合计约 1s，全部压在状态接口关键路径上）。
 IP_LINES=$(/system/bin/ip -o -4 addr show dev "$IFACE" 2>/dev/null)

@@ -408,6 +408,21 @@ while true; do
     start_httpd
   fi
 
+  # v1.7.9：后台预生成 status JSON 缓存（互斥锁防并发重叠），CGI 只读缓存秒回，
+  # 彻底消除状态接口每轮 27+ 子进程的 6-8s 开销（前端 8s 超时 → Load failed 自动重试）。
+  if [ ! -e "$DATA_DIR/status.gen.lock" ]; then
+    : > "$DATA_DIR/status.gen.lock"
+    (
+      STATUS_GEN=1 sh "$MODDIR/web/cgi-bin/status.cgi" > "$DATA_DIR/status.json.cache" 2>/dev/null
+      chmod 0644 "$DATA_DIR/status.json.cache" 2>/dev/null
+      rm -f "$DATA_DIR/status.gen.lock"
+    ) &
+  else
+    # 锁残留超过 60 秒视为异常（生成进程被 kill/崩溃），强制清理避免永久停更
+    L_AGE=$(($(date +%s) - $("$BB" stat -c %Y "$DATA_DIR/status.gen.lock" 2>/dev/null)))
+    [ "${L_AGE:-0}" -gt 60 ] 2>/dev/null && rm -f "$DATA_DIR/status.gen.lock"
+  fi
+
   TICK=$((TICK + 1))
   if [ "$TICK" -ge 3 ]; then
     TICK=0

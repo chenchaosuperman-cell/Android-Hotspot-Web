@@ -177,9 +177,14 @@ header_json() {
 }
 
 json_escape() {
-  # v1.7.2-beta.1：单次 awk 完成原 tr+sed（status.cgi 每次轮询调用 70+ 次，
-  # 原实现每调用 fork 2 个 busybox 子进程，真机上占状态接口数秒开销）
-  printf '%s' "$1" | "$BB" awk '{s=$0; gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); gsub(/[[:cntrl:]]/,"",s); printf "%s", s}'
+  # v1.7.9：纯 sh 内建实现（${//} 参数替换，无 awk 子进程）。
+  # status.cgi 每次轮询调用 50+ 次，awk 每次 fork ~0.1s，真机上累计数秒，
+  # 是状态接口 6-7s 的主要来源（前端 8s 超时 → Load failed 自动重试）。
+  # 控制字符（awk 的 [[:cntrl:]]）在状态数据中不存在，不再单独处理。
+  s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
 }
 
 # 读取设备型号与系统版本（按可用属性链回退，属性缺失时保持空字符串）

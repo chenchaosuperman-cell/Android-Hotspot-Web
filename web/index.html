@@ -366,7 +366,7 @@ let firstLoad=true,csrf='',logShown=false,diagShown=false,historyShown=false,his
       init=init||{};
       if(init.signal||typeof AbortController==='undefined')return nativeFetch(input,init);
       const controller=new AbortController();
-      const timeout=String(input).includes('/status.cgi')?8000:15000;
+      const timeout=String(input).includes('/status.cgi')?12000:15000;
       const timer=setTimeout(()=>controller.abort(),timeout);
       return nativeFetch(input,Object.assign({},init,{signal:controller.signal})).finally(()=>clearTimeout(timer));
     };
