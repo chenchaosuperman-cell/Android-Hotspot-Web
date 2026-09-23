@@ -1494,6 +1494,28 @@ softap_state_snapshot() {
       14) AP_STATE=FAILED ;;
     esac
   fi
+  # v1.7.9：HyperOS/Android 16 dumpsys 无 mWifiApState、无 onStateChanged 数字回调，
+  # 但输出 SoftAp 状态机 rec 事件与 SoftApManager 段（实测格式）：
+  #   what=CMD_SET_AP 1 0 ... num SoftApManagers:1  → 启用
+  #   what=CMD_SET_AP 0 1 ... num SoftApManagers:0  → 禁用
+  #   what=CMD_AP_STOPPED                          → 已停止
+  #   mCurrentSoftApInfoMap {wlanX=...}            → 当前运行实例
+  if [ -z "$AP_STATE" ]; then
+    # CMD_SET_AP 1 0=启用 / CMD_SET_AP 0 1=禁用 / CMD_AP_STOPPED=已停止
+    # 统一按出现顺序取“最后一条”SoftAP 状态事件（CMD_AP_STOPPED 可能晚于旧 CMD_SET_AP）。
+    AP_REC=$("$BB" grep -oE 'what=CMD_SET_AP [01] [01]|what=CMD_AP_STOPPED' "$SOFTAP_CACHE.out" | "$BB" tail -n1)
+    case "$AP_REC" in
+      *'CMD_SET_AP 1 '*) AP_STATE=ENABLED ;;
+      *'CMD_SET_AP 0 '*|*'CMD_AP_STOPPED'*) AP_STATE=DISABLED ;;
+    esac
+  fi
+  if [ -z "$AP_STATE" ]; then
+    AP_MAP=$("$BB" grep -o 'mCurrentSoftApInfoMap *{[^}]*}' "$SOFTAP_CACHE.out" | "$BB" tail -n1)
+    case "$AP_MAP" in
+      *'{wlan'*) AP_STATE=ENABLED ;;
+      *'{}') AP_STATE=DISABLED ;;
+    esac
+  fi
   # 尽力解析 SoftAP 配置段（Android 16/STA+AP 并发，mCurrentSoftApInfoMap 可能含多实例）
   # 只从 mCurrentSoftApConfiguration 或 WifiApConfigStore config 提取 SSID，
   # 避免把 bssid=、current SSID(s):、字段名 mCurrentSoftApInfoMap 误当 SSID。
@@ -1559,10 +1581,18 @@ softap_state_ok() {
     ENABLED) return 0 ;;
     DISABLED|DISABLING|ENABLING|FAILED) return 1 ;;
   esac
-  CMD_STS=$("$BB" timeout 5 "$CMD_WIFI" wifi status 2>/dev/null)
-  case "$CMD_STS" in
-    *"disabled"*|*"Disabled"*|*"DISABLED"*) [ -z "$(get_hotspot_iface)" ] && return 1 ;;
-  esac
+  # v1.7.9：快照未解析出状态时，不得用 cmd wifi status 判定 SoftAP——
+  # 它反映的是整个 Wi-Fi（STA）开关，与热点无关；此前在此 ROM 上导致
+  # wifi stop-softap 已成功却仍被误判 active，白白空等 12 次快照。
+  # 改用系统 Tethering 真实状态兜底，仍未知则按接口是否存在保守处理。
+  if bridge_available; then
+    T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
+    case "$T_OUT" in
+      *'tether_state=2'*|*'tethered=1'*) return 0 ;;
+      *'tethered=0'*) return 1 ;;
+    esac
+  fi
+  [ -z "$(get_hotspot_iface)" ] && return 1
   return 0
 }
 
@@ -4175,12 +4205,18 @@ stop_hotspot_real() {
   TETHER_OUT=$( "$BB" timeout 10 "$CMD_WIFI" connectivity tether stop 2>&1 )
   TETHER_RC=$?
   printf '%s tether stop rc=%s\n%s\n' "$(date)" "$TETHER_RC" "$TETHER_OUT" >> "$LOG"
-  if wait_softap_stopped; then
-    remove_management_alias "$BEFORE_IFACE" 2>/dev/null
-    clear_blacklist "$BEFORE_IFACE" 2>/dev/null
-    ensure_management_loopback
-    echo "$(date) hotspot stop: stopped by connectivity service" >> "$LOG"
-    return 0
+  # v1.7.9：此 ROM（HyperOS/Android 16）无 connectivity tether 子命令（rc=255/Unknown command），
+  # 热点实际不会被系统停掉——立即走 wifi stop-softap，避免空等 12 次快照（每次 dumpsys 数秒）。
+  if [ "$TETHER_RC" != "255" ]; then
+    if wait_softap_stopped; then
+      remove_management_alias "$BEFORE_IFACE" 2>/dev/null
+      clear_blacklist "$BEFORE_IFACE" 2>/dev/null
+      ensure_management_loopback
+      echo "$(date) hotspot stop: stopped by connectivity service" >> "$LOG"
+      return 0
+    fi
+  else
+    echo "$(date) hotspot stop: connectivity tether subcommand unavailable, skip wait" >> "$LOG"
   fi
   rm -f "$SOFTAP_CACHE" 2>/dev/null
   echo "$(date) hotspot stop: tether stop ineffective, trying wifi stop-softap" >> "$LOG"
