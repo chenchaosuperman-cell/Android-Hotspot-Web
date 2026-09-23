@@ -165,7 +165,7 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
     </section>
     <section class="card" data-tab="proxy">
       <h2 class="section-title">科学上网</h2>
-      <div class="label" style="margin-bottom:12px">基于 Mihomo 内核；默认仅代理热点设备，代理范围可在「高级设置」中调整</div>
+      <div class="label" style="margin-bottom:12px">基于 Mihomo 内核；默认仅代理热点设备，代理范围可在下方卡片调整</div>
       <div id="proxyState" class="warnbox" style="margin-bottom:14px">状态：检测中…</div>
       <div class="field"><label>订阅地址（Clash/Mihomo 订阅 URL）</label><input id="proxySubUrl" type="text" placeholder="https://example.com/sub?token=xxx" autocomplete="off"></div>
       <div class="field"><label>节点策略</label>
@@ -181,6 +181,14 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
         <button class="secondary ro" onclick="proxyUpdate()" type="button">更新订阅</button>
       </div>
       <div id="proxyNodes" class="empty" style="margin-top:16px">节点列表将在启动后显示</div>
+    </section>
+    <section class="card" data-tab="proxy">
+      <h2 class="section-title">代理范围</h2>
+      <div class="card-subtitle">选择哪些设备的流量走 Mihomo 代理。</div>
+      <div class="field"><label>代理范围</label>
+        <select id="proxyScope"><option value="hotspot">仅热点设备（默认）</option><option value="self">仅手机本机</option><option value="both">热点设备＋手机本机</option></select>
+      </div>
+      <div class="hint">默认仅代理热点设备，不影响手机自身联网；选择本机代理后，手机自身流量也会走 Mihomo。</div>
     </section>
     <section class="tab-section-label" data-tab="notify">短信转发</section>
     <section class="card" data-tab="notify">
@@ -332,10 +340,6 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
       <label class="switchline"><input id="hidden" type="checkbox"><span>隐藏 SSID（不广播热点名称，需手动输入名称和密码连接；仅隐藏名称广播，不是安全机制）</span></label>
       <div id="hiddenUnsup" class="hint" style="display:none;color:var(--warn-fg)">当前系统不支持隐藏 SSID（SoftApConfiguration 无此能力），开关已禁用</div>
       <div class="hint" style="margin:8px 0 14px">随「热点设置」中的保存一起生效。</div>
-      <div class="field" style="margin-top:10px"><label>代理范围（科学上网）</label>
-        <select id="proxyScope"><option value="hotspot">仅热点设备（默认）</option><option value="self">仅手机本机</option><option value="both">热点设备＋手机本机</option></select>
-      </div>
-      <div class="hint">默认仅代理热点设备，不影响手机自身联网；选择本机代理后，手机自身流量也会走 Mihomo。</div>
     </section>
     <section class="card" data-tab="settings">
       <h2 class="section-title">实验功能</h2>
