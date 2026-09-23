@@ -413,7 +413,11 @@ while true; do
   if [ ! -e "$DATA_DIR/status.gen.lock" ]; then
     : > "$DATA_DIR/status.gen.lock"
     (
-      STATUS_GEN=1 sh "$MODDIR/web/cgi-bin/status.cgi" > "$DATA_DIR/status.json.cache" 2>/dev/null
+      # v1.7.9：原子写——先写临时文件再 mv（mv 原子替换）。
+      # 原直接 > 覆盖，8s 生成期间缓存保持半截状态，前端轮询撞上即读到不完整 JSON
+      # 导致 parse 失败（"状态接口连续请求失败"反复出现）。
+      STATUS_GEN=1 sh "$MODDIR/web/cgi-bin/status.cgi" > "$DATA_DIR/status.json.cache.tmp.$$" 2>/dev/null
+      mv -f "$DATA_DIR/status.json.cache.tmp.$$" "$DATA_DIR/status.json.cache"
       chmod 0644 "$DATA_DIR/status.json.cache" 2>/dev/null
       rm -f "$DATA_DIR/status.gen.lock"
     ) &
