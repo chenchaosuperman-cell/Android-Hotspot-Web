@@ -17,6 +17,17 @@
 - UI：首页四卡片改为全宽度统一两行两列（电量/设备 一行、频段/自动策略 一行），间距 12px 与全站一致，参考手机端两列布局样式
 - UI：首页四卡片（电量/设备/频段/自动策略）移至「本账期流量」卡片下方；卡片缩小（padding 12px、数值 18px、标签 11px、圆角 18px），gap 统一 12px，手机两行两列、桌面一行四列不变，间距与全站卡片一致
 - 修复：首页四卡片（stat-grid）为 div 而非 section，tab 切换仅处理 section[data-tab]，导致四卡片在设备/流量/科学/消息页残留显示；改为 [data-tab] 统一控制并给 stat-grid 补 data-tab=home
+- 修复：root 身份调系统 Tethering 时 HyperOS 状态机不建 DHCP（Binder 调用者身份限制）→ 模块自建 DHCP/NAT 兜底（ensure/cleanup/kill_udhcpd），重写 get_hotspot_iface / get_upstream_iface 接口识别
+- 修复：udhcpd 意外退出无守护 → 新设备连热点拿不到 IP（WiFi 能连但没网、后台打不开）；主循环加 udhcpd 守护自动拉起，conf 指定 lease_file 并预创建（/var 只读）
+- 修复：热点重启后 Android 清空转发路由表（local_network 空）→ 客户端能连 WiFi 但完全无外网；主循环每轮从上游表补默认路由到 local_network
+- 修复：缺回程链路路由 → 客户端 TCP 全卡 SYN_RECV（抓包验证回程 SYN-ACK 不转发）；补 192.168.43.0/24 链路路由到 local_network；守护/路由段误用主循环 IFACE（TICK 块 15s 才赋值可能为空）→ 改用每轮刷新的 IFACE_C
+- 修复：status.cgi 每轮 fork 27+ 子进程（awk/sed/cat，Android 每次 ~0.1s）累计 6-8s，拖过前端 8s 超时 → 页面反复报「状态接口连续请求失败：Load failed，正在自动重试」；主循环后台预生成完整 status.json.cache（互斥锁防并发、锁残留 60s 自动清理），CGI 读 <30s 新鲜缓存秒回（0.1-0.2s，提速约 40 倍）
+- 修复：status.json.cache 原子写（临时文件 + mv），杜绝生成窗口读到半截 JSON 导致解析失败反复报错
+- 修复：status.cgi 热点接口改读 hotspot_iface.cache，绕开 get_hotspot_iface 内部 dumpsys 1-5s 延迟
+- 优化：json_escape 改纯 sh 参数替换（去掉 50 次 awk 子进程）；前端 status.cgi 超时 8s→12s 兜底
+- UI：代理范围从「高级设置」迁移至「科学上网」标签下的独立卡片
+- UI：高级设置卡片移入热点设置之后并改名「WiFi高级设置」
+- UI：非首页标签隐藏空的 #homeGrid，统一各标签首卡片与导航间距为 16px（修复其他标签 32px 与首页不一致）
 - 测试：134 PASS / 0 FAIL（含软AP五态映射、failureReason=0、stop 拒绝假成功、connector 能力消费）
 # v1.7.8-beta（2026-09-23）热点状态误判修复 + 平板/大屏响应式
 
