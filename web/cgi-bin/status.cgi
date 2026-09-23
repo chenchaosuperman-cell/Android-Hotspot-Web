@@ -25,9 +25,10 @@ IP_LINES=$(/system/bin/ip -o -4 addr show dev "$IFACE" 2>/dev/null)
 # 原生热点网关：排除模块固定管理别名，避免读到 192.168.43.1 造成 NAT 网段误判
 NATIVE_IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk -v stable="$STABLE_IP" '{split($4,a,"/"); if (a[1] != stable) {print a[1]; exit}}')
 [ -z "$NATIVE_IP" ] && NATIVE_IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk '{split($4,a,"/"); print a[1]; exit}')
+# v1.7.9：后台管理地址固定 192.168.43.1，不回退原生网关；别名未挂载时输出 unavailable
 case "$IP_LINES" in
   *" $STABLE_IP/"*) IP=$STABLE_IP ;;
-  *) IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk '{split($4,a,"/"); print a[1]; exit}') ;;
+  *) IP=unavailable ;;
 esac
 # v1.7.8：统一热点状态（SoftAP Framework state 优先，failureReason=0 不判失败）
 # ON/STARTING/OFF/STOPPING/ERROR/UNKNOWN；Header 与首页共用 hotspotState。

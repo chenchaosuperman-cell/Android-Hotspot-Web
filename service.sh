@@ -287,6 +287,21 @@ while true; do
   # 由 supervisor 每 tick 采集（softap 15s / telephony 60s 缓存限频），
   # status.cgi 只读缓存文件，避免 CGI 子进程同步执行慢 dumpsys 导致页面 8s 超时。
   softap_state_snapshot >/dev/null 2>&1
+  # v1.7.9：状态/接口缓存（status.cgi 只读，不在 CGI 进程里起 app_process/dumpsys）
+  {
+    printf 'SNAP_AP_STATE=%s\n' "${SNAP_AP_STATE:-}"
+    printf 'SNAP_AP_SSID=%s\n' "${SNAP_AP_SSID:-}"
+  } > "$STATE_CACHE_FILE" 2>/dev/null
+  IFACE_C=$(get_hotspot_iface 2>/dev/null)
+  if [ -n "$IFACE_C" ]; then
+    printf '%s\n' "$IFACE_C" > "$HOTSPOT_IFACE_FILE" 2>/dev/null
+  fi
+  # 能力缓存：每 120 tick（约 10 分钟）强制重探测一次并回写
+  TICK=$((TICK + 1))
+  if [ $((TICK % 120)) -eq 0 ]; then
+    HOTSPOT_CAPS_JSON=
+    hotspot_get_capabilities >/dev/null 2>&1
+  fi
   ensure_telephony_snapshot >/dev/null 2>&1
   # 预热 sim/sig/battery 缓存（内部 15s/30s/60s 限频），status.cgi 只读命中即可，永不在页面进程里重建。
   # 后台异步执行：真机上 dumpsys 重建可能耗时数秒，若同步执行会拖慢 supervisor 的 keepalive/watchdog tick。

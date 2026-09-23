@@ -1,3 +1,16 @@
+# v1.7.9-beta（2026-09-23）— Compatibility & Reliability 第二轮
+- 修复：compat.sh 漏写 # 的注释被当作 cmd wifi 命令执行，可能污染 CGI 输出（补 #，sh -n 通过）
+- 修复：SoftApBridge 回调类名 IWifiManagerSoftApCallback → 标准 ISoftApCallback；回调改为继承真实 AIDL Stub（跨进程可收到 onStateChanged/onCapabilityChanged），删除 Proxy+silentBinder 与 Looper 误用
+- 修复：Modern Tethering 严格按 AIDL 签名重写：startTethering(TetheringRequestParcel,String,String,IIntResultListener)/stopTethering(int,String,String,IIntResultListener)，回调继承 IIntResultListener.Stub；Legacy IConnectivityManager 独立探测；doProbe 同时输出 connector 与 cm 能力
+- 修复：common.sh 未定义 IPT6 导致 IPv6 Web 防火墙/MAC 管控空操作；fw6_ensure/fw6_clear 改为按热点接口挂/删 FORWARD 跳转，杜绝全局丢弃 IPv6 转发（USB 共享等业务不再被误伤）
+- 修复：固定管理地址 192.168.43.1 不再回退原生网关（status.cgi ip=unavailable，原生网关单列 nativeIp；启动提示明确“未通过固定管理地址兼容验证”）
+- 修复：热点接口探测优先级重排：Tethering downstream → 固定管理别名 → supervisor 状态缓存 → ip 枚举兜底（要求有 IPv4 地址）
+- 修复：hotspot_restart 统一走 hotspot_stop→hotspot_start，不再绕过兼容层直用旧 Shell
+- 新增：能力/状态后台缓存（supervisor 预热 hotspot_caps.cache/system_hotspot.cache/hotspot_iface.cache；能力 10 分钟刷新；status.cgi 只读缓存，不再每次请求起 app_process）
+- 新增：sys_bridge_probe 消费 Modern Tethering connector 能力（connector 或 cm 任一可用即支持系统 Tethering 启停）
+- 新增：前端能力驱动禁用（writeConfig=false 禁用“保存并重启热点”；startStop=false 禁用开关按钮）；最大连接数动态上限前后端一致（valid_max_clients 带设备上限）
+- UI：平板/桌面 900px 断点（1180px + 四列 grid）；首页 homeGrid（热点主卡整行、流量/温度并排）
+- 测试：134 PASS / 0 FAIL（含软AP五态映射、failureReason=0、stop 拒绝假成功、connector 能力消费）
 # v1.7.8-beta（2026-09-23）热点状态误判修复 + 平板/大屏响应式
 
 > 依据《v1.7.5-beta 热点状态误判 + 平板 UI 兼容修复任务》：修复「SoftAP 实际启动成功（state=13 / failure reason=0）却被误判为失败」与「平板/大屏仍按约 430px 手机宽度显示」。本版不动视觉风格与代理/短信/流量/MAC/通知/定时等业务功能。

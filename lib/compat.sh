@@ -29,6 +29,11 @@
 
 # 能力检测结果缓存（status/UI 复用；检测一次即可）
 HOTSPOT_CAPS_JSON=
+# v1.7.9：能力/状态缓存（supervisor 预热；status.cgi 只读，避免每次请求起 app_process/dumpsys）
+CAPS_CACHE_FILE="${DATA_DIR:-}/hotspot_caps.cache"
+STATE_CACHE_FILE="${DATA_DIR:-}/system_hotspot.cache"
+HOTSPOT_IFACE_FILE="${DATA_DIR:-}/hotspot_iface.cache"
+CAPS_CACHE_TTL=600
 
 # Binder Bridge 路径（可被测试覆盖为 mock）
 APP_PROCESS=${APP_PROCESS:-/system/bin/app_process}
@@ -52,6 +57,7 @@ sys_bridge_probe() {
   BRIDGE_P_SEC_OPEN=-1; BRIDGE_P_SEC_WPA2=-1; BRIDGE_P_SEC_WPA3_T=-1; BRIDGE_P_SEC_WPA3=-1
   BRIDGE_P_BAND_2G=-1; BRIDGE_P_BAND_5G=-1; BRIDGE_P_BAND_6G=-1; BRIDGE_P_BAND_ANY=-1
   BRIDGE_P_CAP=0; BRIDGE_P_PASS_R=0; BRIDGE_P_TSTART=0; BRIDGE_P_TSTOP=0
+  BRIDGE_P_TCONN=0; BRIDGE_P_TCONN_START=0; BRIDGE_P_TCONN_STOP=0
   BRIDGE_P_CH2G=; BRIDGE_P_CH5G=; BRIDGE_P_CH6G=
   while IFS= read -r PL; do
     case "$PL" in
@@ -81,6 +87,9 @@ sys_bridge_probe() {
       password_readable=*) BRIDGE_P_PASS_R=${PL#password_readable=} ;;
       tether_start_cm=*) BRIDGE_P_TSTART=${PL#tether_start_cm=} ;;
       tether_stop_cm=*) BRIDGE_P_TSTOP=${PL#tether_stop_cm=} ;;
+      tether_connector=*) BRIDGE_P_TCONN=${PL#tether_connector=} ;;
+      tether_connector_start=*) BRIDGE_P_TCONN_START=${PL#tether_connector_start=} ;;
+      tether_connector_stop=*) BRIDGE_P_TCONN_STOP=${PL#tether_connector_stop=} ;;
       channels2g=*) BRIDGE_P_CH2G=${PL#channels2g=} ;;
       channels5g=*) BRIDGE_P_CH5G=${PL#channels5g=} ;;
       channels6g=*) BRIDGE_P_CH6G=${PL#channels6g=} ;;
@@ -88,6 +97,9 @@ sys_bridge_probe() {
   done <<EOF
 $P_OUT
 EOF
+  # v1.7.9：Modern（ITetheringConnector AIDL）与 Legacy（IConnectivityManager）任一可用即支持系统 Tethering 启停
+  [ "$BRIDGE_P_TCONN_START" = "1" ] && BRIDGE_P_TSTART=1
+  [ "$BRIDGE_P_TCONN_STOP" = "1" ] && BRIDGE_P_TSTOP=1
   return 0
 }
 
@@ -113,7 +125,7 @@ EOF
   return 0
 }
 
-cmd wifi 的 start-softap/stop-softap 可用性（仅决定 fallback 启停能力）
+# cmd wifi 的 start-softap/stop-softap 可用性（仅决定 fallback 启停能力）
 sys_cmd_wifi_caps() {
   CMDW_START=0; CMDW_STOP=0
   if command -v "$CMD_WIFI" >/dev/null 2>&1; then
@@ -222,6 +234,32 @@ hotspot_detect_capabilities() {
     "$CH_JSON_5G" \
     "$CH_JSON_6G" \
     "$SYNC_LEVEL")
+  # v1.7.9：探测结果回写缓存（CGI 只读）；目录不存在（如测试环境）时静默跳过
+  if [ -n "$CAPS_CACHE_FILE" ] && [ -d "${CAPS_CACHE_FILE%/*}" ]; then
+    printf '%s\n' "$HOTSPOT_CAPS_JSON" > "$CAPS_CACHE_FILE" 2>/dev/null
+  fi
+}
+
+# v1.7.9：动态最大客户端上限（读能力缓存 maxClientsLimit；无缓存/异常回退 32）
+get_max_clients_limit() {
+  LIMIT=32
+  if [ -s "$CAPS_CACHE_FILE" ]; then
+    V=$(printf '%s' "$("$BB" cat "$CAPS_CACHE_FILE" 2>/dev/null)" | "$BB" sed -n 's/.*"maxClientsLimit":\([0-9]*\).*/\1/p')
+    case "$V" in ''|*[!0-9]*) V=0 ;; esac
+    [ "$V" -gt 0 ] 2>/dev/null && LIMIT=$V
+  fi
+  printf '%s' "$LIMIT"
+}
+
+# 缓存新鲜度（mtime < TTL）；无法取 mtime 视为不新鲜（触发重探测）
+cache_fresh() {
+  f=$1; ttl=$2
+  [ -s "$f" ] || return 1
+  m=$(stat -c %Y "$f" 2>/dev/null)
+  case "$m" in ''|*[!0-9]*) return 1 ;; esac
+  now=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$((now - m))" -lt "$ttl" ]
 }
 
 # "1,3,6,9" → "1,3,6,9"（空/empty 时输出空串）
@@ -230,7 +268,12 @@ list_to_json() {
 }
 
 # ---- 接口 1：能力清单 ----
+# v1.7.9：只读缓存（10 分钟新鲜度），过期/缺失才现场探测（探测会回写缓存）。
+# supervisor 每 120 tick（约 10 分钟）强制刷新一次。
 hotspot_get_capabilities() {
+  if [ -s "$CAPS_CACHE_FILE" ] && cache_fresh "$CAPS_CACHE_FILE" "$CAPS_CACHE_TTL"; then
+    HOTSPOT_CAPS_JSON=$("$BB" tr -d '\r\n' < "$CAPS_CACHE_FILE" 2>/dev/null)
+  fi
   [ -n "$HOTSPOT_CAPS_JSON" ] || hotspot_detect_capabilities
   printf '%s' "$HOTSPOT_CAPS_JSON"
 }
@@ -397,9 +440,14 @@ hotspot_get_state() {
 }
 
 # ---- 热点接口名（统一入口：不写死单一 wlan*，跨厂商探测）----
-# 优先级：bridge tether-state 真实 tethering 接口 → ip 枚举（wlan*/ap0/softap0/swlan0 等）
+# v1.7.9 优先级（避免把 Wi-Fi STA 接口误认成热点接口）：
+#   1) Bridge tether-state 真实 Tethering downstream 接口（系统回调数据，最可靠）
+#   2) 固定管理别名 192.168.43.1/32 所在接口（该别名只挂载在热点接口上）
+#   3) supervisor 写入的状态缓存 HOTSPOT_IFACE_FILE（见第 7 项能力/状态缓存）
+#   4) ip 枚举兜底：仅限 ap*/softap*/swlan*/apbr*/wlan_ap*/wlan[1-9]* 且接口上有 IPv4 地址
 get_hotspot_iface() {
   IFACE=
+  # 1) 系统 Tethering downstream（Bridge tether-state 实测）
   if bridge_available; then
     T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
     case "$T_OUT" in
@@ -413,9 +461,18 @@ get_hotspot_iface() {
         ;;
     esac
   fi
+  # 2) 固定管理别名所在接口（模块只把 192.168.43.1/32 挂到热点接口）
+  if [ -z "$IFACE" ]; then
+    IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null | "$BB" awk -v s="$STABLE_IP/32" '$4 == s {print $2; exit}')
+  fi
+  # 3) supervisor 状态缓存（第 7 项：HOTSPOT_IFACE_FILE）
+  if [ -z "$IFACE" ] && [ -n "$HOTSPOT_IFACE_FILE" ] && [ -s "$HOTSPOT_IFACE_FILE" ]; then
+    IFACE=$("$BB" tr -d '\r\n' < "$HOTSPOT_IFACE_FILE" 2>/dev/null)
+  fi
+  # 4) ip 枚举兜底：接口名模式 + 必须已有 IPv4 地址
   if [ -z "$IFACE" ]; then
     IFACE=$(/system/bin/ip -o -4 addr show 2>/dev/null \
-      | "$BB" awk '$2 ~ /^(wlan[1-9][0-9]*|ap0|softap0|swlan0|apbr0|wlan_ap[0-9]*)$/ {print $2; exit}')
+      | "$BB" awk '$2 ~ /^(wlan[1-9][0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|apbr[0-9]*|wlan_ap[0-9]*)$/ && $4 != "" {print $2; exit}')
   fi
   printf '%s' "$IFACE"
 }
@@ -548,7 +605,8 @@ hotspot_stop() {
 
 # ---- 接口 7：重启热点（完整 停止→启动，单次）----
 hotspot_restart() {
-  stop_hotspot_real >/dev/null 2>&1
+  # v1.7.9：统一走兼容层（stop 确认 → start），不再绕过 hotspot_stop 直用旧 Shell 实现
+  hotspot_stop >/dev/null 2>&1
   sleep 2
   hotspot_start "$@"
   return $?

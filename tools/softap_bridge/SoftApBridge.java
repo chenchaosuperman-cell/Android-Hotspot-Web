@@ -296,64 +296,113 @@ public class SoftApBridge {
         };
     }
 
-    /** Modern Backend：ITetheringConnector（Android 12+ 系统 tethering 服务） */
+    /** v1.7.9 Modern Backend：ITetheringConnector 严格按 AIDL 签名（Android 12+）。
+     *  startTethering(TetheringRequestParcel, String callerPkg, String attributionTag, IIntResultListener)
+     *  stopTethering(int type, String callerPkg, String attributionTag, IIntResultListener)
+     *  回调使用继承 IIntResultListener.Stub 的真实 Binder（跨进程可收到 onResult）。 */
+    static class IntResultCb extends android.net.IIntResultListener.Stub {
+        final AtomicReference<Integer> result;
+        final CountDownLatch latch;
+        IntResultCb(AtomicReference<Integer> r, CountDownLatch l) { result = r; latch = l; }
+        public void onResult(int res) throws android.os.RemoteException {
+            result.set(Integer.valueOf(res));
+            latch.countDown();
+        }
+    }
+
+    // 反射构造 TetheringRequestParcel：字段名随版本演变，缺失字段忽略。
+    static Object buildTetheringRequest(int type) throws Exception {
+        Class<?> reqCls = Class.forName("android.net.TetheringRequestParcel");
+        Object req = reqCls.getConstructor().newInstance();
+        String[] bools = new String[]{"shouldShowProvisioningUi", "preferDun", "isExemptFromEntitlementCheck"};
+        try {
+            java.lang.reflect.Field tf = reqCls.getDeclaredField("type");
+            tf.setAccessible(true);
+            tf.setInt(req, type);
+        } catch (NoSuchFieldException e) { /* 老版本无此字段 */ }
+        for (String f : bools) {
+            try {
+                java.lang.reflect.Field fd = reqCls.getDeclaredField(f);
+                fd.setAccessible(true);
+                fd.setBoolean(req, false);
+            } catch (NoSuchFieldException e) { /* 忽略 */ }
+        }
+        return req;
+    }
+
     static int tetherConnectorStart(int type) throws Exception {
         final AtomicReference<Integer> result = new AtomicReference<>(null);
         final CountDownLatch latch = new CountDownLatch(1);
-        final android.os.IBinder binder = silentBinder();
-        Class<?> cbCls = Class.forName("android.net.IStartTetheringCallback");
-        Object cb = Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls},
-                new InvocationHandler() {
-                    public Object invoke(Object proxy, Method method, Object[] args) {
-                        if (method.getName().equals("onTetheringStarted") && args != null && args.length > 0) {
-                            result.set(((Number) args[0]).intValue());
-                            latch.countDown();
-                        }
-                        if (method.getName().equals("asBinder")) return binder;
-                        return null;
-                    }
-                });
+        IntResultCb cb = new IntResultCb(result, latch);
         Object svc = tetheringConnector();
-        // 枚举 startTethering(int, Executor, IStartTetheringCallback) / (int, IStartTetheringCallback, Executor)
-        java.util.concurrent.Executor ex = new java.util.concurrent.Executor() {
-            public void execute(Runnable r) { r.run(); }
-        };
+        // AIDL: startTethering(TetheringRequestParcel, String, String, IIntResultListener)
         Method m = null;
-        Class<?> exCls = java.util.concurrent.Executor.class;
         for (Method cand : svc.getClass().getMethods()) {
             if (!cand.getName().equals("startTethering")) continue;
             Class<?>[] pts = cand.getParameterTypes();
-            if (pts.length >= 3 && pts[0] == int.class
-                    && (pts[1] == exCls || pts[2] == exCls)) {
+            if (pts.length >= 4 && pts[0].getName().equals("android.net.TetheringRequestParcel")) {
                 m = cand;
                 break;
             }
         }
         if (m == null) {
-            throw new NoSuchMethodException("ITetheringConnector.startTethering");
+            throw new NoSuchMethodException("ITetheringConnector.startTethering(TetheringRequestParcel,...)");
         }
         Class<?>[] pts = m.getParameterTypes();
+        Object req = buildTetheringRequest(type);
+        // 模仿系统设置：callerPkg=com.android.settings，attributionTag 空
+        String callerPkg = "com.android.settings";
+        String attributionTag = "";
         Object[] argv = new Object[pts.length];
         for (int i = 0; i < pts.length; i++) {
-            if (pts[i] == int.class) argv[i] = Integer.valueOf(type);
-            else if (pts[i] == exCls) argv[i] = ex;
-            else argv[i] = cb;
+            if (pts[i].getName().equals("android.net.TetheringRequestParcel")) argv[i] = req;
+            else if (pts[i] == String.class) argv[i] = (i == 1) ? callerPkg : attributionTag;
+            else if (pts[i].isAssignableFrom(android.net.IIntResultListener.class)) argv[i] = cb;
+            else argv[i] = null;
         }
-        m.invoke(svc, argv);
+        Object r = m.invoke(svc, argv);
+        int rc = (r instanceof Integer) ? ((Integer) r).intValue() : 0;
+        if (rc != 0) {
+            return rc;
+        }
         if (!latch.await(2500, TimeUnit.MILLISECONDS)) {
-            throw new IllegalStateException("tether start callback timeout");
+            throw new IllegalStateException("tether start result timeout");
         }
         return result.get() == null ? -1 : result.get().intValue();
     }
 
     static int tetherConnectorStop(int type) throws Exception {
+        final AtomicReference<Integer> result = new AtomicReference<>(null);
+        final CountDownLatch latch = new CountDownLatch(1);
+        IntResultCb cb = new IntResultCb(result, latch);
         Object svc = tetheringConnector();
-        Method m = svc.getClass().getMethod("stopTethering", int.class);
-        Object r = m.invoke(svc, Integer.valueOf(type));
-        if (r instanceof Integer) {
-            return ((Integer) r).intValue();
+        Method m = null;
+        for (Method cand : svc.getClass().getMethods()) {
+            if (!cand.getName().equals("stopTethering")) continue;
+            Class<?>[] pts = cand.getParameterTypes();
+            if (pts.length >= 1 && pts[0] == int.class) {
+                m = cand;
+                break;
+            }
         }
-        return 0;
+        if (m == null) {
+            throw new NoSuchMethodException("ITetheringConnector.stopTethering");
+        }
+        Class<?>[] pts = m.getParameterTypes();
+        Object[] argv = new Object[pts.length];
+        for (int i = 0; i < pts.length; i++) {
+            if (pts[i] == int.class) argv[i] = Integer.valueOf(type);
+            else if (pts[i] == String.class) argv[i] = (i == 1) ? "com.android.settings" : "";
+            else if (pts[i].isAssignableFrom(android.net.IIntResultListener.class)) argv[i] = cb;
+            else argv[i] = null;
+        }
+        Object r = m.invoke(svc, argv);
+        int rc = (r instanceof Integer) ? ((Integer) r).intValue() : 0;
+        if (rc != 0) return rc;
+        if (!latch.await(2500, TimeUnit.MILLISECONDS)) {
+            throw new IllegalStateException("tether stop result timeout");
+        }
+        return result.get() == null ? 0 : result.get().intValue();
     }
 
     static void doTetherStart(int type) throws Exception {
@@ -449,38 +498,46 @@ public class SoftApBridge {
         System.out.print(sb);
     }
 
-    /* ---------------- softap-capability（SoftApCallback.onCapabilityChanged 实测） ---------------- */
+    /* ---------------- SoftAP 回调（继承 ISoftApCallback.Stub，跨进程回调由 framework 父类 onTransact 分发） ---------------- */
+    // v1.7.9：不再使用 Proxy+silentBinder（跨进程收不到回调），改为继承真实 AIDL Stub。
+    // 编译期 stub.jar 提供同名 ISoftApCallback$Stub 占位；运行时 app_process 的 boot classpath
+    // 优先加载 framework 真实 Stub（parent-first），其 onTransact 正确反序列化 system_server 的回调。
+    static class SoftApCb extends android.net.wifi.ISoftApCallback.Stub {
+        final AtomicReference<Object> stateRef;
+        final AtomicReference<Object> capsRef;
+        final CountDownLatch latch;
+        SoftApCb(AtomicReference<Object> s, AtomicReference<Object> c, CountDownLatch l) {
+            stateRef = s; capsRef = c; latch = l;
+        }
+        public void onStateChanged(int state, int failureReason) throws android.os.RemoteException {
+            stateRef.set(Integer.valueOf(state));
+            latch.countDown();
+        }
+        public void onCapabilityChanged(android.net.wifi.SoftApCapability capability) throws android.os.RemoteException {
+            capsRef.set(capability);
+            latch.countDown();
+        }
+        public void onConnectedClientsChanged(java.util.List<?> clients) throws android.os.RemoteException {
+            // 不关心
+        }
+        public void onInfoChanged(android.net.wifi.SoftApInfo info) throws android.os.RemoteException {
+            // 不关心
+        }
+        public void onConnectedClientsChangedForApUid(int apUid, java.util.List<?> clients) throws android.os.RemoteException {
+            // 不关心
+        }
+        public void onClientNumChanged(int num) throws android.os.RemoteException {
+            // 不关心
+        }
+    }
 
-    static void doSoftApCapability() throws Exception {
-        StringBuilder sb = new StringBuilder();
-        final AtomicReference<Object> capsRef = new AtomicReference<>(null);
-        final CountDownLatch latch = new CountDownLatch(1);
-        try {
-            Class.forName("android.net.wifi.SoftApCapability");
-        } catch (ClassNotFoundException e) {
-            sb.append("caps=0\n");
-            System.out.print(sb);
-            return;
-        }
-        try {
-            android.os.Looper.prepareMainLooper();
-        } catch (RuntimeException e) {
-            // 已 prepare：忽略
-        }
-        final android.os.IBinder binder = silentBinder();
-        Class<?> cbCls = Class.forName("android.net.wifi.IWifiManagerSoftApCallback");
-        Object cb = Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls},
-                new InvocationHandler() {
-                    public Object invoke(Object proxy, Method method, Object[] args) {
-                        if (method.getName().equals("onCapabilityChanged") && args != null && args.length > 0 && args[0] != null) {
-                            capsRef.set(args[0]);
-                            latch.countDown();
-                        }
-                        if (method.getName().equals("asBinder")) return binder;
-                        return null;
-                    }
-                });
+    // 通过 IWifiManager 反射注册 ISoftApCallback；返回已注册的 SoftApCb。
+    static SoftApCb registerSoftApCallback(AtomicReference<Object> stateRef,
+                                           AtomicReference<Object> capsRef,
+                                           CountDownLatch latch) throws Exception {
+        SoftApCb cb = new SoftApCb(stateRef, capsRef, latch);
         Object svc = wifiService();
+        Class<?> cbCls = Class.forName("android.net.wifi.ISoftApCallback");
         Method reg = null;
         for (Method cand : svc.getClass().getMethods()) {
             if (cand.getName().equals("registerSoftApCallback")
@@ -491,25 +548,37 @@ public class SoftApBridge {
             }
         }
         if (reg == null) {
-            sb.append("caps=0\n");
-            System.out.print(sb);
-            return;
+            throw new NoSuchMethodException("IWifiManager.registerSoftApCallback");
         }
         Class<?>[] pts = reg.getParameterTypes();
         Object[] argv = new Object[pts.length];
         for (int i = 0; i < pts.length; i++) {
-            if (pts[i] == android.os.Looper.class) argv[i] = android.os.Looper.getMainLooper();
+            if (pts[i] == android.os.Looper.class) argv[i] = null;
             else argv[i] = cb;
         }
         reg.invoke(svc, argv);
-        // 驱动 main looper（子线程），最多等 2.5s
-        Thread looperThread = new Thread(new Runnable() {
-            public void run() {
-                android.os.Looper.loop();
-            }
-        });
-        looperThread.setDaemon(true);
-        looperThread.start();
+        return cb;
+    }
+
+    /* ---------------- softap-capability（ISoftApCallback.onCapabilityChanged 实测） ---------------- */
+    static void doSoftApCapability() throws Exception {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Class.forName("android.net.wifi.SoftApCapability");
+        } catch (ClassNotFoundException e) {
+            sb.append("caps=0\n");
+            System.out.print(sb);
+            return;
+        }
+        final AtomicReference<Object> capsRef = new AtomicReference<>(null);
+        final CountDownLatch latch = new CountDownLatch(1);
+        try {
+            registerSoftApCallback(new AtomicReference<>(null), capsRef, latch);
+        } catch (Throwable t) {
+            sb.append("caps=0\n");
+            System.out.print(sb);
+            return;
+        }
         try {
             latch.await(2500, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
@@ -562,58 +631,18 @@ public class SoftApBridge {
         System.out.print(sb);
     }
 
-    /* ---------------- softap-state（SoftApCallback.onStateChanged 实测） ---------------- */
+    /* ---------------- softap-state（ISoftApCallback.onStateChanged 实测） ---------------- */
     // 输出 SoftAP Framework 真实状态数值（10=DISABLING 11=DISABLED 12=ENABLING 13=ENABLED 14=FAILED）。
     // "failure reason: 0" 表示无失败原因，只按最终 state 判定；无法取得回调则输出 -1。
     static void doSoftApState() throws Exception {
         final AtomicReference<Object> stateRef = new AtomicReference<>(null);
         final CountDownLatch latch = new CountDownLatch(1);
         try {
-            android.os.Looper.prepareMainLooper();
-        } catch (RuntimeException e) {
-            // 已 prepare：忽略
-        }
-        final android.os.IBinder binder = silentBinder();
-        Class<?> cbCls = Class.forName("android.net.wifi.IWifiManagerSoftApCallback");
-        Object cb = Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls},
-                new InvocationHandler() {
-                    public Object invoke(Object proxy, Method method, Object[] args) {
-                        if (method.getName().equals("onStateChanged") && args != null && args.length > 0 && args[0] != null) {
-                            stateRef.set(args[0]);
-                            latch.countDown();
-                        }
-                        if (method.getName().equals("asBinder")) return binder;
-                        return null;
-                    }
-                });
-        Object svc = wifiService();
-        Method reg = null;
-        for (Method cand : svc.getClass().getMethods()) {
-            if (cand.getName().equals("registerSoftApCallback")
-                    && cand.getParameterTypes().length >= 1
-                    && cand.getParameterTypes()[0].isAssignableFrom(cbCls)) {
-                reg = cand;
-                break;
-            }
-        }
-        if (reg == null) {
+            registerSoftApCallback(stateRef, new AtomicReference<>(null), latch);
+        } catch (Throwable t) {
             System.out.print("softap_state=-1\n");
             return;
         }
-        Class<?>[] pts = reg.getParameterTypes();
-        Object[] argv = new Object[pts.length];
-        for (int i = 0; i < pts.length; i++) {
-            if (pts[i] == android.os.Looper.class) argv[i] = android.os.Looper.getMainLooper();
-            else argv[i] = cb;
-        }
-        reg.invoke(svc, argv);
-        Thread looperThread = new Thread(new Runnable() {
-            public void run() {
-                android.os.Looper.loop();
-            }
-        });
-        looperThread.setDaemon(true);
-        looperThread.start();
         try {
             latch.await(2500, TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
@@ -706,7 +735,7 @@ public class SoftApBridge {
         try {
             Object svc = wifiService();
             boolean cbReg = false;
-            Class<?> cbCls = Class.forName("android.net.wifi.IWifiManagerSoftApCallback");
+            Class<?> cbCls = Class.forName("android.net.wifi.ISoftApCallback");
             for (Method cand : svc.getClass().getMethods()) {
                 if (cand.getName().equals("registerSoftApCallback")
                         && cand.getParameterTypes().length >= 1
@@ -733,44 +762,44 @@ public class SoftApBridge {
             sb.append("password_readable=0\n");
         }
 
-        // 系统 Tethering 能力：Modern（ITetheringConnector）优先，Legacy（IConnectivityManager）兜底
+        // 系统 Tethering 能力：Modern（ITetheringConnector，AIDL TetheringRequestParcel 签名）+ Legacy（IConnectivityManager）独立探测
+        boolean connOk = false, connStart = false, connStop = false;
         try {
             Object tc = tetheringConnector();
-            boolean st = false, sp = false;
-            Class<?> exCls = java.util.concurrent.Executor.class;
+            connOk = true;
             for (Method cand : tc.getClass().getMethods()) {
                 if (!cand.getName().equals("startTethering")) continue;
                 Class<?>[] pts = cand.getParameterTypes();
-                if (pts.length >= 3 && pts[0] == int.class && (pts[1] == exCls || pts[2] == exCls)) st = true;
+                if (pts.length >= 4 && pts[0].getName().equals("android.net.TetheringRequestParcel")) connStart = true;
             }
-            try {
-                tc.getClass().getMethod("stopTethering", int.class);
-                sp = true;
-            } catch (NoSuchMethodException e) { /* ignore */ }
-            sb.append("tether_connector=1\n");
-            sb.append("tether_connector_start=").append(st ? 1 : 0).append("\n");
-            sb.append("tether_connector_stop=").append(sp ? 1 : 0).append("\n");
+            for (Method cand : tc.getClass().getMethods()) {
+                if (!cand.getName().equals("stopTethering")) continue;
+                Class<?>[] pts = cand.getParameterTypes();
+                if (pts.length >= 1 && pts[0] == int.class) connStop = true;
+            }
         } catch (Throwable t) {
-            sb.append("tether_connector=0\n");
-            try {
-                Object svc = connectivityService();
-                try {
-                    svc.getClass().getMethod("startTethering", int.class, boolean.class,
-                            Class.forName("android.net.IOnStartTetheringCallback"), int.class);
-                    sb.append("tether_start_cm=1\n");
-                } catch (NoSuchMethodException e) {
-                    sb.append("tether_start_cm=0\n");
-                }
-                try {
-                    svc.getClass().getMethod("stopTethering", int.class);
-                    sb.append("tether_stop_cm=1\n");
-                } catch (NoSuchMethodException e) {
-                    sb.append("tether_stop_cm=0\n");
-                }
-            } catch (Throwable t2) {
-                sb.append("tether_start_cm=0\ntether_stop_cm=0\n");
-            }
+            connOk = false;
         }
+        boolean cmStart = false, cmStop = false;
+        try {
+            Object svc = connectivityService();
+            try {
+                svc.getClass().getMethod("startTethering", int.class, boolean.class,
+                        Class.forName("android.net.IOnStartTetheringCallback"), int.class);
+                cmStart = true;
+            } catch (NoSuchMethodException e) { /* legacy 不存在 */ }
+            try {
+                svc.getClass().getMethod("stopTethering", int.class);
+                cmStop = true;
+            } catch (NoSuchMethodException e) { /* legacy 不存在 */ }
+        } catch (Throwable t2) {
+            /* connectivity service 不可用 */
+        }
+        sb.append("tether_connector=").append(connOk ? 1 : 0).append("\n");
+        sb.append("tether_connector_start=").append(connStart ? 1 : 0).append("\n");
+        sb.append("tether_connector_stop=").append(connStop ? 1 : 0).append("\n");
+        sb.append("tether_start_cm=").append(cmStart ? 1 : 0).append("\n");
+        sb.append("tether_stop_cm=").append(cmStop ? 1 : 0).append("\n");
 
         System.out.print(sb);
     }

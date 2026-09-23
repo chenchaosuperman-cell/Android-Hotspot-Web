@@ -109,7 +109,7 @@ restart_hotspot_async() {
         if [ "$(get_management_ip "$VERIFY_IFACE")" = "$STABLE_IP" ]; then
           write_operation success "热点已启动，固定管理地址 $STABLE_IP:$PORT"
         else
-          write_operation success "热点已启动，管理地址 $VERIFY_IP:$PORT"
+          write_operation success "热点已启动，但固定管理地址 $STABLE_IP 未挂载成功（该设备未通过固定管理地址兼容验证）"
         fi
       else
         write_operation error "热点启动失败：$PARAM_ERR"
@@ -679,7 +679,8 @@ case "$ACTION" in
     fi
     if [ -n "$NEW_MAX" ]; then
       case "$NEW_MAX" in ''|*[!0-9]*) printf '{"ok":false,"message":"最大连接数需为数字（0–32）"}'; exit 0 ;; esac
-      valid_max_clients "$NEW_MAX" || { printf '{"ok":false,"message":"最大连接数需为0–32"}'; exit 0; }
+      MC_LIMIT=$(get_max_clients_limit)
+      valid_max_clients "$NEW_MAX" "$MC_LIMIT" || { printf '{"ok":false,"message":"最大连接数需为0–%s"}' "$MC_LIMIT"; exit 0; }
       MAX_CLIENTS=$NEW_MAX
     fi
     if [ -n "$NEW_DATA_LIMIT" ]; then

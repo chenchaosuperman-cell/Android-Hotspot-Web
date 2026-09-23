@@ -300,6 +300,9 @@ softap_capability=1
 password_readable=1
 tether_start_cm=1
 tether_stop_cm=1
+tether_connector=1
+tether_connector_start=1
+tether_connector_stop=1
 EOF
 SC_FILE="$TMP_SYS_DIR/softap_caps.txt"
 cat > "$SC_FILE" <<'EOF'

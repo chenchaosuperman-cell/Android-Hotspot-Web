@@ -16,6 +16,7 @@ OP_LOCK="$DATA_DIR/operation.lock"
 CONTROL_REQUEST="$DATA_DIR/control.request"
 STABLE_IP=192.168.43.1
 IPT=/system/bin/iptables
+IPT6=/system/bin/ip6tables
 # Hotspot Compatibility Layer 统一走系统 cmd（可被测试覆盖为 mock）
 CMD_WIFI=/system/bin/cmd
 
@@ -683,10 +684,11 @@ valid_channel() {
 
 # 最大连接数 0–32；空闲关闭 0 或 1–600 分钟
 valid_max_clients() {
+  # v1.7.9：第 2 参数为设备动态上限（get_max_clients_limit），缺省 32（兼容旧调用/测试）
   case "$1" in
     ''|0) return 0 ;;
     *[!0-9]*) return 1 ;;
-    *) [ "$1" -ge 1 ] && [ "$1" -le 32 ] ;;
+    *) MAXLIM=${2:-32}; case "$MAXLIM" in ''|*[!0-9]*) MAXLIM=32 ;; esac; [ "$1" -ge 1 ] && [ "$1" -le "$MAXLIM" ] ;;
   esac
 }
 
@@ -936,7 +938,7 @@ apply_mac_policy() {
       $IPT -A mifi_acl -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null
     done
     $IPT -A mifi_acl -j DROP 2>/dev/null
-    fw6_ensure
+    fw6_ensure "$iface"
   else
     # 黑名单：名单 MAC DROP，其余 RETURN 兜底（不阻断正常流量）
     for mac in $BLOCKED_MACS; do
@@ -944,7 +946,7 @@ apply_mac_policy() {
       $IPT -A mifi_acl -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
     done
     $IPT -A mifi_acl -j RETURN 2>/dev/null
-    [ -n "$BLOCKED_MACS" ] && fw6_ensure
+    [ -n "$BLOCKED_MACS" ] && fw6_ensure "$iface"
   fi
   $IPT -I FORWARD 1 -i "$iface" -j mifi_acl 2>/dev/null
   return 0
@@ -992,7 +994,7 @@ clear_mac_acl() {
   done
   $IPT -F mifi_acl 2>/dev/null || true
   $IPT -X mifi_acl 2>/dev/null || true
-  fw6_clear
+  fw6_clear "$iface"
 }
 
 # 全量清理（热点停止/接口变化等场景）：旧直插规则 + 专用链 + IPv6
@@ -1031,20 +1033,32 @@ unblock_one_mac() {
 # 避免“IPv4 已禁、IPv6 仍通”；管控全部关闭时由 fw6_clear 恢复。
 fw6_ensure() {
   command -v "$IPT6" >/dev/null 2>&1 || return 0
+  iface=$1
+  # v1.7.9：IPv6 管控必须限定热点接口，禁止全局丢弃所有 IPv6 转发（会连带 USB 共享等业务断网）
+  [ -z "$iface" ] && return 0
   $IPT6 -N mifi_ipv6 2>/dev/null || { $IPT6 -F mifi_ipv6 2>/dev/null; }
   $IPT6 -F mifi_ipv6 2>/dev/null
   $IPT6 -A mifi_ipv6 -j DROP 2>/dev/null
-  $IPT6 -C FORWARD -j mifi_ipv6 2>/dev/null || $IPT6 -I FORWARD 1 -j mifi_ipv6 2>/dev/null
+  $IPT6 -C FORWARD -i "$iface" -j mifi_ipv6 2>/dev/null || $IPT6 -I FORWARD 1 -i "$iface" -j mifi_ipv6 2>/dev/null
   return 0
 }
 
 fw6_clear() {
   command -v "$IPT6" >/dev/null 2>&1 || return 0
+  iface=$1
   N=0
-  while [ "$N" -lt 20 ] && $IPT6 -C FORWARD -j mifi_ipv6 2>/dev/null; do
-    $IPT6 -D FORWARD -j mifi_ipv6 2>/dev/null
-    N=$((N + 1))
-  done
+  if [ -n "$iface" ]; then
+    while [ "$N" -lt 20 ] && $IPT6 -C FORWARD -i "$iface" -j mifi_ipv6 2>/dev/null; do
+      $IPT6 -D FORWARD -i "$iface" -j mifi_ipv6 2>/dev/null
+      N=$((N + 1))
+    done
+  else
+    # 无接口参数（卸载兜底）：清理任意引用
+    while [ "$N" -lt 20 ] && $IPT6 -C FORWARD -j mifi_ipv6 2>/dev/null; do
+      $IPT6 -D FORWARD -j mifi_ipv6 2>/dev/null
+      N=$((N + 1))
+    done
+  fi
   $IPT6 -F mifi_ipv6 2>/dev/null || true
   $IPT6 -X mifi_ipv6 2>/dev/null || true
   return 0
