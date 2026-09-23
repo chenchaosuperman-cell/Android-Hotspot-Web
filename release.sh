@@ -73,7 +73,7 @@ BODY=$(python3 - "$TAG" <<'PYEOF'
 import sys,re
 tag=sys.argv[1]
 txt=open('CHANGELOG.md',encoding='utf-8').read()
-m=re.search(r'^# '+re.escape(tag)+r'（[^）]*）\s*\n(.*?)(?=^# |\Z)',txt,re.S|re.M)
+m=re.search(r'^# '+re.escape(tag)+r'[^\n]*\n(.*?)(?=^# |\Z)',txt,re.S|re.M)
 print((m.group(1).strip() if m else '') or tag)
 PYEOF
 )
