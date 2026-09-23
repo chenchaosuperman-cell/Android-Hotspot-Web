@@ -1,7 +1,7 @@
 id=xiaomi_mifi_web
 name=Android-Hotspot-Web
-version=1.7.6-beta
-versionCode=1726
+version=1.7.7-beta
+versionCode=1727
 author=chenchaosuperman
-description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, MAC blacklist/whitelist, scheduling, SMS forward, Mihomo proxy, PushPlus/DingTalk/Bark notifications, hidden SSID, device diagnostics. Generic Android compatibility via Hotspot Compatibility Layer (capability-driven; system SoftApConfiguration as single source of truth; writes via Framework setSoftApConfiguration(config,packageName) Binder Bridge, AOSP signatures; hotspot on/off via system Tethering, cmd wifi only as OEM fallback). Verified: Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU. v1.7.6-beta: one-config with system hotspot settings, Binder Bridge, 7 unified APIs, 6GHz support.
+description=Local web hotspot management for rooted Android (KernelSU). Hotspot control, traffic quota, client management, MAC blacklist/whitelist, scheduling, SMS forward, Mihomo proxy, PushPlus/DingTalk/Bark notifications, hidden SSID, device diagnostics. Generic Android compatibility via Hotspot Compatibility Layer (capability-driven; system SoftApConfiguration as single source of truth; writes via Framework setSoftApConfiguration(config,packageName) Binder Bridge, AOSP signatures; hotspot on/off via system Tethering, cmd wifi only as OEM fallback). Verified: Xiaomi 14 / HyperOS 3 / Android 16 / KernelSU. v1.7.7-beta: Compatibility & Reliability — SoftApCapability via SoftApCallback (dynamic channel/max-client), Modern ITetheringConnector + Legacy tethering split, MAC ACL unified chain (IPv4+IPv6), dedicated MIFI_WEB firewall chain, fixed management IP 192.168.43.1 (no fallback), full cross-vendor uninstall cleanup, valid_channel 0x01 bugfix.
 updateJson=https://raw.githubusercontent.com/chenchaosuperman-cell/Android-Hotspot-Web/main/update.json

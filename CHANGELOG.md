@@ -1,3 +1,19 @@
+# v1.7.7-beta（2026-09-23）Compatibility & Reliability
+
+> 本版不做新功能，专注兼容性、网络安全、状态一致性与卸载恢复（依据《v1.7.6-beta 全量审计报告》P0/P1 修复）。
+
+- **P0 修复 valid_channel()**：`lib/common.sh` 中三处 `sed` 替换引用了真实控制字符 `0x01` 而非 ``，导致 Bridge 返回的设备动态信道列表无法通过合法性校验（`channels2g=[1,6,11]` 时 `6` 被判非法）。恢复为 ``，并新增动态信道断言（2.4G/5G/6G 合法信道 PASS、非法信道 FAIL）。
+- **SoftApCapability 改走 SoftApCallback 实测**：不再反射猜测 `getSoftApCapabilities()`。`SoftApBridge` 新增 `softap-capability` 命令：注册 `WifiManager.SoftApCallback`，在 `onCapabilityChanged(SoftApCapability)` 中取得真实能力（`getSupportedChannelList(band)` 2.4/5/6 GHz 信道 + 最大客户端），2.5s latch 后输出 `caps/channels2g/channels5g/channels6g/max_clients`；shell 侧据此动态生成信道下拉与最大连接数上限（拿不到只显示"自动"），`maxClientsLimit` 写入 caps JSON。
+- **Tethering 分代 Backend**：`tether-start/tether-stop` 由 `IConnectivityManager` 单一路径改为 **Modern（ITetheringConnector，Android 12+ 系统 tethering 服务）优先、Legacy（IConnectivityManager）兜底**，`cmd connectivity` / `cmd wifi` 仅作最后 Shell fallback；probe 输出 `tether_connector/tether_connector_start/tether_connector_stop/tether_start_cm/tether_stop_cm` 分代能力。
+- **MAC 访问策略统一专用链（IPv4+IPv6）**：黑名单/白名单共用 `FORWARD → mifi_acl`，`rebuild_acl_chain()` 先删后建（`-F/-X/-N`）杜绝切换残留；策略变化 flush+重建而非"猜旧规则逐条删"；IPv6 经 `fw6_ensure/fw6_clear` 同步管控（方案 B：不支持 IPv6 ACL 时限制为明确降级）。
+- **Web 防火墙独立链 MIFI_WEB**：`INPUT → MIFI_WEB`（放行 lo/热点接口/USB 共享，其余 DROP），不再直插 INPUT 末尾（避免被系统 ACCEPT 提前命中导致 8080 无法封锁）；IPv4+IPv6 同步，`clear` 兼清旧版直插规则。
+- **固定管理地址 192.168.43.1 不再降级**：`get_management_ip()` 挂 `/32` alias 失败时输出 `unavailable`，诊断页显示"固定管理地址不可用，该设备当前未通过兼容性验证"，不再偷偷回退系统热点网关（保持"兼容手机后台固定 192.168.43.1:8080"的承诺）。
+- **卸载全量清理（跨厂商）**：`uninstall.sh` 重写——接口集合 = 运行时记录（usage/hotspot/proxy/iface）优先 + 宽枚举（`wlan*/ap*/softap*/swlan*/apbr*/rndis*/usb*`）；逐接口清 qdisc / MAC 链引用 / 固定别名（含 lo 路径）；`MIFI_WEB` IPv4+IPv6 清理 + 旧直插兼容；链清删集合覆盖 `mifi_stats/mifi_up/mifi_dn/mifi_acl/mifi_ipv6/MIFI_PROXY/MIFI_PROXY_SELF/MIFI_BLOCK_QUIC/MIFI_SELF_BLOCK_QUIC`；代理链按 `PROXY_IFACE+IFACES` 循环，去掉 `wlan2-4` 写死。卸载后不再残留 iptables/tc/别名/Mihomo 进程。
+- **diagnose.cgi**：新增 `mgmtNote` 字段（固定管理地址不可用时明确提示未通过兼容性验证）。
+- **回归测试 → 125 用例全部通过**（新增：softap-capability mock 分支、probe 去掉 channels 行改走 softap-capability 实测、`maxClientsLimit:32` 断言、MAC 统一链 `-X` 先于 `-N` 断言、blacklist 清除残留白名单链断言）。
+
+---
+
 # v1.7.6-beta（2026-09-22）一套配置 + 系统 Framework 持久化
 
 > 架构升级：热点配置不再维护「模块一份 + 系统一份」，改为**系统 SoftApConfiguration 为唯一数据源**，系统设置与 Web 双向同步；新增 **Hotspot Compatibility Layer** 与 **Binder Bridge**，写入一律走 Android Wi-Fi Framework 真实持久化接口。

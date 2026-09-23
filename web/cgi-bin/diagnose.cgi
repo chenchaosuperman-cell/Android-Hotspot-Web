@@ -81,7 +81,11 @@ LOG_TAIL=$("$BB" tail -n 15 "$LOG" 2>/dev/null)
 printf '{'
 printf '"ok":true,'
 printf '"module":"xiaomi_mifi_web",'
-printf '"iface":"%s","ip":"%s","mgmtIp":"%s","alias":%s,' "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$MIP")" "$ALIAS"
+MIP_NOTE=
+if [ "$MIP" = "unavailable" ]; then
+  MIP_NOTE="固定管理地址不可用，该设备当前未通过兼容性验证"
+fi
+printf '"iface":"%s","ip":"%s","mgmtIp":"%s","alias":%s,"mgmtNote":"%s",' "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$MIP")" "$ALIAS" "$(json_escape "$MIP_NOTE")"
 printf '"desired":%s,"keepalive":%s,"idleShutdown":%s,"schedEnable":%s,' \
   "$DESIRED" "$([ "${KEEPALIVE:-1}" = "1" ] && echo true || echo false)" "${IDLE_SHUTDOWN:-0}" "$([ "${SCHED_ENABLE:-0}" = "1" ] && echo true || echo false)"
 printf '"tether":{"fwd":%s,"nat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_PKTS"

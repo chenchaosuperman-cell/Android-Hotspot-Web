@@ -1,54 +1,40 @@
 /*
- * SoftApBridge — Android-Hotspot-Web 系统热点配置 Binder Bridge（v2，AOSP 签名对齐）
+ * SoftApBridge — Android-Hotspot-Web 系统热点配置 Binder Bridge（v3，v1.7.7）
  *
- * 职责（配置与开关分离）：
- *   get-config    读取系统持久 SoftApConfiguration（IWifiManager.getSoftApConfiguration）
- *   set-config    写入系统持久 SoftApConfiguration（IWifiManager.setSoftApConfiguration，
- *                 标准 AOSP 签名为 (SoftApConfiguration, String packageName)；
- *                 运行时枚举方法签名，兼容 (SoftApConfiguration) 等 OEM 变体）
- *   tether-state  读取 Wi-Fi tethering 状态（IConnectivityManager.getTetheredIfaces /
- *                 getTetheringState）——开关本身由 shell 侧走系统 Tethering 路径
- *   probe         运行时能力探测（方法签名、Builder 方法、安全/频段常量），
- *                 shell 侧据此决定 readConfig/writeConfig 与同步级别，不靠文件存在判断
- *
- * 为什么 set 不能只用单参数：
- *   AOSP IWifiManager.aidl：setSoftApConfiguration(SoftApConfiguration config,
- *   String packageName)；低版本/厂商可能存在单参数变体，因此运行时枚举匹配。
+ * 职责（配置/开关/能力分离）：
+ *   get-config            读取系统持久 SoftApConfiguration（IWifiManager.getSoftApConfiguration）
+ *   set-config            写入系统持久 SoftApConfiguration（IWifiManager.setSoftApConfiguration，
+ *                         标准 AOSP 签名为 (SoftApConfiguration, String packageName)；
+ *                         运行时枚举方法签名，兼容 (SoftApConfiguration) 等 OEM 变体）
+ *   tether-state          读取 Wi-Fi tethering 状态（IConnectivityManager / TetheringManager 体系）
+ *   tether-start/stop     走系统 Tethering 体系，分代 Backend：
+ *                         Modern = ITetheringConnector（TetheringManager 底层，"tethering" 系统服务）
+ *                         Legacy = IConnectivityManager.startTethering/stopTethering
+ *   softap-capability     通过 WifiManager.SoftApCallback.onCapabilityChanged(SoftApCapability)
+ *                         取得一次真实能力（信道列表/最大客户端），不反射猜 getSoftApCapabilities()
+ *   probe                 运行时能力探测（方法签名、Builder 方法、安全/频段常量、Tethering 分代）
  *
  * AOSP 常量（运行时优先反射 Framework 字段，反射不到才用内置值）：
  *   SECURITY_TYPE: OPEN=0 WPA2_PSK=1 WPA3_SAE_TRANSITION=2 WPA3_SAE=3
  *                  WPA3_OWE_TRANSITION=4 WPA3_OWE=5
  *   BAND: 2GHZ=1 5GHZ=2 6GHZ=4 ANY=7（=1|2|4，禁止 0，setBand(0) 会抛 IllegalArgumentException）
- *
- * 运行方式（root，KernelSU/Magisk）：
- *   app_process -Djava.class.path=<模块>/lib/softap_bridge.dex \
- *       /system/bin com.mifi.softap.SoftApBridge get-config
- *   app_process ... com.mifi.softap.SoftApBridge set-config \
- *       <ssid> <open|wpa2|wpa3|wpa3_transition> <pass> \
- *       <2|5|6|any> <channel> <0|1> <maxclients>
- *   app_process ... com.mifi.softap.SoftApBridge tether-state
- *   app_process ... com.mifi.softap.SoftApBridge probe
- *
- * 输出（get-config，字符串字段 base64）：
- *   present=1
- *   ssid_b64=...
- *   security=open|wpa2|wpa3|wpa3_transition|owe_transition|owe
- *   password_b64=...
- *   band=2|5|6|any
- *   channel=N  hidden=0|1  maxclients=N
- *
- * 兼容：API 30+。API<30 输出 present=0 + ERROR_UNSUPPORTED，shell 侧降级。
  */
 package com.mifi.softap;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class SoftApBridge {
 
-    // AOSP 内置默认值（反射 Framework 字段优先，见 readSecurityConstants/readBandConstants）
+    // AOSP 内置默认值（反射 Framework 字段优先，见 readIntConstants）
     static final int SEC_OPEN = 0;
     static final int SEC_WPA2 = 1;
     static final int SEC_WPA3_TRANSITION = 2;
@@ -90,6 +76,9 @@ public class SoftApBridge {
                 case "tether-stop":
                     doTetherStop(parseInt(args.length > 1 ? args[1] : "0", 0));
                     break;
+                case "softap-capability":
+                    doSoftApCapability();
+                    break;
                 case "probe":
                     doProbe();
                     break;
@@ -97,7 +86,7 @@ public class SoftApBridge {
                     System.out.println("api=" + api);
                     break;
                 default:
-                    System.err.println("ERROR_USAGE: usage get-config|set-config|tether-state|tether-start|tether-stop|probe|get-api");
+                    System.err.println("ERROR_USAGE: usage get-config|set-config|tether-state|tether-start|tether-stop|softap-capability|probe|get-api");
                     System.exit(2);
             }
         } catch (Throwable t) {
@@ -126,6 +115,10 @@ public class SoftApBridge {
 
     static Object connectivityService() throws Exception {
         return binderService("connectivity", "android.net.IConnectivityManager$Stub");
+    }
+
+    static Object tetheringConnector() throws Exception {
+        return binderService("tethering", "android.net.ITetheringConnector$Stub");
     }
 
     /* ---------------- get-config ---------------- */
@@ -201,7 +194,6 @@ public class SoftApBridge {
             try {
                 bCls.getMethod("setPassphrase", String.class, int.class).invoke(builder, (String) null, Integer.valueOf(SEC_OPEN));
             } catch (NoSuchMethodException e) {
-                // OEM 变体：无 (String,int) 时只设安全类型（无密码方法则无法清除密码，报错让上层降级）
                 try {
                     bCls.getMethod("setSecurityType", int.class).invoke(builder, Integer.valueOf(SEC_OPEN));
                 } catch (NoSuchMethodException e2) {
@@ -246,7 +238,7 @@ public class SoftApBridge {
             bCls.getMethod("setMaxNumberOfClients", int.class).invoke(builder, Integer.valueOf(max));
         } catch (NoSuchMethodException e) {
             // 无此方法：不设置
-        } catch (java.lang.reflect.InvocationTargetException e) {
+        } catch (InvocationTargetException e) {
             // 个别 ROM 拒绝 0：忽略，保留原值
         }
         Object cfg = bCls.getMethod("build").invoke(builder);
@@ -288,85 +280,281 @@ public class SoftApBridge {
         System.out.println("ok=1");
     }
 
-    /* ---------------- tether-start / tether-stop（走系统 Tethering 体系，不依赖 cmd connectivity 子命令） ---------------- */
+    /* ---------------- tether-start / tether-stop（系统 Tethering 体系，分代 Backend） ---------------- */
 
-    /** IConnectivityManager.startTethering(type, showProvisioningUi, IOnStartTetheringCallback, uid)
-     *  callback 用 Proxy 实现接口 + asBinder 返回自定义 Binder（服务端跨进程回调时 transact 即可，无需实现 AIDL stub） */
-    static Object tetherCallbackBinder() {
+    /** 通用静默回调 Binder：onTransact 直接 writeNoException 并返回 true */
+    static android.os.IBinder silentBinder() {
         return new android.os.Binder() {
             @Override
             protected boolean onTransact(int code, android.os.Parcel data, android.os.Parcel reply, int flags) {
-                // onTetheringStarted / onTetheringFailed：静默接受
                 if (reply != null) reply.writeNoException();
                 return true;
             }
         };
     }
 
-    static Object tetherCallbackProxy() throws Exception {
-        Class<?> cbCls = Class.forName("android.net.IOnStartTetheringCallback");
-        final android.os.IBinder binder = (android.os.IBinder) tetherCallbackBinder();
-        java.lang.reflect.InvocationHandler h = new java.lang.reflect.InvocationHandler() {
-            public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) {
-                if (method.getName().equals("asBinder")) return binder;
-                return null;
-            }
+    /** Modern Backend：ITetheringConnector（Android 12+ 系统 tethering 服务） */
+    static int tetherConnectorStart(int type) throws Exception {
+        final AtomicReference<Integer> result = new AtomicReference<>(null);
+        final CountDownLatch latch = new CountDownLatch(1);
+        final android.os.IBinder binder = silentBinder();
+        Class<?> cbCls = Class.forName("android.net.IStartTetheringCallback");
+        Object cb = Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls},
+                new InvocationHandler() {
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        if (method.getName().equals("onTetheringStarted") && args != null && args.length > 0) {
+                            result.set(((Number) args[0]).intValue());
+                            latch.countDown();
+                        }
+                        if (method.getName().equals("asBinder")) return binder;
+                        return null;
+                    }
+                });
+        Object svc = tetheringConnector();
+        // 枚举 startTethering(int, Executor, IStartTetheringCallback) / (int, IStartTetheringCallback, Executor)
+        java.util.concurrent.Executor ex = new java.util.concurrent.Executor() {
+            public void execute(Runnable r) { r.run(); }
         };
-        return java.lang.reflect.Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls}, h);
+        Method m = null;
+        Class<?> exCls = java.util.concurrent.Executor.class;
+        for (Method cand : svc.getClass().getMethods()) {
+            if (!cand.getName().equals("startTethering")) continue;
+            Class<?>[] pts = cand.getParameterTypes();
+            if (pts.length >= 3 && pts[0] == int.class
+                    && (pts[1] == exCls || pts[2] == exCls)) {
+                m = cand;
+                break;
+            }
+        }
+        if (m == null) {
+            throw new NoSuchMethodException("ITetheringConnector.startTethering");
+        }
+        Class<?>[] pts = m.getParameterTypes();
+        Object[] argv = new Object[pts.length];
+        for (int i = 0; i < pts.length; i++) {
+            if (pts[i] == int.class) argv[i] = Integer.valueOf(type);
+            else if (pts[i] == exCls) argv[i] = ex;
+            else argv[i] = cb;
+        }
+        m.invoke(svc, argv);
+        if (!latch.await(2500, TimeUnit.MILLISECONDS)) {
+            throw new IllegalStateException("tether start callback timeout");
+        }
+        return result.get() == null ? -1 : result.get().intValue();
+    }
+
+    static int tetherConnectorStop(int type) throws Exception {
+        Object svc = tetheringConnector();
+        Method m = svc.getClass().getMethod("stopTethering", int.class);
+        Object r = m.invoke(svc, Integer.valueOf(type));
+        if (r instanceof Integer) {
+            return ((Integer) r).intValue();
+        }
+        return 0;
     }
 
     static void doTetherStart(int type) throws Exception {
+        // Modern：ITetheringConnector
         try {
-            Object svc = connectivityService();
-            Method m = svc.getClass().getMethod("startTethering",
-                    int.class, boolean.class, Class.forName("android.net.IOnStartTetheringCallback"), int.class);
-            m.invoke(svc, Integer.valueOf(type), Boolean.FALSE, tetherCallbackProxy(), Integer.valueOf(android.os.Process.myUid()));
-            System.out.println("ok=1");
-        } catch (NoSuchMethodException e) {
-            System.err.println("ERROR_NOSUCHMETHOD: IConnectivityManager.startTethering unavailable");
+            int rc = tetherConnectorStart(type);
+            if (rc == 0) {
+                System.out.println("backend=modern\nok=1");
+                return;
+            }
+            System.out.println("backend=modern\nresult=" + rc);
             System.exit(1);
-        } catch (java.lang.reflect.InvocationTargetException e) {
-            System.err.println("ERROR_TETHERING: " + e.getCause());
-            System.exit(1);
+        } catch (Throwable modernErr) {
+            // Legacy：IConnectivityManager.startTethering
+            try {
+                Object svc = connectivityService();
+                Method m = svc.getClass().getMethod("startTethering",
+                        int.class, boolean.class, Class.forName("android.net.IOnStartTetheringCallback"), int.class);
+                Object cb = Proxy.newProxyInstance(
+                        Class.forName("android.net.IOnStartTetheringCallback").getClassLoader(),
+                        new Class<?>[]{Class.forName("android.net.IOnStartTetheringCallback")},
+                        new InvocationHandler() {
+                            public Object invoke(Object proxy, Method method, Object[] args) {
+                                if (method.getName().equals("asBinder")) return silentBinder();
+                                return null;
+                            }
+                        });
+                m.invoke(svc, Integer.valueOf(type), Boolean.FALSE, cb, Integer.valueOf(android.os.Process.myUid()));
+                System.out.println("backend=legacy\nok=1");
+            } catch (NoSuchMethodException e) {
+                System.err.println("ERROR_NOSUCHMETHOD: no tether start backend (modern=" + modernErr + ")");
+                System.exit(1);
+            } catch (InvocationTargetException e) {
+                System.err.println("ERROR_TETHERING: " + e.getCause());
+                System.exit(1);
+            }
         }
     }
 
     static void doTetherStop(int type) throws Exception {
+        // Modern：ITetheringConnector
         try {
-            Object svc = connectivityService();
-            Method m = svc.getClass().getMethod("stopTethering", int.class);
-            m.invoke(svc, Integer.valueOf(type));
-            System.out.println("ok=1");
-        } catch (NoSuchMethodException e) {
-            System.err.println("ERROR_NOSUCHMETHOD: IConnectivityManager.stopTethering unavailable");
-            System.exit(1);
-        } catch (java.lang.reflect.InvocationTargetException e) {
-            System.err.println("ERROR_TETHERING: " + e.getCause());
-            System.exit(1);
+            int rc = tetherConnectorStop(type);
+            System.out.println("backend=modern\nok=1");
+            return;
+        } catch (Throwable modernErr) {
+            // Legacy：IConnectivityManager.stopTethering
+            try {
+                Object svc = connectivityService();
+                Method m = svc.getClass().getMethod("stopTethering", int.class);
+                m.invoke(svc, Integer.valueOf(type));
+                System.out.println("backend=legacy\nok=1");
+            } catch (NoSuchMethodException e) {
+                System.err.println("ERROR_NOSUCHMETHOD: no tether stop backend (modern=" + modernErr + ")");
+                System.exit(1);
+            } catch (InvocationTargetException e) {
+                System.err.println("ERROR_TETHERING: " + e.getCause());
+                System.exit(1);
+            }
         }
     }
 
     /* ---------------- tether-state（开关状态，供 shell 侧确认系统 Tethering 真实状态） ---------------- */
 
     static void doTetherState() throws Exception {
-        Object svc = connectivityService();
         StringBuilder sb = new StringBuilder();
+        boolean got = false;
+        // 现代 Android Tethering 已迁移，IConnectivityManager 部分方法可能不存在
         try {
+            Object svc = connectivityService();
             Method gti = svc.getClass().getMethod("getTetheredIfaces");
             String[] ifaces = (String[]) gti.invoke(svc);
             sb.append("tethered=").append(ifaces == null ? 0 : ifaces.length).append("\n");
             if (ifaces != null && ifaces.length > 0) {
                 sb.append("ifaces=").append(String.join(",", ifaces)).append("\n");
             }
+            got = true;
         } catch (NoSuchMethodException e) {
             sb.append("tethered=-1\n");
         }
         try {
+            Object svc = connectivityService();
             Method gts = svc.getClass().getMethod("getTetheringState", int.class);
             int st = (Integer) gts.invoke(svc, 0); // TETHERING_WIFI=0
             sb.append("tether_state=").append(st).append("\n");
+            got = true;
         } catch (NoSuchMethodException e) {
             sb.append("tether_state=-1\n");
+        }
+        if (!got) {
+            sb.append("tether_state=-1\n");
+        }
+        System.out.print(sb);
+    }
+
+    /* ---------------- softap-capability（SoftApCallback.onCapabilityChanged 实测） ---------------- */
+
+    static void doSoftApCapability() throws Exception {
+        StringBuilder sb = new StringBuilder();
+        final AtomicReference<Object> capsRef = new AtomicReference<>(null);
+        final CountDownLatch latch = new CountDownLatch(1);
+        try {
+            Class.forName("android.net.wifi.SoftApCapability");
+        } catch (ClassNotFoundException e) {
+            sb.append("caps=0\n");
+            System.out.print(sb);
+            return;
+        }
+        try {
+            android.os.Looper.prepareMainLooper();
+        } catch (RuntimeException e) {
+            // 已 prepare：忽略
+        }
+        final android.os.IBinder binder = silentBinder();
+        Class<?> cbCls = Class.forName("android.net.wifi.IWifiManagerSoftApCallback");
+        Object cb = Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls},
+                new InvocationHandler() {
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        if (method.getName().equals("onCapabilityChanged") && args != null && args.length > 0 && args[0] != null) {
+                            capsRef.set(args[0]);
+                            latch.countDown();
+                        }
+                        if (method.getName().equals("asBinder")) return binder;
+                        return null;
+                    }
+                });
+        Object svc = wifiService();
+        Method reg = null;
+        for (Method cand : svc.getClass().getMethods()) {
+            if (cand.getName().equals("registerSoftApCallback")
+                    && cand.getParameterTypes().length >= 1
+                    && cand.getParameterTypes()[0].isAssignableFrom(cbCls)) {
+                reg = cand;
+                break;
+            }
+        }
+        if (reg == null) {
+            sb.append("caps=0\n");
+            System.out.print(sb);
+            return;
+        }
+        Class<?>[] pts = reg.getParameterTypes();
+        Object[] argv = new Object[pts.length];
+        for (int i = 0; i < pts.length; i++) {
+            if (pts[i] == android.os.Looper.class) argv[i] = android.os.Looper.getMainLooper();
+            else argv[i] = cb;
+        }
+        reg.invoke(svc, argv);
+        // 驱动 main looper（子线程），最多等 2.5s
+        Thread looperThread = new Thread(new Runnable() {
+            public void run() {
+                android.os.Looper.loop();
+            }
+        });
+        looperThread.setDaemon(true);
+        looperThread.start();
+        try {
+            latch.await(2500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            // 忽略
+        }
+        Object caps = capsRef.get();
+        if (caps == null) {
+            sb.append("caps=0\n");
+            System.out.print(sb);
+            return;
+        }
+        sb.append("caps=1\n");
+        int[] bands = new int[]{1, 2, 4};
+        String[] keys = new String[]{"channels2g", "channels5g", "channels6g"};
+        for (int i = 0; i < bands.length; i++) {
+            StringBuilder line = new StringBuilder(keys[i] + "=");
+            try {
+                Method cml = caps.getClass().getMethod("getSupportedChannelList", int.class);
+                Object list = cml.invoke(caps, Integer.valueOf(bands[i]));
+                if (list instanceof int[]) {
+                    int[] arr = (int[]) list;
+                    if (arr.length == 0) line.append("empty");
+                    else for (int j = 0; j < arr.length; j++) { if (j > 0) line.append(","); line.append(arr[j]); }
+                } else if (list instanceof java.util.List) {
+                    java.util.List<?> l = (java.util.List<?>) list;
+                    if (l == null || l.isEmpty()) line.append("empty");
+                    else for (int j = 0; j < l.size(); j++) { if (j > 0) line.append(","); line.append(l.get(j)); }
+                } else {
+                    line.append("empty");
+                }
+            } catch (Throwable t) {
+                line.append("empty");
+            }
+            sb.append(line).append("\n");
+        }
+        // 最大客户端（硬件能力）
+        try {
+            Method mm = caps.getClass().getMethod("getMaxSupportedClients");
+            Object mc = mm.invoke(caps);
+            sb.append("max_clients=").append(mc == null ? 0 : mc).append("\n");
+        } catch (Throwable t) {
+            try {
+                Method mm = caps.getClass().getMethod("getMaximumSupportedClientNumber");
+                Object mc = mm.invoke(caps);
+                sb.append("max_clients=").append(mc == null ? 0 : mc).append("\n");
+            } catch (Throwable t2) {
+                sb.append("max_clients=0\n");
+            }
         }
         System.out.print(sb);
     }
@@ -379,14 +567,12 @@ public class SoftApBridge {
 
         // Wi-Fi 服务与读取能力
         boolean wifiOk = false;
-        boolean getOk = false;
         try {
             Object svc = wifiService();
             wifiOk = true;
             try {
                 svc.getClass().getMethod("getSoftApConfiguration");
                 Object cfg = svc.getClass().getMethod("getSoftApConfiguration").invoke(svc);
-                getOk = true;
                 sb.append("get_config=1\n");
                 sb.append("get_config_has_data=").append(cfg != null ? 1 : 0).append("\n");
             } catch (NoSuchMethodException e) {
@@ -446,12 +632,28 @@ public class SoftApBridge {
                 "band_6g", "BAND_6GHZ",
                 "band_any", "BAND_ANY");
 
-        // SoftApCapability（API 30+，信道/最大客户端硬件能力）
+        // SoftApCapability 类存在 + SoftApCallback 注册路径（软AP能力走 callback，不猜 getSoftApCapabilities）
         try {
             Class.forName("android.net.wifi.SoftApCapability");
             sb.append("softap_capability=1\n");
         } catch (ClassNotFoundException e) {
             sb.append("softap_capability=0\n");
+        }
+        try {
+            Object svc = wifiService();
+            boolean cbReg = false;
+            Class<?> cbCls = Class.forName("android.net.wifi.IWifiManagerSoftApCallback");
+            for (Method cand : svc.getClass().getMethods()) {
+                if (cand.getName().equals("registerSoftApCallback")
+                        && cand.getParameterTypes().length >= 1
+                        && cand.getParameterTypes()[0].isAssignableFrom(cbCls)) {
+                    cbReg = true;
+                    break;
+                }
+            }
+            sb.append("softap_callback=").append(cbReg ? 1 : 0).append("\n");
+        } catch (Throwable t) {
+            sb.append("softap_callback=0\n");
         }
 
         // 密码是否可读回（部分 ROM 读回为空；决定保存后是否校验密码）
@@ -467,60 +669,45 @@ public class SoftApBridge {
             sb.append("password_readable=0\n");
         }
 
-        // 系统 Tethering 能力：IConnectivityManager.startTethering/stopTethering（API 26+，无需 cmd connectivity 子命令）
+        // 系统 Tethering 能力：Modern（ITetheringConnector）优先，Legacy（IConnectivityManager）兜底
         try {
-            Object svc = connectivityService();
-            try {
-                svc.getClass().getMethod("startTethering", int.class, boolean.class,
-                        Class.forName("android.net.IOnStartTetheringCallback"), int.class);
-                sb.append("tether_start_cm=1\n");
-            } catch (NoSuchMethodException e) {
-                sb.append("tether_start_cm=0\n");
+            Object tc = tetheringConnector();
+            boolean st = false, sp = false;
+            Class<?> exCls = java.util.concurrent.Executor.class;
+            for (Method cand : tc.getClass().getMethods()) {
+                if (!cand.getName().equals("startTethering")) continue;
+                Class<?>[] pts = cand.getParameterTypes();
+                if (pts.length >= 3 && pts[0] == int.class && (pts[1] == exCls || pts[2] == exCls)) st = true;
             }
             try {
-                svc.getClass().getMethod("stopTethering", int.class);
-                sb.append("tether_stop_cm=1\n");
-            } catch (NoSuchMethodException e) {
-                sb.append("tether_stop_cm=0\n");
-            }
+                tc.getClass().getMethod("stopTethering", int.class);
+                sp = true;
+            } catch (NoSuchMethodException e) { /* ignore */ }
+            sb.append("tether_connector=1\n");
+            sb.append("tether_connector_start=").append(st ? 1 : 0).append("\n");
+            sb.append("tether_connector_stop=").append(sp ? 1 : 0).append("\n");
         } catch (Throwable t) {
-            sb.append("tether_start_cm=0\ntether_stop_cm=0\n");
+            sb.append("tether_connector=0\n");
+            try {
+                Object svc = connectivityService();
+                try {
+                    svc.getClass().getMethod("startTethering", int.class, boolean.class,
+                            Class.forName("android.net.IOnStartTetheringCallback"), int.class);
+                    sb.append("tether_start_cm=1\n");
+                } catch (NoSuchMethodException e) {
+                    sb.append("tether_start_cm=0\n");
+                }
+                try {
+                    svc.getClass().getMethod("stopTethering", int.class);
+                    sb.append("tether_stop_cm=1\n");
+                } catch (NoSuchMethodException e) {
+                    sb.append("tether_stop_cm=0\n");
+                }
+            } catch (Throwable t2) {
+                sb.append("tether_start_cm=0\ntether_stop_cm=0\n");
+            }
         }
 
-        // 设备支持信道列表（SoftApCapabilities.getSupportedChannelList(band)，API 30+；获取不到则 Web 只显示"自动"）
-        try {
-            Object svc = wifiService();
-            Object caps = svc.getClass().getMethod("getSoftApCapabilities").invoke(svc);
-            if (caps != null) {
-                Method cml = caps.getClass().getMethod("getSupportedChannelList", int.class);
-                int[] bands = new int[]{1, 2, 4};
-                String[] keys = new String[]{"channels2g", "channels5g", "channels6g"};
-                for (int i = 0; i < bands.length; i++) {
-                    Object list = cml.invoke(caps, Integer.valueOf(bands[i]));
-                    StringBuilder line = new StringBuilder(keys[i] + "=");
-                    if (list instanceof java.util.List) {
-                        java.util.List<?> l = (java.util.List<?>) list;
-                        if (l == null || l.isEmpty()) {
-                            line.append("empty");
-                        } else {
-                            for (int j = 0; j < l.size(); j++) {
-                                if (j > 0) line.append(",");
-                                line.append(l.get(j));
-                            }
-                        }
-                    } else {
-                        line.append("empty");
-                    }
-                    sb.append(line).append("\n");
-                }
-            } else {
-                sb.append("channels2g=empty\nchannels5g=empty\nchannels6g=empty\n");
-            }
-        } catch (NoSuchMethodException e) {
-            sb.append("channels2g=empty\nchannels5g=empty\nchannels6g=empty\n");
-        } catch (Throwable t) {
-            sb.append("channels2g=empty\nchannels5g=empty\nchannels6g=empty\n");
-        }
         System.out.print(sb);
     }
 

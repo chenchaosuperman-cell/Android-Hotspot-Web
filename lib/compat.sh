@@ -91,7 +91,29 @@ EOF
   return 0
 }
 
-# cmd wifi 的 start-softap/stop-softap 可用性（仅决定 fallback 启停能力）
+# # Binder Bridge：SoftApCapability 实测（SoftApCallback.onCapabilityChanged，非反射猜方法）
+# 成功时设置 BRIDGE_SC_CAPS=1 + BRIDGE_SC_CH2G/CH5G/CH6G/BRIDGE_SC_MAX；失败置 0。
+sys_bridge_softap_caps() {
+  BRIDGE_SC_CAPS=0; BRIDGE_SC_CH2G=; BRIDGE_SC_CH5G=; BRIDGE_SC_CH6G=; BRIDGE_SC_MAX=0
+  bridge_available || return 1
+  SC_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge softap-capability 2>/dev/null)
+  [ -n "$SC_OUT" ] || return 1
+  while IFS= read -r PL; do
+    case "$PL" in
+      caps=1) BRIDGE_SC_CAPS=1 ;;
+      channels2g=*) BRIDGE_SC_CH2G=${PL#channels2g=} ;;
+      channels5g=*) BRIDGE_SC_CH5G=${PL#channels5g=} ;;
+      channels6g=*) BRIDGE_SC_CH6G=${PL#channels6g=} ;;
+      max_clients=*) BRIDGE_SC_MAX=${PL#max_clients=} ;;
+    esac
+  done <<EOF
+$SC_OUT
+EOF
+  case "$BRIDGE_SC_MAX" in ''|*[!0-9]*) BRIDGE_SC_MAX=0 ;; esac
+  return 0
+}
+
+cmd wifi 的 start-softap/stop-softap 可用性（仅决定 fallback 启停能力）
 sys_cmd_wifi_caps() {
   CMDW_START=0; CMDW_STOP=0
   if command -v "$CMD_WIFI" >/dev/null 2>&1; then
@@ -161,8 +183,20 @@ hotspot_detect_capabilities() {
     START_STOP=1
   fi
 
-  # 信道能力：由设备 SoftApCapability 实测（SoftApCapabilities.getSupportedChannelList），
-  # 无列表时 Web 只显示"自动"
+  # 信道能力：由设备 SoftApCapability 实测（SoftApCallback.onCapabilityChanged →
+  # SoftApCapability.getSupportedChannelList），无列表时 Web 只显示"自动"
+  # 动态最大客户端数：SoftApCapability 实测，>0 时前端据此动态设置上限
+  MAX_CLIENTS_LIMIT=0
+  if [ "$BRIDGE_P_WIFI" = "1" ]; then
+    if sys_bridge_softap_caps; then
+      if [ "$BRIDGE_SC_CAPS" = "1" ]; then
+        BRIDGE_P_CH2G=$BRIDGE_SC_CH2G
+        BRIDGE_P_CH5G=$BRIDGE_SC_CH5G
+        BRIDGE_P_CH6G=$BRIDGE_SC_CH6G
+        MAX_CLIENTS_LIMIT=$BRIDGE_SC_MAX
+      fi
+    fi
+  fi
   CH_JSON_2G=[$(list_to_json "$BRIDGE_P_CH2G")]
   CH_JSON_5G=[$(list_to_json "$BRIDGE_P_CH5G")]
   CH_JSON_6G=[$(list_to_json "$BRIDGE_P_CH6G")]
@@ -172,7 +206,7 @@ hotspot_detect_capabilities() {
   [ "$READ_CFG" = "1" ] && SYNC_LEVEL=B
   [ "$WRITE_CFG" = "1" ] && SYNC_LEVEL=A
 
-  HOTSPOT_CAPS_JSON=$(printf '{"android":%s,"startStop":%s,"readConfig":%s,"writeConfig":%s,"band2g":%s,"band5g":%s,"band6g":%s,"hiddenSsid":%s,"channelControl":%s,"maxClients":%s,"channels2g":%s,"channels5g":%s,"channels6g":%s,"syncLevel":"%s"}' \
+  HOTSPOT_CAPS_JSON=$(printf '{"android":%s,"startStop":%s,"readConfig":%s,"writeConfig":%s,"band2g":%s,"band5g":%s,"band6g":%s,"hiddenSsid":%s,"channelControl":%s,"maxClients":%s,"maxClientsLimit":%s,"channels2g":%s,"channels5g":%s,"channels6g":%s,"syncLevel":"%s"}' \
     "$API" \
     "$([ "$START_STOP" = "1" ] && echo true || echo false)" \
     "$([ "$READ_CFG" = "1" ] && echo true || echo false)" \
@@ -183,6 +217,7 @@ hotspot_detect_capabilities() {
     "$([ "$HIDDEN_OK" = "1" ] && echo true || echo false)" \
     "$([ "$CH_CTL" = "1" ] && echo true || echo false)" \
     "$([ "$MAX_CTL" = "1" ] && echo true || echo false)" \
+    "$MAX_CLIENTS_LIMIT" \
     "$CH_JSON_2G" \
     "$CH_JSON_5G" \
     "$CH_JSON_6G" \

@@ -33,18 +33,38 @@ web_fw_ifaces() {
   printf 'rndis0\nusb0\n'
 }
 
-# 清理指定端口的全部 Web 管理访问规则（DROP 兜底 + 各放行接口）
+# v1.7.7：Web 防火墙独立链 MIFI_WEB（INPUT → MIFI_WEB）。
+# 链内 lo / 热点接口 / USB 共享 ACCEPT，其余接口管理端口 DROP，链尾 RETURN；
+# 独立链避免“系统 INPUT 前置 ACCEPT 先命中、末尾 DROP 不生效”的顺序问题；
+# IPv4/IPv6 同步维护；端口变更时先清旧端口规则。
 clear_web_fw() {
   [ -n "$1" ] || return 0
+  local N IFACE
+  N=0
+  while [ "$N" -lt 20 ] && $IPT -C INPUT -j MIFI_WEB 2>/dev/null; do
+    $IPT -D INPUT -j MIFI_WEB 2>/dev/null
+    N=$((N + 1))
+  done
+  $IPT -F MIFI_WEB 2>/dev/null || true
+  $IPT -X MIFI_WEB 2>/dev/null || true
+  if command -v "$IPT6" >/dev/null 2>&1; then
+    N=0
+    while [ "$N" -lt 20 ] && $IPT6 -C INPUT -j MIFI_WEB 2>/dev/null; do
+      $IPT6 -D INPUT -j MIFI_WEB 2>/dev/null
+      N=$((N + 1))
+    done
+    $IPT6 -F MIFI_WEB 2>/dev/null || true
+    $IPT6 -X MIFI_WEB 2>/dev/null || true
+  fi
+  # 旧版（v1.7.2-v1.7.6）直插 INPUT 规则清理（升级残留）
   $IPT -D INPUT -p tcp --dport "$1" -j DROP 2>/dev/null
   $IPT -D INPUT -i lo -p tcp --dport "$1" -j ACCEPT 2>/dev/null
-  local IFACE
   for IFACE in $(web_fw_ifaces); do
     $IPT -D INPUT -i "$IFACE" -p tcp --dport "$1" -j ACCEPT 2>/dev/null
   done
 }
 
-# 幂等保活：端口未变时补齐缺失规则；端口变更时先清理旧端口再应用新端口
+# 幂等保活：端口未变时补齐缺失规则；端口变更时先清旧端口再应用新端口
 ensure_web_fw() {
   [ -n "$PORT" ] || PORT=8080
   local prev
@@ -52,13 +72,31 @@ ensure_web_fw() {
   if [ -n "$prev" ] && [ "$prev" != "$PORT" ]; then
     clear_web_fw "$prev"
   fi
-  $IPT -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || $IPT -A INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null
-  $IPT -C INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+  # IPv4：INPUT 首位跳转独立链
+  $IPT -N MIFI_WEB 2>/dev/null || { $IPT -F MIFI_WEB 2>/dev/null; }
+  $IPT -F MIFI_WEB 2>/dev/null
+  $IPT -A MIFI_WEB -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
   local IFACE
   for IFACE in $(web_fw_ifaces); do
     [ -n "$IFACE" ] || continue
-    $IPT -C INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || $IPT -I INPUT -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+    $IPT -A MIFI_WEB -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
   done
+  $IPT -A MIFI_WEB -p tcp --dport "$PORT" -j DROP 2>/dev/null
+  $IPT -A MIFI_WEB -j RETURN 2>/dev/null
+  $IPT -C INPUT -j MIFI_WEB 2>/dev/null || $IPT -I INPUT 1 -j MIFI_WEB 2>/dev/null
+  # IPv6 同步
+  if command -v "$IPT6" >/dev/null 2>&1; then
+    $IPT6 -N MIFI_WEB 2>/dev/null || { $IPT6 -F MIFI_WEB 2>/dev/null; }
+    $IPT6 -F MIFI_WEB 2>/dev/null
+    $IPT6 -A MIFI_WEB -i lo -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+    for IFACE in $(web_fw_ifaces); do
+      [ -n "$IFACE" ] || continue
+      $IPT6 -A MIFI_WEB -i "$IFACE" -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+    done
+    $IPT6 -A MIFI_WEB -p tcp --dport "$PORT" -j DROP 2>/dev/null
+    $IPT6 -A MIFI_WEB -j RETURN 2>/dev/null
+    $IPT6 -C INPUT -j MIFI_WEB 2>/dev/null || $IPT6 -I INPUT 1 -j MIFI_WEB 2>/dev/null
+  fi
   printf '%s\n' "$PORT" > "$WEB_FW_PORT_FILE" 2>/dev/null
   chmod 0600 "$WEB_FW_PORT_FILE" 2>/dev/null
 }
@@ -566,7 +604,9 @@ get_management_ip() {
   if /system/bin/ip -o -4 addr show dev "$iface" 2>/dev/null | "$BB" grep -q " $STABLE_IP/"; then
     printf '%s' "$STABLE_IP"
   else
-    get_iface_ip "$iface"
+    # v1.7.7：固定管理地址为兼容性硬性要求，不降级为系统热点网关；
+    # 调用方在输出 unavailable 时提示“未通过兼容性验证”。
+    printf 'unavailable'
   fi
 }
 
@@ -626,9 +666,9 @@ valid_channel() {
       hotspot_get_capabilities >/dev/null 2>&1
       LIST=
       case "$band" in
-        2) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels2g":\[\([0-9,]*\)\].*//p') ;;
-        5) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels5g":\[\([0-9,]*\)\].*//p') ;;
-        6) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels6g":\[\([0-9,]*\)\].*//p') ;;
+        2) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels2g":\[\([0-9,]*\)\].*/\1/p') ;;
+        5) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels5g":\[\([0-9,]*\)\].*/\1/p') ;;
+        6) LIST=$(printf '%s' "$HOTSPOT_CAPS_JSON" | "$BB" sed -n 's/.*"channels6g":\[\([0-9,]*\)\].*/\1/p') ;;
       esac
       if [ -n "$LIST" ]; then
         case ",$LIST," in *",$channel,"*) return 0 ;; esac
@@ -869,44 +909,60 @@ run_softap() {
 }
 
 
-# ---------- 客户端 MAC 访问策略（黑名单 DROP / 白名单仅放行） ----------
-apply_blacklist() {
-  iface=$1
-  [ -z "$iface" ] && return 0
-  if [ "${MAC_MODE:-blacklist}" = "whitelist" ]; then
-    apply_whitelist "$iface"
-    return $?
-  fi
-  # P0-43：只 DROP FORWARD（禁止上网），不再 DROP INPUT——否则会连管理页/手机本机访问一起阻断
-  # P1-44：逐条验证规则是否真正添加，任一失败记日志（调用方可据此返回“保存但未生效”）
-  for mac in $BLOCKED_MACS; do
-    valid_mac "$mac" || continue
-    if ! $IPT -C FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; then
-      if ! $IPT -I FORWARD 1 -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; then
-        echo "$(date) blacklist: 添加规则失败 mac=$mac iface=$iface" >> "$LOG"
-      fi
-    fi
-  done
+# ---------- 客户端 MAC 访问策略（黑名单/白名单统一专用链 mifi_acl，v1.7.7） ----------
+# 黑名单、白名单共用 FORWARD → mifi_acl；策略变化时 flush+重建，不做“猜旧规则逐条删”，
+# 修复 whitelist→blacklist 切换时旧链残留导致规则仍生效的问题；IPv6 同步管控。
+rebuild_acl_chain() {
+  # 先删后建（幂等）：清内容 → 删链 → 重建 → 再清空
+  $IPT -F mifi_acl 2>/dev/null || true
+  $IPT -X mifi_acl 2>/dev/null || true
+  $IPT -N mifi_acl 2>/dev/null || { $IPT -F mifi_acl 2>/dev/null; }
+  $IPT -F mifi_acl 2>/dev/null
 }
 
-# 白名单模式：专用链 mifi_acl，白名单 MAC RETURN 放行，其余 DROP。
-# 跳转插在 FORWARD 首位（先于 mifi_stats 计数链），RETURN 后继续走后续规则。
-apply_whitelist() {
+apply_mac_policy() {
   iface=$1
   [ -z "$iface" ] && return 0
-  $IPT -N mifi_acl 2>/dev/null || { $IPT -F mifi_acl 2>/dev/null; }
-  for mac in $ALLOWED_MACS; do
-    valid_mac "$mac" || continue
-    $IPT -C mifi_acl -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null || \
-      $IPT -A mifi_acl -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null
+  N=0
+  while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -j mifi_acl 2>/dev/null; do
+    $IPT -D FORWARD -i "$iface" -j mifi_acl 2>/dev/null
+    N=$((N + 1))
   done
-  $IPT -C mifi_acl -j DROP 2>/dev/null || $IPT -A mifi_acl -j DROP 2>/dev/null
-  $IPT -C FORWARD -i "$iface" -j mifi_acl 2>/dev/null || \
-    $IPT -I FORWARD 1 -i "$iface" -j mifi_acl 2>/dev/null
+  rebuild_acl_chain
+  if [ "${MAC_MODE:-blacklist}" = "whitelist" ]; then
+    # 白名单：允许 MAC RETURN 放行，其余 DROP 兜底
+    for mac in $ALLOWED_MACS; do
+      valid_mac "$mac" || continue
+      $IPT -A mifi_acl -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null
+    done
+    $IPT -A mifi_acl -j DROP 2>/dev/null
+    fw6_ensure
+  else
+    # 黑名单：名单 MAC DROP，其余 RETURN 兜底（不阻断正常流量）
+    for mac in $BLOCKED_MACS; do
+      valid_mac "$mac" || continue
+      $IPT -A mifi_acl -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
+    done
+    $IPT -A mifi_acl -j RETURN 2>/dev/null
+    [ -n "$BLOCKED_MACS" ] && fw6_ensure
+  fi
+  $IPT -I FORWARD 1 -i "$iface" -j mifi_acl 2>/dev/null
   return 0
 }
 
-# 清理黑名单模式的 FORWARD/INPUT DROP 规则（对 BLOCKED_MACS 逐条清理，上限 20 防死循环）
+apply_blacklist() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  apply_mac_policy "$iface"
+}
+
+apply_whitelist() {
+  iface=$1
+  [ -z "$iface" ] && return 0
+  apply_mac_policy "$iface"
+}
+
+# 清理旧版（v1.7.6 及更早）直插 FORWARD/INPUT DROP 规则（升级/接口变化时兼容清理）
 clear_blacklist_rules() {
   iface=$1
   [ -z "$iface" ] && return 0
@@ -917,7 +973,6 @@ clear_blacklist_rules() {
       $IPT -D FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
       N=$((N + 1))
     done
-    # 兼容旧版 INPUT 规则（v1.5.9 及更早）：同样循环清理，避免残留
     N=0
     while [ "$N" -lt 20 ] && $IPT -C INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
       $IPT -D INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
@@ -926,7 +981,7 @@ clear_blacklist_rules() {
   done
 }
 
-# 清理白名单专用链 mifi_acl：先删 FORWARD 跳转，再清链删除
+# 清理 mifi_acl 链：先删 FORWARD 跳转，再清链删除
 clear_mac_acl() {
   iface=$1
   [ -z "$iface" ] && return 0
@@ -937,9 +992,10 @@ clear_mac_acl() {
   done
   $IPT -F mifi_acl 2>/dev/null || true
   $IPT -X mifi_acl 2>/dev/null || true
+  fw6_clear
 }
 
-# 全量清理（热点停止/接口变化等场景）：黑名单 DROP 规则 + 白名单链
+# 全量清理（热点停止/接口变化等场景）：旧直插规则 + 专用链 + IPv6
 clear_blacklist() {
   iface=$1
   [ -z "$iface" ] && return 0
@@ -947,25 +1003,16 @@ clear_blacklist() {
   clear_mac_acl "$iface"
 }
 
-# 统一应用 MAC 访问策略：先清旧策略残留（黑名单 DROP + 白名单链），再按当前模式重建。
-# 修复 whitelist→blacklist 切换时 mifi_acl 残留导致旧白名单仍生效的问题。
-apply_mac_policy() {
-  iface=$1
-  [ -z "$iface" ] && return 0
-  clear_blacklist_rules "$iface"
-  clear_mac_acl "$iface"
-  if [ "${MAC_MODE:-blacklist}" = "whitelist" ]; then
-    apply_whitelist "$iface"
-  else
-    apply_blacklist "$iface"
-  fi
-  return 0
-}
-
+# 单设备解禁：新实现（mifi_acl 链内删）+ 旧版直插规则兼容
 unblock_one_mac() {
   iface=$1
   mac=$2
   valid_mac "$mac" || return 1
+  N=0
+  while [ "$N" -lt 20 ] && $IPT -C mifi_acl -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
+    $IPT -D mifi_acl -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
+    N=$((N + 1))
+  done
   N=0
   while [ "$N" -lt 20 ] && $IPT -C FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null; do
     $IPT -D FORWARD -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
@@ -976,6 +1023,31 @@ unblock_one_mac() {
     $IPT -D INPUT -i "$iface" -m mac --mac-source "$mac" -j DROP 2>/dev/null
     N=$((N + 1))
   done
+}
+
+# ---------- IPv6 管控（方案 B） ----------
+# Android Tethering 双栈：MAC ACL / 透明代理为 IPv4 规则，无法约束 IPv6。
+# 启用名单管控时显式 DROP 热点 downstream IPv6（FORWARD 方向，不影响本机/上游），
+# 避免“IPv4 已禁、IPv6 仍通”；管控全部关闭时由 fw6_clear 恢复。
+fw6_ensure() {
+  command -v "$IPT6" >/dev/null 2>&1 || return 0
+  $IPT6 -N mifi_ipv6 2>/dev/null || { $IPT6 -F mifi_ipv6 2>/dev/null; }
+  $IPT6 -F mifi_ipv6 2>/dev/null
+  $IPT6 -A mifi_ipv6 -j DROP 2>/dev/null
+  $IPT6 -C FORWARD -j mifi_ipv6 2>/dev/null || $IPT6 -I FORWARD 1 -j mifi_ipv6 2>/dev/null
+  return 0
+}
+
+fw6_clear() {
+  command -v "$IPT6" >/dev/null 2>&1 || return 0
+  N=0
+  while [ "$N" -lt 20 ] && $IPT6 -C FORWARD -j mifi_ipv6 2>/dev/null; do
+    $IPT6 -D FORWARD -j mifi_ipv6 2>/dev/null
+    N=$((N + 1))
+  done
+  $IPT6 -F mifi_ipv6 2>/dev/null || true
+  $IPT6 -X mifi_ipv6 2>/dev/null || true
+  return 0
 }
 
 # ---------- 客户端流量统计（FORWARD 计数链） ----------

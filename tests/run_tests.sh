@@ -300,9 +300,14 @@ softap_capability=1
 password_readable=1
 tether_start_cm=1
 tether_stop_cm=1
+EOF
+SC_FILE="$TMP_SYS_DIR/softap_caps.txt"
+cat > "$SC_FILE" <<'EOF'
+caps=1
 channels2g=1,3,6,9,11
 channels5g=36,40,44,48,149,153
 channels6g=empty
+max_clients=32
 EOF
 printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
 cat > "$MOCKBIN/app_process" <<EOF
@@ -314,7 +319,7 @@ for a in "\$@"; do
   if [ "\$FOUND" = "1" ]; then
     if [ -z "\$ARGS" ]; then ARGS="\$a"; else ARGS="\$ARGS|\$a"; fi
   else
-    case "\$a" in get-config|set-config|probe|tether-state|tether-start|tether-stop) CMD=\$a; FOUND=1 ;; esac
+    case "\$a" in get-config|set-config|probe|tether-state|tether-start|tether-stop|softap-capability) CMD=\$a; FOUND=1 ;; esac
   fi
 done
 case "\$CMD" in
@@ -335,6 +340,9 @@ EOF2
     ;;
   probe)
     cat "$PROBE_FILE"
+    ;;
+  softap-capability)
+    cat "$SC_FILE"
     ;;
   tether-state)
     printf 'tethered=1\nifaces=wlan0\ntether_state=2\n'
@@ -475,6 +483,7 @@ case "$CAPS" in *'"hiddenSsid":true'*) ok 'caps Builder setHiddenSsid → hidden
 case "$CAPS" in *'"channels2g":[1,3,6,9,11]'*) ok 'caps 信道列表实测（channels2g）' 0 ;; *) ok 'caps 信道列表实测（channels2g）' 1 ;; esac
 case "$CAPS" in *'"channels5g":[36,40,44,48,149,153]'*) ok 'caps 信道列表实测（channels5g）' 0 ;; *) ok 'caps 信道列表实测（channels5g）' 1 ;; esac
 case "$CAPS" in *'"channels6g":[]'*) ok 'caps 6G 无信道列表 → 空数组' 0 ;; *) ok 'caps 6G 无信道列表 → 空数组' 1 ;; esac
+case "$CAPS" in *'"maxClientsLimit":32'*) ok 'caps SoftApCapability 实测最大客户端 maxClientsLimit=32' 0 ;; *) ok 'caps SoftApCapability 实测最大客户端 maxClientsLimit=32' 1 ;; esac
 # 降级：setSoftApConfiguration 仅 1 参变体、无 setPassphrase(String,int) → writeConfig 仍可（兼容路径）
 # 降级：set_config_2arg=0 且 Builder 无密码方法 → writeConfig=false / syncLevel=B
 cat > "$PROBE_FILE" <<'EOF'
