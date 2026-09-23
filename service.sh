@@ -544,6 +544,26 @@ while true; do
       fi
     fi
 
+    # v1.7.9：自建 DHCP 守护——热点开着但 udhcpd 意外退出时自动拉起。
+    # 背景：udhcpd 是模块自建 DHCP（热点半开兜底），只在热点启动时拉起一次；
+    # 若中途被系统回收/异常退出，新设备连热点拿不到 IP（表现为能连 WiFi 但没网、
+    # 后台也进不去）。busybox 多进程进程名不叫 udhcpd，须按 cmdline 含配置路径判断。
+    if [ -n "$IFACE" ]; then
+      DHCP_ALIVE=0
+      for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
+        CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
+        case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) DHCP_ALIVE=1 ;; esac
+      done
+      if [ "$DHCP_ALIVE" = 0 ]; then
+        # 接口上有系统 DHCP 网段地址时不干预（ensure 内部同判；此处少一次空转）
+        SYS_IP=$(/system/bin/ip -o -4 addr show dev "$IFACE" 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '{split($4,a,"/"); if (a[1]!=s) {print a[1]; exit}}')
+        if [ -z "$SYS_IP" ]; then
+          echo "$(date) dhcp-watch: udhcpd not running, re-ensuring" >> "$LOG" 2>/dev/null
+          ensure_hotspot_dhcp "$IFACE" >/dev/null 2>&1
+        fi
+      fi
+    fi
+
     # 保活：期望开启但热点掉了就重启（保活关闭时不自动重启）
     if [ "$DESIRED" = "1" ] && [ "$KEEPALIVE" = "1" ] && [ -z "$IFACE" ] && [ ! -e "$MANUAL_OFF_FILE" ]; then
       echo "$(date) SoftAP is down while desired; restarting" >> "$LOG"

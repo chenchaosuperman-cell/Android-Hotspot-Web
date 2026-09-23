@@ -669,8 +669,12 @@ ensure_hotspot_dhcp() {
     printf 'opt router %s\n' "$STABLE_IP"
     printf 'opt dns 8.8.8.8 8.8.4.4\n'
     printf 'opt lease 86400\n'
+    printf 'lease_file %s/udhcpd.leases\n' "$DATA_DIR"
   } > "$DATA_DIR/udhcpd.conf" 2>/dev/null
-  rm -f "$DATA_DIR/udhcpd.leases" "$DATA_DIR/udhcpd.pid" 2>/dev/null
+  # 预创建 lease 文件：/var 在 Android 上只读，默认路径打不开；
+  # 用数据目录下的文件（busybox 打开失败仅警告不退出，但预建后无噪音且可持久化租约）
+  : > "$DATA_DIR/udhcpd.leases" 2>/dev/null
+  rm -f "$DATA_DIR/udhcpd.pid" 2>/dev/null
   "$BB" udhcpd -f "$DATA_DIR/udhcpd.conf" >> "$DATA_DIR/udhcpd.log" 2>&1 &
   echo "$(date) ensure_hotspot_dhcp: self-built DHCP/NAT on $iface (upstream $UP, subnet ${STABLE_IP%.*}.0/24)" >> "$LOG" 2>/dev/null
   return 0
