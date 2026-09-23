@@ -550,7 +550,12 @@ while true; do
     # 背景2（路由）：Android 热点重启/网络变化会清空 local_network 等路由表，转发流量
     # （客户端→热点）查表落到 unreachable → 能连 WiFi 但完全无外网。需从上游接口所在
     # 表取默认路由补进 local_network（fwmark=0 转发流量的查询表），并每轮确保。
-    if [ -n "$IFACE" ]; then
+    if [ -n "$IFACE_C" ]; then
+      # 1) 回程链路路由（关键）：Android 热点重启会清空 local_network 表；若缺
+      #    $STABLE_IP/24 的链路路由，回程应答（SYN-ACK/DNS 响应等）查表走 default
+      #    出 wlan0 直接丢包 → 客户端 TCP 全卡 SYN_RECV、页面打不开。必须补链路路由。
+      /system/bin/ip route replace "$STABLE_IP"/24 dev "$IFACE_C" table local_network 2>/dev/null
+      # 2) 出方向默认路由：从上游接口所在表取默认路由补进 local_network
       if ! /system/bin/ip route show table local_network 2>/dev/null | "$BB" grep -q '^default'; then
         UP=$(get_upstream_iface)
         if [ -n "$UP" ]; then
@@ -565,10 +570,10 @@ while true; do
       done
       if [ "$DHCP_ALIVE" = 0 ]; then
         # 接口上有系统 DHCP 网段地址时不干预（ensure 内部同判；此处少一次空转）
-        SYS_IP=$(/system/bin/ip -o -4 addr show dev "$IFACE" 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '{split($4,a,"/"); if (a[1]!=s) {print a[1]; exit}}')
+        SYS_IP=$(/system/bin/ip -o -4 addr show dev "$IFACE_C" 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '{split($4,a,"/"); if (a[1]!=s) {print a[1]; exit}}')
         if [ -z "$SYS_IP" ]; then
           echo "$(date) dhcp-watch: udhcpd not running, re-ensuring" >> "$LOG" 2>/dev/null
-          ensure_hotspot_dhcp "$IFACE" >/dev/null 2>&1
+          ensure_hotspot_dhcp "$IFACE_C" >/dev/null 2>&1
         fi
       fi
     fi
