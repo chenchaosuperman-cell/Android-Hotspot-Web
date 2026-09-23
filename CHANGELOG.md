@@ -1,3 +1,20 @@
+# v1.7.8-beta（2026-09-23）热点状态误判修复 + 平板/大屏响应式
+
+> 依据《v1.7.5-beta 热点状态误判 + 平板 UI 兼容修复任务》：修复「SoftAP 实际启动成功（state=13 / failure reason=0）却被误判为失败」与「平板/大屏仍按约 430px 手机宽度显示」。本版不动视觉风格与代理/短信/流量/MAC/通知/定时等业务功能。
+
+- **SoftAP 状态按 Framework state 判定（P0）**：统一映射 `10=DISABLING / 11=DISABLED / 12=ENABLING / 13=ENABLED / 14=FAILED`；`failure reason: 0` 表示无失败原因，绝不判失败；启动序列 `11→12→13` 属正常，最终状态优先（取最后一次 `onStateChanged`）。
+- **hotspot_get_state 四级优先**：`Bridge softap-state（真实回调数值）→ dumpsys 快照（新增 onStateChanged state 解析）→ Bridge tether-state → 接口探测兜底`；业务层不再自行猜 `wlan*/ap*` 接口名。
+- **SoftApBridge 新增 `softap-state` 命令**：复用 SoftApCallback 注册模式（2.5s latch），`onStateChanged` 输出真实状态数值 `softap_state=<0-14或-1>`；dex 已重编（21,260B）。
+- **启动确认提前失败**：`wait_tether_enabled()` 轮询到 `state=14` 立即判失败，不再等超时才报错。
+- **hotspot_stop 拒绝"假成功"（P0）**：8 秒轮询未确认 DISABLED 时再查 Bridge tether-state 真实状态，仍激活则 `return 1`（绝不超时就假装关闭成功）。
+- **状态出口统一**：`status.cgi` 新增 `hotspotState`（ON/STARTING/OFF/STOPPING/ERROR/UNKNOWN）；Header badge 与首页卡片共用同一状态渲染，点击开启先置 STARTING、最终 13→ON / 14→ERROR，中间 11/12 不来回覆盖（防抖）。
+- **错误文案简洁化**：`control.cgi` 启动失败只显示首行 80 字符 + 「详见诊断/日志页」，不再把整段系统 callback/Capability 原文塞进红色错误框；完整原始输出仍写入模块日志。
+- **平板/大屏响应式**：`.wrap` 手机单列 → `≥600px` 居中 `max-width:960px`（两列 grid）→ `≥1024px` `max-width:1200px`；导航 6 项 grid 铺满；错误/警告卡片独占整行（`grid-column:1/-1`）；弹窗改 `.modal-box`（手机 `min(360px,100vw-32px)`、平板 `min(560px,100vw-64px)`）；长错误文本 `overflow-wrap:anywhere` 换行。
+- **最大连接数动态上限**：`maxClientsLimit`（SoftApCapability 实测）写入输入框 `max` 并显示「当前设备最大支持 N 台」，不再固定 32。
+- **回归测试 125 → 134 全部通过**（新增：softap-state 五态映射、failureReason=0 不判失败、启动序列最终状态、stop 超时拒绝假成功断言；mock 增加 `softap-state`/可控 `tether-state` 分支）。
+
+---
+
 # v1.7.7-beta（2026-09-23）Compatibility & Reliability
 
 > 本版不做新功能，专注兼容性、网络安全、状态一致性与卸载恢复（依据《v1.7.6-beta 全量审计报告》P0/P1 修复）。

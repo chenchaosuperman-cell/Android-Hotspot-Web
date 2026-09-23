@@ -1441,7 +1441,7 @@ softap_state_snapshot() {
       # 逐行白名单解析：只接受固定键，值做严格字符校验；SSID 走 Base64。
       while IFS='=' read -r C_KEY C_VAL; do
         case "$C_KEY" in
-          SNAP_AP_STATE) case "$C_VAL" in ENABLED|DISABLED|DISABLING|ENABLED_AND_SUSPENDED) SNAP_AP_STATE="$C_VAL" ;; esac ;;
+          SNAP_AP_STATE) case "$C_VAL" in ENABLED|DISABLED|DISABLING|ENABLING|FAILED|ENABLED_AND_SUSPENDED) SNAP_AP_STATE="$C_VAL" ;; esac ;;
           SNAP_AP_SSID_B64) case "$C_VAL" in ''|*[!A-Za-z0-9+/=-]*) : ;; *) SNAP_AP_SSID_B64="$C_VAL" ;; esac ;;
           SNAP_AP_SECURITY) case "$C_VAL" in ''|*[!0-9]*) : ;; *) SNAP_AP_SECURITY="$C_VAL" ;; esac ;;
           SNAP_AP_CHANNEL) case "$C_VAL" in ''|*[!0-9]*) : ;; *) SNAP_AP_CHANNEL="$C_VAL" ;; esac ;;
@@ -1467,6 +1467,23 @@ softap_state_snapshot() {
   # 本次采集失败时允许解析上次成功快照；没有快照则返回“未知”。
   [ -s "$SOFTAP_CACHE.out" ] || return 0
   AP_STATE=$("$BB" grep -o 'mWifiApState=[A-Z]*' "$SOFTAP_CACHE.out" | "$BB" head -n1 | "$BB" cut -d= -f2)
+  if [ -z "$AP_STATE" ]; then
+    # 部分 ROM（MTK/骁龙等）不打印 mWifiApState，仅输出 SoftApCallback 回调：
+    #   onStateChanged with state: 11 failure reason: 0 ... SAP is disabled
+    #   onStateChanged with state: 12 ... onStateChanged with state: 13 ... SAP is enabled successfully
+    # 统一映射：10=DISABLING 11=DISABLED 12=ENABLING 13=ENABLED 14=FAILED。
+    # 只取最后一次 state（最终状态优先，启动序列 11→12→13 以 13 为准）；
+    # "failure reason: 0" 表示无失败原因，绝不据此判失败。
+    AP_STATE_NUM=$("$BB" grep -o 'onStateChanged with state: *[0-9]*' "$SOFTAP_CACHE.out" \
+      | "$BB" tail -n1 | "$BB" grep -o '[0-9]*$')
+    case "$AP_STATE_NUM" in
+      10) AP_STATE=DISABLING ;;
+      11) AP_STATE=DISABLED ;;
+      12) AP_STATE=ENABLING ;;
+      13) AP_STATE=ENABLED ;;
+      14) AP_STATE=FAILED ;;
+    esac
+  fi
   # 尽力解析 SoftAP 配置段（Android 16/STA+AP 并发，mCurrentSoftApInfoMap 可能含多实例）
   # 只从 mCurrentSoftApConfiguration 或 WifiApConfigStore config 提取 SSID，
   # 避免把 bssid=、current SSID(s):、字段名 mCurrentSoftApInfoMap 误当 SSID。
@@ -1485,7 +1502,7 @@ softap_state_snapshot() {
   TMP="$SOFTAP_CACHE.$$"
   # SSID 经 Base64 存储，避免特殊字符破坏缓存文件；状态/安全/频段/信道只接受枚举或数字
   case "$AP_STATE" in
-    ENABLED|DISABLED|DISABLING|ENABLED_AND_SUSPENDED) : ;;
+    ENABLED|DISABLED|DISABLING|ENABLING|FAILED|ENABLED_AND_SUSPENDED) : ;;
     *) AP_STATE= ;;
   esac
   AP_SSID_B64=$(printf '%s' "$AP_SSID" | "$BB" base64 2>/dev/null | "$BB" tr -d '=\n')
@@ -1522,7 +1539,7 @@ softap_state_ok() {
     if [ "$SNAP_AGE" -ge 0 ] && [ "$SNAP_AGE" -lt 45 ] 2>/dev/null; then
       case "$SNAP_AP_STATE" in
         ENABLED) return 0 ;;
-        DISABLED) return 1 ;;
+        DISABLED|DISABLING|ENABLING|FAILED) return 1 ;;
       esac
     fi
     return 0
@@ -1530,7 +1547,7 @@ softap_state_ok() {
   softap_state_snapshot
   case "$SNAP_AP_STATE" in
     ENABLED) return 0 ;;
-    DISABLED) return 1 ;;
+    DISABLED|DISABLING|ENABLING|FAILED) return 1 ;;
   esac
   CMD_STS=$("$BB" timeout 5 "$CMD_WIFI" wifi status 2>/dev/null)
   case "$CMD_STS" in

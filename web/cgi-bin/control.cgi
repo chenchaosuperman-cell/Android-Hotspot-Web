@@ -115,8 +115,11 @@ restart_hotspot_async() {
         write_operation error "热点启动失败：$PARAM_ERR"
       fi
     else
-      [ -n "$OUT" ] || OUT="系统未分配热点接口地址"
-      write_operation error "热点启动失败：$OUT"
+      # v1.7.8：页面只展示简洁错误（不把原始 callback/dumpsys 输出塞进红色错误框）；
+      # 完整原始输出已写入 $LOG，可到 设置→诊断/日志 查看。
+      OUT_FIRST=$(printf '%s\n' "$OUT" | "$BB" sed -n '1p' | "$BB" cut -c1-80 2>/dev/null)
+      [ -n "$OUT_FIRST" ] || OUT_FIRST="系统未分配热点接口地址"
+      write_operation error "热点启动失败：$OUT_FIRST（详见诊断/日志页）"
     fi
     if [ "$OK" != "1" ]; then
       ensure_management_loopback

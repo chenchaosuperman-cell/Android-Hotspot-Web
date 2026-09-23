@@ -309,6 +309,14 @@ channels5g=36,40,44,48,149,153
 channels6g=empty
 max_clients=32
 EOF
+# v1.7.8：SoftAP Framework state 可控 mock（onStateChanged 数值 10-14）
+SOFTAP_STATE_FILE="$TMP_SYS_DIR/softap_state.txt"
+printf '13' > "$SOFTAP_STATE_FILE"
+export SOFTAP_STATE_FILE
+# v1.7.8：Tethering 状态可控 mock（stop 确认用）
+TETHER_STATE_FILE="$TMP_SYS_DIR/tether_state.txt"
+printf 'tethered=1\nifaces=wlan0\ntether_state=2\n' > "$TETHER_STATE_FILE"
+export TETHER_STATE_FILE
 printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
 cat > "$MOCKBIN/app_process" <<EOF
 #!/bin/sh
@@ -319,7 +327,7 @@ for a in "\$@"; do
   if [ "\$FOUND" = "1" ]; then
     if [ -z "\$ARGS" ]; then ARGS="\$a"; else ARGS="\$ARGS|\$a"; fi
   else
-    case "\$a" in get-config|set-config|probe|tether-state|tether-start|tether-stop|softap-capability) CMD=\$a; FOUND=1 ;; esac
+    case "\$a" in get-config|set-config|probe|tether-state|tether-start|tether-stop|softap-capability|softap-state) CMD=\$a; FOUND=1 ;; esac
   fi
 done
 case "\$CMD" in
@@ -344,8 +352,11 @@ EOF2
   softap-capability)
     cat "$SC_FILE"
     ;;
+  softap-state)
+    printf 'softap_state=%s\n' "\$(cat "\$SOFTAP_STATE_FILE")"
+    ;;
   tether-state)
-    printf 'tethered=1\nifaces=wlan0\ntether_state=2\n'
+    cat "\$TETHER_STATE_FILE"
     ;;
   tether-start)
     echo "tether-start|0" >> "$BRIDGE_LOG"
@@ -448,9 +459,43 @@ printf '%s' "Xiaomi14-MiFi|wpa2|87654321|any|0|0|0" > "$BRIDGE_STATE"
 # --- hotspot_stop：Bridge 系统 Tethering 停止优先 ---
 : > "$BRIDGE_LOG"
 : > "$MOCK_LOG"
-hotspot_stop
+STOP_CONFIRM_MAX=1 hotspot_stop
 "$BB" grep -q 'tether-stop' "$BRIDGE_LOG"; ok 'hotspot_stop 走 Bridge 系统 Tethering（tether-stop）' $?
 if "$BB" grep -q 'connectivity tether stop' "$MOCK_LOG"; then ok 'hotspot_stop 未依赖 cmd connectivity 子命令（bridge 优先）' 1; else ok 'hotspot_stop 未依赖 cmd connectivity 子命令（bridge 优先）' 0; fi
+
+# --- v1.7.8：SoftAP Framework state 判定（onStateChanged 数值，failureReason=0 不判失败）---
+printf '13' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq 'softap-state=13 → 热点已开启（ON）' 'ENABLED' "$SNAP_AP_STATE"
+printf '11' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq 'softap-state=11 → 热点已关闭（OFF）' 'DISABLED' "$SNAP_AP_STATE"
+printf '12' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq 'softap-state=12 → 正在开启（STARTING）' 'ENABLING' "$SNAP_AP_STATE"
+printf '10' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq 'softap-state=10 → 正在关闭（STOPPING）' 'DISABLING' "$SNAP_AP_STATE"
+printf '14' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq 'softap-state=14 → 启动失败（ERROR）' 'FAILED' "$SNAP_AP_STATE"
+# failure reason: 0 = 无失败原因，绝不判失败；输出中出现正常 callback 文本不影响最终判定
+printf '13' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq 'failureReason=0 时最终 state=13 仍判定已开启' 'ENABLED' "$SNAP_AP_STATE"
+# 启动序列 11→12→13：最终状态优先（等待确认阶段只认最终 state=13）
+printf '13' > "$SOFTAP_STATE_FILE"
+hotspot_get_state
+assert_eq '启动序列 11→12→13 最终判定已开启' 'ENABLED' "$SNAP_AP_STATE"
+
+# hotspot_stop：系统确认关闭才返回成功；超时仍开启 → 返回失败（不假装成功）
+printf 'tethered=0\nifaces=\ntether_state=0\n' > "$TETHER_STATE_FILE"
+STOP_CONFIRM_MAX=1 hotspot_stop
+assert_eq 'hotspot_stop 确认关闭 → rc=0' '0' "$?"
+printf 'tethered=1\nifaces=wlan0\ntether_state=2\n' > "$TETHER_STATE_FILE"
+printf '13' > "$SOFTAP_STATE_FILE"
+STOP_CONFIRM_MAX=1 hotspot_stop
+assert_eq 'hotspot_stop 超时仍开启 → rc=1（拒绝假成功）' '1' "$?"
 
 # 新版 SSID 标签（SoftApConfToXmlMigration 风格）
 cat > "$TMP_SYS_DIR/store3.xml" <<'XMLEOF'

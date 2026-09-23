@@ -29,12 +29,19 @@ case "$IP_LINES" in
   *" $STABLE_IP/"*) IP=$STABLE_IP ;;
   *) IP=$(printf '%s\n' "$IP_LINES" | "$BB" awk '{split($4,a,"/"); print a[1]; exit}') ;;
 esac
+# v1.7.8：统一热点状态（SoftAP Framework state 优先，failureReason=0 不判失败）
+# ON/STARTING/OFF/STOPPING/ERROR/UNKNOWN；Header 与首页共用 hotspotState。
+HOTSPOT_STATE=UNKNOWN
+hotspot_get_state
+case "$SNAP_AP_STATE" in
+  ENABLED) HOTSPOT_STATE=ON ;;
+  ENABLING) HOTSPOT_STATE=STARTING ;;
+  DISABLING) HOTSPOT_STATE=STOPPING ;;
+  DISABLED) HOTSPOT_STATE=OFF ;;
+  FAILED) HOTSPOT_STATE=ERROR ;;
+esac
 RUNNING=false
-if [ -n "$IFACE" ] && [ -n "$IP" ] && softap_state_ok "$IFACE" "$IP"; then
-  RUNNING=true
-else
-  RUNNING=false
-fi
+[ "$HOTSPOT_STATE" = "ON" ] && RUNNING=true
 DESIRED=$("$BB" head -n 1 "$DESIRED_FILE" 2>/dev/null)
 [ "$DESIRED" = "1" ] || DESIRED=0
 CSRF=$(read_csrf_token)
@@ -307,8 +314,8 @@ printf '{'
 MOD_VERSION=$("$BB" sed -n 's/^version=//p' "$MODDIR/module.prop" 2>/dev/null | "$BB" head -n1)
  [ -z "$MOD_VERSION" ] && MOD_VERSION=--
 read_device_info
-printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%s,' \
-  "$MOD_VERSION" "$(json_escape "$DEVICE_MODEL")" "$(json_escape "$OS_VERSION")" "$RUNNING"
+printf '"ok":true,"version":"%s","deviceModel":"%s","osVersion":"%s","running":%s,"hotspotState":"%s",' \
+  "$MOD_VERSION" "$(json_escape "$DEVICE_MODEL")" "$(json_escape "$OS_VERSION")" "$RUNNING" "$HOTSPOT_STATE"
 # v1.7.6：热点配置唯一数据源 = 系统 WifiConfigStore.xml（Hotspot Compatibility Layer）
 hotspot_get_config
 printf '"ssid":"%s","passwordSet":%s,"security":"%s","band":"%s","channel":%s,"hidden":%s,"hiddenSupported":%s,"caps":%s,' \

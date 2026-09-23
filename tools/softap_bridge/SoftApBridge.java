@@ -79,6 +79,9 @@ public class SoftApBridge {
                 case "softap-capability":
                     doSoftApCapability();
                     break;
+                case "softap-state":
+                    doSoftApState();
+                    break;
                 case "probe":
                     doProbe();
                     break;
@@ -86,7 +89,7 @@ public class SoftApBridge {
                     System.out.println("api=" + api);
                     break;
                 default:
-                    System.err.println("ERROR_USAGE: usage get-config|set-config|tether-state|tether-start|tether-stop|softap-capability|probe|get-api");
+                    System.err.println("ERROR_USAGE: usage get-config|set-config|tether-state|tether-start|tether-stop|softap-capability|softap-state|probe|get-api");
                     System.exit(2);
             }
         } catch (Throwable t) {
@@ -557,6 +560,67 @@ public class SoftApBridge {
             }
         }
         System.out.print(sb);
+    }
+
+    /* ---------------- softap-state（SoftApCallback.onStateChanged 实测） ---------------- */
+    // 输出 SoftAP Framework 真实状态数值（10=DISABLING 11=DISABLED 12=ENABLING 13=ENABLED 14=FAILED）。
+    // "failure reason: 0" 表示无失败原因，只按最终 state 判定；无法取得回调则输出 -1。
+    static void doSoftApState() throws Exception {
+        final AtomicReference<Object> stateRef = new AtomicReference<>(null);
+        final CountDownLatch latch = new CountDownLatch(1);
+        try {
+            android.os.Looper.prepareMainLooper();
+        } catch (RuntimeException e) {
+            // 已 prepare：忽略
+        }
+        final android.os.IBinder binder = silentBinder();
+        Class<?> cbCls = Class.forName("android.net.wifi.IWifiManagerSoftApCallback");
+        Object cb = Proxy.newProxyInstance(cbCls.getClassLoader(), new Class<?>[]{cbCls},
+                new InvocationHandler() {
+                    public Object invoke(Object proxy, Method method, Object[] args) {
+                        if (method.getName().equals("onStateChanged") && args != null && args.length > 0 && args[0] != null) {
+                            stateRef.set(args[0]);
+                            latch.countDown();
+                        }
+                        if (method.getName().equals("asBinder")) return binder;
+                        return null;
+                    }
+                });
+        Object svc = wifiService();
+        Method reg = null;
+        for (Method cand : svc.getClass().getMethods()) {
+            if (cand.getName().equals("registerSoftApCallback")
+                    && cand.getParameterTypes().length >= 1
+                    && cand.getParameterTypes()[0].isAssignableFrom(cbCls)) {
+                reg = cand;
+                break;
+            }
+        }
+        if (reg == null) {
+            System.out.print("softap_state=-1\n");
+            return;
+        }
+        Class<?>[] pts = reg.getParameterTypes();
+        Object[] argv = new Object[pts.length];
+        for (int i = 0; i < pts.length; i++) {
+            if (pts[i] == android.os.Looper.class) argv[i] = android.os.Looper.getMainLooper();
+            else argv[i] = cb;
+        }
+        reg.invoke(svc, argv);
+        Thread looperThread = new Thread(new Runnable() {
+            public void run() {
+                android.os.Looper.loop();
+            }
+        });
+        looperThread.setDaemon(true);
+        looperThread.start();
+        try {
+            latch.await(2500, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            // 忽略
+        }
+        Object st = stateRef.get();
+        System.out.print("softap_state=" + (st == null ? -1 : st) + "\n");
     }
 
     /* ---------------- probe（真实能力探测，shell 侧决定 read/write 与同步级别） ---------------- */

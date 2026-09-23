@@ -351,10 +351,42 @@ hotspot_set_config() {
   return 0
 }
 
-# ---- 接口 4：热点运行状态（统一入口；dumpsys 快照 + bridge tether-state 补充）----
+# ---- 接口 4：热点运行状态（统一入口，业务层禁止自行猜接口名）----
+# 判定优先级（v1.7.8）：
+#   1) SoftAP Framework state（Bridge SoftApCallback.onStateChanged，state 10-14，最终状态优先）
+#   2) dumpsys 快照（softap_state_snapshot 缓存，支持 onStateChanged state 解析）
+#   3) Tethering state（bridge tether-state：tether_state=2/tethered=1 → ENABLED）
+#   4) 接口探测（仅剩此路时才用 get_hotspot_iface）
+# 任何"failure reason: 0"都不判失败；只有 state=14（FAILED）才算启动失败。
 hotspot_get_state() {
-  softap_state_snapshot "$@"
-  # dumpsys 缺失时用 bridge tether-state 兜底
+  SNAP_AP_STATE=
+  # CGI 只读轮询：先读 supervisor 后台刷新的快照缓存（避免每次起 app_process）
+  if [ "${CGI_READONLY:-0}" = "1" ]; then
+    softap_state_snapshot "$@"
+    [ -n "$SNAP_AP_STATE" ] && return 0
+  fi
+  # 1) Bridge SoftAP Framework state（真实回调状态，10=DISABLING 11=DISABLED 12=ENABLING 13=ENABLED 14=FAILED）
+  if bridge_available; then
+    S_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge softap-state 2>/dev/null)
+    case "$S_OUT" in
+      *'softap_state='*)
+        S_NUM=${S_OUT#*softap_state=}
+        S_NUM=${S_NUM%%$'\n'*}
+        case "$S_NUM" in
+          10) SNAP_AP_STATE=DISABLING ;;
+          11) SNAP_AP_STATE=DISABLED ;;
+          12) SNAP_AP_STATE=ENABLING ;;
+          13) SNAP_AP_STATE=ENABLED ;;
+          14) SNAP_AP_STATE=FAILED ;;
+        esac
+        ;;
+    esac
+  fi
+  # 2) dumpsys 快照兜底（含 onStateChanged state 解析）
+  if [ -z "$SNAP_AP_STATE" ]; then
+    softap_state_snapshot "$@"
+  fi
+  # 3) Tethering state 兜底
   if [ -z "$SNAP_AP_STATE" ] && bridge_available; then
     T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
     case "$T_OUT" in
@@ -389,13 +421,17 @@ get_hotspot_iface() {
 }
 
 # 等待系统 Tethering 生效（轮询 dumpsys 快照 / bridge tether-state）
+# 启动序列 11→12→13 属正常；state=14（FAILED）立即判失败，不等到超时才报错。
 wait_tether_enabled() {
   I=0
   while [ "$I" -lt "$1" ]; do
     I=$((I + 1))
     sleep 1
     softap_state_snapshot 2>/dev/null
-    [ "$SNAP_AP_STATE" = "ENABLED" ] && return 0
+    case "$SNAP_AP_STATE" in
+      ENABLED) return 0 ;;
+      FAILED) return 1 ;;
+    esac
     if bridge_available; then
       T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
       case "$T_OUT" in *'tether_state=2'*|*'tethered=1'*) return 0 ;; esac
@@ -487,13 +523,21 @@ hotspot_stop() {
       ok=1*)
         echo "$(date) hotspot_stop: bridge tether-stop (system Tethering)" >> "$LOG" 2>/dev/null
         I=0
-        while [ "$I" -lt 8 ]; do
+        STOP_CONFIRM_MAX=${STOP_CONFIRM_MAX:-8}
+        while [ "$I" -lt "$STOP_CONFIRM_MAX" ]; do
           I=$((I + 1))
           sleep 1
           softap_state_snapshot 2>/dev/null
-          case "$SNAP_AP_STATE" in DISABLED|'') return 0 ;; esac
+          case "$SNAP_AP_STATE" in DISABLED) return 0 ;; esac
         done
-        return 0
+        # 8 秒后仍未在快照中确认关闭：再查 bridge tether-state 真实状态，
+        # 仍 tethered 则返回失败（绝不"超时就假装关闭成功"）。
+        if bridge_available; then
+          T_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-state 2>/dev/null)
+          case "$T_OUT" in *'tethered=0'*|*'tether_state=0'*|*'tether_state=1'*) return 0 ;; esac
+        fi
+        echo "$(date) hotspot_stop: system still reports hotspot active after $STOP_CONFIRM_MAX s" >> "$LOG" 2>/dev/null
+        return 1
         ;;
       *) echo "$(date) hotspot_stop: bridge tether-stop unavailable, fallback" >> "$LOG" 2>/dev/null ;;
     esac
