@@ -328,7 +328,7 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
       </div></div>
       <div id="smsPanel" hidden style="margin-top:8px"></div>
       <div id="logPanel" hidden><h2 class="section-title" style="margin-top:12px">服务日志</h2><pre class="mono" id="logText">加载中…</pre></div>
-      <div id="diagPanel" hidden><h2 class="section-title" style="margin-top:12px">诊断报告</h2><div id="diagTable"></div><details class="adv-state" style="margin-top:8px"><summary>查看原始 JSON 数据</summary><pre class="mono" id="diagText" style="margin-top:8px">加载中…</pre></details><div class="actions" style="margin-top:10px"><button class="secondary mini ro" onclick="copyDiag()" type="button">复制报告</button></div></div>
+      <div id="diagPanel" hidden><h2 class="section-title" style="margin-top:12px">诊断报告</h2><div id="diagTable"></div><details class="adv-state" style="margin-top:8px"><summary>查看原始 JSON 数据</summary><pre class="mono" id="diagText" style="margin-top:8px">加载中…</pre></details><div class="actions" style="margin-top:10px"><button class="secondary mini ro" onclick="copyDiag()" type="button">复制报告</button><button class="secondary mini ro" onclick="exportDiag()" type="button">导出诊断包</button></div></div>
     </section>
 
     <section class="card" data-tab="settings">
@@ -515,6 +515,7 @@ function heroToggle(){if($('hcBtn').disabled)return;if($('hcBtn').getAttribute('
     }
     function selectDiagText(){try{var el=$('diagText'),r=document.createRange(),s=window.getSelection();r.selectNodeContents(el);s.removeAllRanges();s.addRange(r);return true}catch(e){return false}}
     async function copyDiag(){try{await copyText($('diagText').textContent);toast('诊断报告已复制')}catch(e){if(selectDiagText()){toast('浏览器禁止直接复制，已选中报告全文，请长按选择“复制”')}else{toast('复制失败，请长按报告文本手动复制')}}}
+    function exportDiag(){const a=document.createElement('a');a.href='/cgi-bin/export_diag.cgi';a.download='diagnostic.tar';document.body.appendChild(a);a.click();a.remove()}
     const MOON_PATH='M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z';
     const SUN_PATH='M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10zm0-15v2m0 16v2M4.22 4.22l1.42 1.42m12.73 12.73 1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42';
     function updateThemeBtn(){const dark=document.documentElement.getAttribute('data-theme')==='dark';const b=$('themeBtn');if(!b)return;const p=$('themeIcoPath'),t=$('themeTxt');if(p)p.setAttribute('d',dark?SUN_PATH:MOON_PATH);if(t)t.textContent=dark?'浅色':'暗色';const mc=document.querySelector('meta[name=theme-color]');if(mc)mc.setAttribute('content',dark?'#0f1420':'#f5f7fb')}
