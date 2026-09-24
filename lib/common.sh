@@ -665,7 +665,9 @@ ensure_hotspot_dhcp() {
   $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null     || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
   $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null     || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
   # 4) DHCP：busybox udhcpd（系统 dnsmasq 参数受限不可靠）
+  # v1.8.0：杀旧实例后等待 exec/退出完成，避免启动瞬间双实例抢 67 端口
   kill_udhcpd 2>/dev/null
+  sleep 1
   {
     printf 'interface %s\n' "$iface"
     printf 'start %s.2\n' "${STABLE_IP%.*}"

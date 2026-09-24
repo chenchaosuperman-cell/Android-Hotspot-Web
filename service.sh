@@ -339,6 +339,12 @@ while true; do
     printf 'SNAP_AP_SSID=%s\n' "${SNAP_AP_SSID:-}"
   } > "$STATE_CACHE_FILE" 2>/dev/null
   IFACE_C=$(get_hotspot_iface 2>/dev/null)
+  # v1.8.0：半开热点（系统 Tethering 未登记/SoftAp 状态机 Idle）时接口检测可能为空，
+  # 兜底扫描持有管理地址的接口，保证回程链路路由（local_network 43.0/24）每轮补上，
+  # 否则客户端流量出得去、响应回不来（后台打不开 + 无外网）。
+  if [ -z "$IFACE_C" ]; then
+    IFACE_C=$(/system/bin/ip -o -4 addr show 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '$4 ~ ("^"s"/") {split($2,a,":"); print a[1]; exit}')
+  fi
   if [ -n "$IFACE_C" ]; then
     printf '%s\n' "$IFACE_C" > "$HOTSPOT_IFACE_FILE" 2>/dev/null
   fi
@@ -587,6 +593,16 @@ while true; do
         CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
         case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) DHCP_ALIVE=1 ;; esac
       done
+      # v1.8.0：udhcpd 刚启动时 /proc/PID/cmdline 可能尚未成形（exec 窗口），
+      # 立即扫描会误判 not running 而重复拉起，两个实例抢 67 端口导致设备拿不到 IP。
+      # 首次未发现时等待 1 秒复查，确认仍无才重新 ensure。
+      if [ "$DHCP_ALIVE" = 0 ]; then
+        sleep 1
+        for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
+          CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
+          case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) DHCP_ALIVE=1 ;; esac
+        done
+      fi
       if [ "$DHCP_ALIVE" = 0 ]; then
         # 接口上有系统 DHCP 网段地址时不干预（ensure 内部同判；此处少一次空转）
         SYS_IP=$(/system/bin/ip -o -4 addr show dev "$IFACE_C" 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '{split($4,a,"/"); if (a[1]!=s) {print a[1]; exit}}')
