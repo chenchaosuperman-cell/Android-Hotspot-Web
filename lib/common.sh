@@ -971,6 +971,7 @@ sys_band_val() {
 # 兼容两种标签：旧版 <string name="WifiSsid">&quot;X&quot;</string>（引号实体包裹）、
 # 新版（SoftApConfToXmlMigration）<string name="SSID">X</string>。
 sys_softap_get() {
+  [ -r "$SYS_WIFI_STORE" ] || return 0
   sys_ok=0
   sys_ssid=; sys_security=wpa2; sys_password=; sys_band=any; sys_channel=0; sys_hidden=0; sys_maxclients=0
   [ -r "$SYS_WIFI_STORE" ] || return 0
@@ -2033,7 +2034,7 @@ accumulate_usage() {
   CUR=$(( $(get_chain_bytes mifi_up) + $(get_chain_bytes mifi_dn) ))
   SNAP=$(cat "$USAGE_SNAP" 2>/dev/null | "$BB" tr -d ' ')
   case "$SNAP" in ''|*[!0-9]*) SNAP=0 ;; esac
-  ACC=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
+  ACC=$("$BB" cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
   case "$ACC" in ''|*[!0-9]*) ACC=0 ;; esac
   if [ "$CUR" -lt "$SNAP" ]; then
     # P1-38：统计链被系统清除/计数器重置时记录原因与时间（避免静默丢段），从当前值重新开始
@@ -2052,7 +2053,7 @@ accumulate_usage() {
 
 # 读取累计用量（MB）与是否超限
 read_usage() {
-  USAGE_BYTES=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
+  USAGE_BYTES=$("$BB" cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
   case "$USAGE_BYTES" in ''|*[!0-9]*) USAGE_BYTES=0 ;; esac
   USAGE_MB=$((USAGE_BYTES / 1048576))
   USAGE_OVER=false
@@ -2415,6 +2416,7 @@ health_note() {
 # 读取渠道健康：输出 last_send|last_ok|err|fails
 read_health() {
   # v1.7.2-beta.1：纯 shell 匹配（文件小），避免 grep|head|cut 三个子进程
+  [ -r "$NOTIFY_HEALTH_FILE" ] || return 0
   while IFS= read -r _HL; do
     case "$_HL" in
       "$1"|*) printf '%s' "${_HL#*|}"; return 0 ;;
@@ -3186,7 +3188,7 @@ plan_period_bytes() {
     BBY=$("$BB" cut -d'|' -f2 "$TRAFFIC_BASE" 2>/dev/null)
     case "$BBY" in ''|*[!0-9]*) BBY=0 ;; esac
     if [ "$BD" = "$TODAY" ]; then
-      CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
+      CUR=$("$BB" cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
       case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
       [ "$CUR" -ge "$BBY" ] 2>/dev/null && PLAN_PERIOD_BYTES=$((PLAN_PERIOD_BYTES + CUR - BBY))
     fi
@@ -3360,7 +3362,7 @@ read_admin_password() {
 # ---------- 流量按日/月度统计 ----------
 # TRAFFIC_BASE: "YYYYMMDD|bytes"（当日开始基准）；TRAFFIC_DAILY: 每行 "YYYYMMDD|MB"（保留 11 天）
 accumulate_daily() {
-  CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
+  CUR=$("$BB" cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
   case "$CUR" in ''|*[!0-9]*) return 0 ;; esac
   TODAY=${DATE_TODAY:-$($DATE_CMD +%Y%m%d 2>/dev/null)}
   DATE_TODAY=$TODAY
@@ -3403,7 +3405,7 @@ read_traffic_stats() {
   TRAFFIC_TODAY_VALID=false
   TRAFFIC_MONTH_VALID=false
   TRAFFIC_DAYS=
-  CUR=$("$BB" tr -d ' ' < "$USAGE_FILE" 2>/dev/null)
+  CUR=$("$BB" cat "$USAGE_FILE" 2>/dev/null | "$BB" tr -d ' ')
   case "$CUR" in ''|*[!0-9]*) CUR=0 ;; esac
   BASE_DATE=
   BASE_BYTES=0

@@ -349,7 +349,7 @@ printf '"autostart":%s,"iface":"%s","ip":"%s","nativeIp":"%s","port":%s,"battery
   "$([ "$AUTOSTART" = "1" ] && echo true || echo false)" "$(json_escape "$IFACE")" "$(json_escape "$IP")" "$(json_escape "$NATIVE_IP")" "$PORT" "$BATTERY" "$CHARGING"
 printf '"desired":%s,"csrf":"%s","operation":{"state":"%s","time":%s,"message":"%s"},' \
   "$([ "$DESIRED" = "1" ] && echo true || echo false)" "$(json_escape "$CSRF")" "$(json_escape "$OP_STATE")" "$OP_TIME" "$(json_escape "$OP_MESSAGE")"
-CFG_SAVED=$("$BB" tr -d '\r\n' < "$DATA_DIR/config.saved" 2>/dev/null)
+CFG_SAVED=$("$BB" cat "$DATA_DIR/config.saved" 2>/dev/null | "$BB" tr -d '\r\n')
 printf '"cfgSaved":"%s",' "$(json_escape "$CFG_SAVED")"
 printf '"activeClientCount":%s,"connectedClientCount":%s,"manualOff":%s,"tcSupported":%s,' "$(count_online_clients "$IFACE")" "$(count_connected_clients "$IFACE")" "$([ -f "$MANUAL_OFF_FILE" ] && echo true || echo false)" "$([ -n "$(command -v tc 2>/dev/null)" ] && echo true || echo false)"
 printf '"tether":{"fwd":%s,"nat":%s,"hotspotNat":%s,"pkts":%s},' "$TETHER_FWD" "$TETHER_NAT" "$TETHER_HOTSPOT_NAT" "$TETHER_PKTS"
@@ -372,7 +372,7 @@ printf '"usage":{"bytes":%s,"mb":%s,"limitMb":%s,"limitAction":"%s","over":%s},'
 # 信号面板与自动关闭原因
 get_signal_info
 case "$SIG_RSRP" in ''|*[!0-9-]*) SIG_RSRP=0; SIG_LEVEL= ;; *) SIG_LEVEL=$(signal_level "$SIG_RSRP") ;; esac
-STOP_REASON=$("$BB" tr -d ' \r\n' < "$STOP_REASON_FILE" 2>/dev/null)
+STOP_REASON=$("$BB" cat "$STOP_REASON_FILE" 2>/dev/null | "$BB" tr -d ' \r\n')
 case "$STOP_REASON" in '') STOP_REASON= ;; esac
 count_sms_stats
   printf '"smsQueued":%s,"smsRetrying":%s,' "$SMS_QUEUED" "$SMS_RETRYING"
