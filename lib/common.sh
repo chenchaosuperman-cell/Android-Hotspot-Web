@@ -690,6 +690,20 @@ cleanup_hotspot_dhcp() {
   iface=$1
   kill_udhcpd 2>/dev/null
   [ -n "$iface" ] || return 0
+  # v1.7.9+：清理热点接口的流量统计/转发链 FORWARD 引用（旧接口 wlan2 已消失，
+  # 规则残留且反复开关会重复累积）。循环删除直到不存在；链定义保留可复用。
+  while $IPT -C FORWARD -i "$iface" -j mifi_stats 2>/dev/null; do
+    $IPT -D FORWARD -i "$iface" -j mifi_stats 2>/dev/null
+  done
+  while $IPT -C FORWARD -i "$iface" -j mifi_up 2>/dev/null; do
+    $IPT -D FORWARD -i "$iface" -j mifi_up 2>/dev/null
+  done
+  while $IPT -C FORWARD -o "$iface" -j mifi_dn 2>/dev/null; do
+    $IPT -D FORWARD -o "$iface" -j mifi_dn 2>/dev/null
+  done
+  $IPT -F mifi_stats 2>/dev/null
+  $IPT -F mifi_up 2>/dev/null
+  $IPT -F mifi_dn 2>/dev/null
   UP=$(get_upstream_iface)
   if [ -n "$UP" ]; then
     $IPT -t nat -D POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null
@@ -2002,8 +2016,12 @@ ensure_usage_chain() {
   # P1-39：热点接口变化时清理旧接口上残留的 FORWARD 跳转，避免旧规则继续计数/残留
   OLD_IFACE=$("$BB" cat "$USAGE_IFACE_FILE" 2>/dev/null | "$BB" tr -d ' ')
   if [ -n "$OLD_IFACE" ] && [ "$OLD_IFACE" != "$iface" ]; then
-    $IPT -D FORWARD -i "$OLD_IFACE" -j mifi_up 2>/dev/null
-    $IPT -D FORWARD -o "$OLD_IFACE" -j mifi_dn 2>/dev/null
+    while $IPT -C FORWARD -i "$OLD_IFACE" -j mifi_up 2>/dev/null; do
+      $IPT -D FORWARD -i "$OLD_IFACE" -j mifi_up 2>/dev/null
+    done
+    while $IPT -C FORWARD -o "$OLD_IFACE" -j mifi_dn 2>/dev/null; do
+      $IPT -D FORWARD -o "$OLD_IFACE" -j mifi_dn 2>/dev/null
+    done
     echo "$(date) usage: 热点接口 $OLD_IFACE -> $iface，已清理旧接口统计跳转" >> "$LOG"
   fi
   printf '%s\n' "$iface" > "$USAGE_IFACE_FILE" 2>/dev/null
