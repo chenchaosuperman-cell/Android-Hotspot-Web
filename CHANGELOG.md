@@ -1,3 +1,9 @@
+# v1.8.0-beta（2026-09-24）— 诊断导出 + 日志与规则清理修复
+- 新增：后台诊断报告新增「导出诊断包」——一键打包 service.log（截断 3000 行）/状态缓存/运行时状态（接口、路由、iptables、进程、客户端）/关键系统属性/代理状态/脱敏配置为 tar.gz 下载，供其它机器遇到问题时一键收集发回分析；脱敏：config 密码/订阅/短信/令牌全部打码，日志中 token/password/sub_b64 替换为 ***；SMS_FWD 开关保留
+- 修复：status.cgi 读缺失缓存文件（notify_health/data_usage/stop_reason/config.saved）时，toybox sh 输入重定向（< file）打开失败在 shell 层报错、绕过命令的 2>/dev/null，stderr 经 httpd 反复刷屏 service.log 淹没真实日志——读前先 [ -r ] 判存在，tr < file 改 cat file 2>/dev/null | tr 管道
+- 修复：热点停止后 iptables 流量统计/转发链（mifi_up/mifi_dn/mifi_stats）FORWARD 引用规则残留且反复开关后重复累积（诊断包实测 wlan2 规则各 2 条）——cleanup_hotspot_dhcp 停止时循环删除引用（-C 判存在 -D 删除直至无）并清空链内容；update_traffic_rules 接口切换路径同改循环删除
+- 修复：release.sh 提取 CHANGELOG 块的旧正则（标题「）—」中破折号非换行导致失配）使 Release body 只剩 tag 名——修正为匹配整行标题
+- 测试：真机验证——status.cgi 秒回且日志零刷屏；FORWARD 残留规则清零（6→0）；导出诊断包可下载解包、脱敏通过
 # v1.7.9-beta（2026-09-23）— Compatibility & Reliability 第二轮
 - 修复：compat.sh 漏写 # 的注释被当作 cmd wifi 命令执行，可能污染 CGI 输出（补 #，sh -n 通过）
 - 修复：SoftApBridge 回调类名 IWifiManagerSoftApCallback → 标准 ISoftApCallback；回调改为继承真实 AIDL Stub（跨进程可收到 onStateChanged/onCapabilityChanged），删除 Proxy+silentBinder 与 Looper 误用
