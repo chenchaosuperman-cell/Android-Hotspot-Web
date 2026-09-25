@@ -19,7 +19,9 @@ case "$LINES" in ''|*[!0-9]*) LINES=50 ;; esac
 
 if [ -r "$LOG" ]; then
   TAIL=$("$BB" tail -n "$LINES" "$LOG" 2>/dev/null)
-  printf '{"ok":true,"log":"%s"}' "$(json_escape "$TAIL")"
+  # v1.9.1：日志含真实换行/回车，json_escape 不处理控制字符会产出非法 JSON
+  # （前端报 Bad control character in string literal）。改用 json_escape_nl（\n 转义、\r 去化）。
+  printf '{"ok":true,"log":"%s"}' "$(json_escape_nl "$TAIL")"
 else
   printf '{"ok":false,"message":"日志文件不存在"}'
 fi
