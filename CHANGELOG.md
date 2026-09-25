@@ -1,3 +1,10 @@
+# v1.9.1-beta（2026-09-25）
+
+- 修复 HyperOS 系统 SoftAP 10 分钟 idle timeout 反复自动关闭热点导致的周期性断网：SoftApBridge 写入 SoftApConfiguration 时设置 shutdownTimeoutMillis=604800000（7 天等效禁用；HyperOS 拒绝 0 值），系统不再每 10 分钟强制 DISABLED 热点、keepalive 反复拉起。
+- 修复 supervisor.pid 缺失/陈旧导致 ensure_hotspot_dhcp 误判“非 supervisor 上下文”、udhcpd 永远不被拉起的问题（客户端连上 WiFi 拿不到 IP、后台打不开、无外网）；supervisor 主进程启动时及每轮 tick 写入 supervisor.pid，并允许空/陈旧 PID 视为 supervisor 上下文。
+- 修复 MASQUERADE 规则膨胀：ensure_hotspot_upstream 每次先清空热点子网的全部 MASQUERADE（含历史版本遗留的不带 -o 规则）再按当前上游重建一条，防止升级/热切换累积成百条重复规则。
+- 温度显示修复：首页温度卡主值改为电池温度，CPU 只认真实 CPU thermal zone（剔除 socd/quiet_therm 等误报），找不到时显示 —，不再把 SoC 局部温度当整机温度。
+- 发布元数据更新：module.prop 升级为 version=1.9.1-beta、versionCode=18104；update.json 指向 v1.9.1-beta Release ZIP。
 # v1.9.0-beta（2026-09-25）
 
 - 基于 v1.8.2-beta（stabilityfix 系列）发布整理：不改热点、DHCP、NAT、路由、SoftAP Bridge、流量统计与现有策略逻辑。

@@ -21,7 +21,7 @@
 .stat-card{background:var(--card);border:1px solid var(--card-border);border-radius:18px;padding:12px 12px;box-shadow:var(--shadow);min-width:0;min-height:76px;display:flex;flex-direction:column;justify-content:center}
 .stat-label{color:var(--muted);font-size:11px;margin:0 0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .stat-value{font-size:18px;font-weight:700;color:var(--text);line-height:1.25;overflow-wrap:anywhere}
-/* v1.7.9：紧凑温度状态卡（最高温度主数据 + 电池/CPU 并排 + 细进度条），无仪表盘/圆环/火焰 */
+/* v1.9.0：紧凑温度状态卡（电池温度主数据 + CPU 辅助 + 细进度条），无仪表盘/圆环/火焰 */
 #thermalCard{min-height:130px;max-height:150px;overflow:hidden;padding:16px 16px 12px}
 #thermalCard[hidden]{display:none!important}
 .thm-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
@@ -114,11 +114,10 @@ nav.tabbar{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin-botto
       </div>
       <div class="thm-main">
         <div class="thm-max">
-          <div class="thm-max-label">最高温度</div>
+          <div class="thm-max-label">电池温度</div>
           <div class="thm-max-value" id="tMax">—</div>
         </div>
         <div class="thm-minor">
-          <div class="thm-minor-item"><span class="thm-minor-label">电池</span><b id="tBat">—</b></div>
           <div class="thm-minor-item"><span class="thm-minor-label">CPU</span><b id="tCpu">—</b></div>
         </div>
       </div>
@@ -437,23 +436,26 @@ function fillChannels(){const b=$('band').value,sel=$('channel');const cur=sel.v
       const s=d.sys||{};$('memInfo').textContent=(s.memTotal?(s.memTotal/1048576).toFixed(1)+' GB 总 / ':'')+(s.memAvail?(s.memAvail/1048576).toFixed(1)+' GB 可用':'—');$('storInfo').textContent=fmtBytes(s.storAvail)+' / '+fmtBytes(s.storTotal);$('loadInfo').textContent=(s.load||'—');
       const th=d.thermal||{};
       const _tc=$('thermalCard');
-      const _hasT=(th.max!=null||th.battery!=null||th.cpu!=null);
+      const _hasT=(th.battery!=null||th.cpu!=null);
       if(_tc)_tc.hidden=!_hasT;
       if(_hasT){
-        const _maxV=th.max!=null?Number(th.max):(th.cpu!=null?Number(th.cpu):(th.battery!=null?Number(th.battery):0));
-        $('tMax').textContent=Math.round(_maxV)+'°C';
-        $('tBat').textContent=(th.battery!=null?Math.round(th.battery)+'°C':'—');
-        $('tCpu').textContent=(th.cpu!=null?Math.round(th.cpu)+'°C':'—');
+        // v1.9.0：主值=电池温度；CPU 只认真实 CPU zone（找不到显示 —），不再把 SoC 当整机温度
+        const _bat=th.battery!=null?Number(th.battery):null;
+        const _cpu=th.cpu!=null?Number(th.cpu):null;
+        $('tMax').textContent=_bat!=null?Math.round(_bat)+'°C':'—';
+        $('tCpu').textContent=_cpu!=null?Math.round(_cpu)+'°C':'—';
         var _st,_sc,_tip;
-        if(_maxV>=55){_st='过热';_sc='var(--danger,#dc2626)';_tip='建议关闭热点并等待降温';}
-        else if(_maxV>=45){_st='偏高';_sc='var(--warn-fg)';_tip='建议降低负载或暂停充电';}
+        const _stRaw=th.status||'normal';
+        if(_stRaw==='hot'){_st='过热';_sc='var(--danger,#dc2626)';_tip='建议关闭热点并等待降温';}
+        else if(_stRaw==='warm'){_st='偏高';_sc='var(--warn-fg)';_tip='建议降低负载或暂停充电';}
         else{_st='正常';_sc='var(--ok-fg)';_tip='温度正常，无需处理';}
         const _badge=$('tStat');
         _badge.textContent=_st;
         _badge.style.color=_sc;
-        _badge.style.background=(_maxV>=55?'rgba(220,38,38,.12)':_maxV>=45?'rgba(245,158,11,.12)':'rgba(74,222,128,.12)');
+        _badge.style.background=(_stRaw==='hot'?'rgba(220,38,38,.12)':_stRaw==='warm'?'rgba(245,158,11,.12)':'rgba(74,222,128,.12)');
         const _bar=$('thmBar');
-        _bar.style.width=Math.min(100,Math.round(_maxV/60*100))+'%';
+        const _barV=_cpu!=null?_cpu:(th.max!=null?Number(th.max):0);
+        _bar.style.width=Math.min(100,Math.round(_barV/60*100))+'%';
         _bar.style.background=_sc;
         $('thmTip').textContent=_tip;
       }$('upInfo').textContent=s.uptime||'—';

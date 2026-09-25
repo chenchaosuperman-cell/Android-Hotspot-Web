@@ -642,6 +642,13 @@ ensure_hotspot_upstream() {
       $IPT -D FORWARD -i "$OLD" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || break
     done
   fi
+  # v1.9.0：幂等重建 —— 先清掉热点子网的全部 MASQUERADE（含历史版本遗留的不带 -o 规则，
+  # 升级/热切换会累积成百条重复），再按当前上游重建一条；省略 -o 的 -C/-D 匹配任意出口。
+  _M=0
+  while $IPT -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -j MASQUERADE 2>/dev/null; do
+    $IPT -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -j MASQUERADE 2>/dev/null || break
+    _M=$((_M+1)); [ "$_M" -gt 200 ] && break
+  done
   $IPT -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null || $IPT -t nat -A POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null
   $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
   $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
@@ -749,7 +756,9 @@ ensure_hotspot_dhcp() {
   # v1.8.0-latencyfix: service.sh also owns a lightweight DHCP request worker.
   # That worker is a child shell, so its PID is not supervisor.pid; mark it with
   # SUPERVISOR_CONTEXT=1 instead of forcing it to bounce the request back another 5s.
-  if [ "$SUP_PID" != "$$" ] && [ "${SUPERVISOR_CONTEXT:-0}" != "1" ]; then
+  # v1.9.0：supervisor.pid 缺失/陈旧（服务热重启后常见）时视为 supervisor 上下文，
+  # 否则 udhcpd 永远不被拉起（只写 dhcp.request 无人消费）→ 客户端连上 WiFi 拿不到 IP。
+  if [ -n "$SUP_PID" ] && [ "$SUP_PID" != "$$" ] && [ "${SUPERVISOR_CONTEXT:-0}" != "1" ]; then
     : > "$DATA_DIR/dhcp.request" 2>/dev/null
     echo "$(date) ensure_hotspot_dhcp: routes/NAT ready; DHCP delegated to supervisor on $iface" >> "$LOG" 2>/dev/null
     return 0
@@ -1493,7 +1502,7 @@ get_sysinfo() {
     [ -e "$z/type" ] || continue
     T=$(cat "$z/type" 2>/dev/null)
     case "$T" in
-      cpu*|soc*|apc*|cluster*|quiet*|*cpu*)
+      *cpu*|CPU*)
         MV=$(cat "$z/temp" 2>/dev/null)
         case "$MV" in ''|*[!0-9]*) continue ;; esac
         SYS_THERMAL=$((MV / 1000))
@@ -1545,7 +1554,7 @@ get_thermal_info() {
   elif [ "${CGI_READONLY:-0}" = "1" ]; then
     return 0
   fi
-  # 采集：type=battery 电池、cpu*/soc* CPU/SoC、gpuss-*/gpu* GPU，各取最高
+  # 采集：type=battery 电池、真 CPU（名字含 cpu/CPU，不再把 soc 当 CPU）、gpuss-*/gpu* GPU，各取最高
   BT=0; CT=0; GX=0
   for z in /sys/class/thermal/thermal_zone*; do
     IFS= read -r T < "$z/type" 2>/dev/null || continue
@@ -1554,7 +1563,7 @@ get_thermal_info() {
         IFS= read -r V < "$z/temp" 2>/dev/null
         case "$V" in ''|*[!0-9]*) V=0 ;; esac
         BT=$((V / 1000)) ;;
-      cpu*|soc*)
+      *cpu*|CPU*)
         IFS= read -r V < "$z/temp" 2>/dev/null
         case "$V" in ''|*[!0-9]*) V=0 ;; esac
         [ "$((V / 1000))" -gt "$CT" ] 2>/dev/null && CT=$((V / 1000)) ;;

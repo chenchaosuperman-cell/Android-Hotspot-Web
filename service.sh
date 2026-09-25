@@ -412,8 +412,13 @@ TICK=0
 # 被双重累加变成 10s 而非 15s，所有周期任务（定时/保活/流量/空闲/通知）时间错乱）。
 CAP_TICK=0
 IDLE_SECS=0
+# v1.9.0：supervisor.pid 必须由 supervisor 主进程持有（ensure_hotspot_dhcp 靠它判断
+# “是否 supervisor 上下文”以决定是否直接启动 udhcpd）。缺失/陈旧会让 udhcpd 永远不被拉起。
+printf '%s\n' "$$" > "$SUPERVISOR_PIDFILE" 2>/dev/null
 while true; do
   sleep 5
+  # 每轮刷新，防止 PID 文件陈旧（服务热重启后旧 PID 残留导致误判非 supervisor）
+  printf '%s\n' "$$" > "$SUPERVISOR_PIDFILE" 2>/dev/null
   # v1.7.2-beta.1：常驻预热系统快照。dumpsys wifi/telephony 在真机上可能卡数秒，
   # 由 supervisor 每 tick 采集（softap 15s / telephony 60s 缓存限频），
   # status.cgi 只读缓存文件，避免 CGI 子进程同步执行慢 dumpsys 导致页面 8s 超时。

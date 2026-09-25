@@ -244,6 +244,19 @@ public class SoftApBridge {
         } catch (InvocationTargetException e) {
             // 个别 ROM 拒绝 0：忽略，保留原值
         }
+        // v1.9.0：禁用系统 SoftAP idle 自动关闭。
+        // HyperOS framework 默认 600000ms（10 分钟）无客户端活动即 DISABLED 热点，
+        // keepalive 虽能自动恢复，但客户端每 10 分钟断网一次，体验不可接受。
+        // AOSP 语义：0 应表示禁用，但 MIUI/HyperOS 拒绝 0（IllegalArgumentException:
+        // "Invalid timeout value: 0"），改用 7 天（604800000ms）等效禁用（模块自身
+        // 仍有 30 分钟无客户端自动关闭策略，热点不会永远挂着）。
+        try {
+            bCls.getMethod("setShutdownTimeoutMillis", long.class).invoke(builder, Long.valueOf(604800000L));
+        } catch (NoSuchMethodException e) {
+            System.err.println("NOTE: setShutdownTimeoutMillis(long) unavailable; system idle shutdown remains");
+        } catch (InvocationTargetException e) {
+            System.err.println("NOTE: setShutdownTimeoutMillis rejected by this ROM: " + e.getCause());
+        }
         Object cfg = bCls.getMethod("build").invoke(builder);
 
         Object svc = wifiService();
