@@ -85,10 +85,12 @@ restart_hotspot_async() {
     # 失败或新旧热点交替异常。hotspot_stop 内部已等待确认（bridge/snapshot）。
     if [ "$FORCE_RESTART" = "1" ]; then
       if ! hotspot_stop >/dev/null 2>&1; then
+        echo "$(date) HOTSPOT_STOP source=config_restart result=failed" >> "$LOG"
         write_operation error "热点重启失败：旧热点未能成功停止"
         release_operation_lock
         exit 0
       fi
+      echo "$(date) HOTSPOT_STOP source=config_restart result=success" >> "$LOG"
       sleep 1
     fi
     # 直接“开启热点”时不再先执行 stop；只有保存配置并需要重启时才 stop -> start。
@@ -126,6 +128,11 @@ restart_hotspot_async() {
       PARAM_ERR=$(verify_hotspot_params "$NEW_SSID" "$NEW_SECURITY" "$NEW_BAND" "$NEW_CHANNEL")
       if [ -z "$PARAM_ERR" ]; then
         OK=1
+        if [ "$FORCE_RESTART" = "1" ]; then
+          echo "$(date) HOTSPOT_START source=config_restart result=success" >> "$LOG"
+        else
+          echo "$(date) HOTSPOT_START source=manual result=success" >> "$LOG"
+        fi
         switch_management_to_hotspot "$VERIFY_IFACE"
         # v1.7.9：系统 DHCP 未建立时自建 DHCP/NAT（修复热点半开——设备连上无网）
         ensure_hotspot_dhcp "$VERIFY_IFACE"

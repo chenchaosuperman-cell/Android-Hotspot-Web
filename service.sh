@@ -280,22 +280,59 @@ start_httpd() {
   chmod 0600 "$PIDFILE"
 }
 
-# MANUAL_OFF 是“本次开机”的临时状态：手机开机后 120 秒内由 init 拉起时清除；
-# 模块服务单独重启（restart_module）不清除，保留用户本次开机的选择。
+# desired_state 只允许在“真正的新一轮系统启动”时由 AUTOSTART 初始化。
+# 同一次开机内 service.sh 自己重启时必须保留现有 desired_state，不能擅自写 0；
+# 否则后续系统 SoftAP 被关闭时 keepalive 会因为 desired=0 而拒绝恢复热点。
+# boot_id 用来可靠区分“手机重启”和“模块服务重启”，避免仅靠 uptime<120s 的误判。
+BOOT_ID_FILE="$DATA_DIR/boot.id"
+CURRENT_BOOT_ID=$(/system/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+SAVED_BOOT_ID=$(/system/bin/cat "$BOOT_ID_FILE" 2>/dev/null)
 _UP_SEC=$(/system/bin/cat /proc/uptime 2>/dev/null | "$BB" awk '{print int($1)}')
 case "$_UP_SEC" in ''|*[!0-9]*) _UP_SEC=999 ;; esac
-if [ "$_UP_SEC" -lt 120 ]; then
-  rm -f "$MANUAL_OFF_FILE" 2>/dev/null
+
+NEW_BOOT=0
+if [ -n "$CURRENT_BOOT_ID" ]; then
+  if [ -n "$SAVED_BOOT_ID" ]; then
+    [ "$CURRENT_BOOT_ID" != "$SAVED_BOOT_ID" ] && NEW_BOOT=1
+  else
+    # 首次升级到本逻辑时没有 boot.id：仅在开机早期视为真正新启动；
+    # 若系统已经运行较久，则按“服务热重启”处理，避免覆盖当前 desired_state。
+    [ "$_UP_SEC" -lt 120 ] && NEW_BOOT=1
+  fi
+  printf '%s\n' "$CURRENT_BOOT_ID" > "$BOOT_ID_FILE"
+  chmod 0600 "$BOOT_ID_FILE"
+else
+  # 极端兼容兜底：读不到 boot_id 时才沿用旧的 uptime 判定。
+  [ "$_UP_SEC" -lt 120 ] && NEW_BOOT=1
 fi
 
-# 开机自启：仅在真正手机开机（uptime<120s，已清 MANUAL_OFF）且 AUTOSTART=1 时启动；
-# 单独重启模块服务保留 MANUAL_OFF，不重新拉起热点。
-if [ "$_UP_SEC" -lt 120 ] && [ "$AUTOSTART" = "1" ] && [ ! -e "$MANUAL_OFF_FILE" ]; then
-  echo "$(date) autostart: starting" >> "$LOG"
-  echo 1 > "$DESIRED_FILE"
-  start_hotspot || echo 0 > "$DESIRED_FILE"
+if [ "$NEW_BOOT" = "1" ]; then
+  rm -f "$MANUAL_OFF_FILE" 2>/dev/null
+  if [ "$AUTOSTART" = "1" ]; then
+    echo "$(date) autostart: new boot detected, starting" >> "$LOG"
+    echo 1 > "$DESIRED_FILE"
+    start_hotspot || echo 0 > "$DESIRED_FILE"
+  else
+    echo 0 > "$DESIRED_FILE"
+  fi
 else
-  echo 0 > "$DESIRED_FILE"
+  # 同一次开机内 service.sh 重启：保留已有期望状态。
+  # 只有文件缺失/损坏时才根据当前真实 SoftAP 状态做一次安全初始化。
+  DESIRED_INIT=$(/system/bin/cat "$DESIRED_FILE" 2>/dev/null)
+  case "$DESIRED_INIT" in
+    0|1)
+      echo "$(date) service restart: preserving desired=$DESIRED_INIT" >> "$LOG"
+      ;;
+    *)
+      softap_state_snapshot >/dev/null 2>&1
+      SNAP_INIT=${SNAP_AP_STATE:-}
+      case "$SNAP_INIT" in
+        ENABLED|ENABLING) echo 1 > "$DESIRED_FILE" ;;
+        *) echo 0 > "$DESIRED_FILE" ;;
+      esac
+      echo "$(date) service restart: desired missing/invalid, initialized from SoftAP state=${SNAP_INIT:-unknown}" >> "$LOG"
+      ;;
+  esac
 fi
 chmod 0600 "$DESIRED_FILE"
 start_httpd
@@ -316,6 +353,7 @@ try_stop_hotspot() {
   _reason=$1
   _iface=$2
   if hotspot_stop; then
+    echo "$(date) HOTSPOT_STOP source=$_reason result=success" >> "$LOG"
     [ -n "$_iface" ] && remove_management_alias "$_iface" 2>/dev/null
     echo 0 > "$DESIRED_FILE"
     chmod 0600 "$DESIRED_FILE"
@@ -323,7 +361,7 @@ try_stop_hotspot() {
     chmod 0600 "$STOP_REASON_FILE" 2>/dev/null
     return 0
   fi
-  echo "$(date) hotspot stop FAILED (reason=$_reason); desired kept on, no false 'stopped' report" >> "$LOG"
+  echo "$(date) HOTSPOT_STOP source=$_reason result=failed; desired kept on, no false 'stopped' report" >> "$LOG"
   return 1
 }
 
@@ -424,6 +462,7 @@ while true; do
         # v1.7.9：与定时/流量/空闲关闭统一走兼容层 hotspot_stop（bridge 优先，
         # fallback stop_hotspot_real），不再直用旧 Shell 实现。
         if hotspot_stop; then
+          echo "$(date) HOTSPOT_STOP source=manual result=success" >> "$LOG"
           printf '0\n' > "$DESIRED_FILE"
           chmod 0600 "$DESIRED_FILE"
           printf 'manual\n' > "$STOP_REASON_FILE"
@@ -433,6 +472,7 @@ while true; do
           : > "$SKIP_WINDOW_FILE"
           write_operation success "热点已实际关闭，本次开机内不会自动拉起"
         else
+          echo "$(date) HOTSPOT_STOP source=manual result=failed" >> "$LOG"
           printf '1\n' > "$DESIRED_FILE"
           chmod 0600 "$DESIRED_FILE"
           rm -f "$MANUAL_OFF_FILE" "$SKIP_WINDOW_FILE" "$STOP_REASON_FILE"
@@ -582,6 +622,7 @@ while true; do
           echo "$(date) schedule: in window, starting" >> "$LOG"
           echo 1 > "$DESIRED_FILE"
           if start_hotspot; then
+            echo "$(date) HOTSPOT_START source=schedule result=success" >> "$LOG"
             IFACE=$(get_hotspot_iface)
     if [ -n "$IFACE" ] && softap_state_ok "$IFACE"; then
       switch_management_to_hotspot "$IFACE"
@@ -590,6 +631,7 @@ while true; do
     fi
             DESIRED=1
           else
+            echo "$(date) HOTSPOT_START source=schedule result=failed" >> "$LOG"
             IFACE=
             DESIRED=0
           fi
@@ -648,21 +690,33 @@ while true; do
       fi
     fi
 
-    # 保活：期望开启但热点掉了就重启（保活关闭时不自动重启）
-    if [ "$DESIRED" = "1" ] && [ "$KEEPALIVE" = "1" ] && [ -z "$IFACE" ] && [ ! -e "$MANUAL_OFF_FILE" ]; then
-      echo "$(date) SoftAP is down while desired; restarting" >> "$LOG"
+    # 保活：以 Framework/softap.cache 的真实 SoftAP 状态为准，而不是只看 IFACE。
+    # HyperOS 会保留 wlan2/管理别名/接口缓存一段时间，即使 SoftAP 已被系统自己的
+    # 10 分钟 idle timeout 关闭；旧逻辑 [ -z "$IFACE" ] 会因此误判“热点仍在”，
+    # 导致 desired=1 + keepalive=1 时也不恢复。
+    AP_ACTUALLY_DOWN=0
+    case "${SNAP_AP_STATE:-}" in
+      DISABLED|FAILED) AP_ACTUALLY_DOWN=1 ;;
+      ENABLED|ENABLING) AP_ACTUALLY_DOWN=0 ;;
+      *) [ -z "$IFACE" ] && AP_ACTUALLY_DOWN=1 ;;
+    esac
+    if [ "$DESIRED" = "1" ] && [ "$KEEPALIVE" = "1" ] && [ "$AP_ACTUALLY_DOWN" = "1" ] && [ ! -e "$MANUAL_OFF_FILE" ]; then
+      echo "$(date) SoftAP actually down while desired (state=${SNAP_AP_STATE:-unknown}); restarting" >> "$LOG"
       if start_hotspot; then
+        echo "$(date) HOTSPOT_START source=keepalive result=success state=${SNAP_AP_STATE:-unknown}" >> "$LOG"
         IFACE=$(get_hotspot_iface)
-    if [ -n "$IFACE" ] && softap_state_ok "$IFACE"; then
-      switch_management_to_hotspot "$IFACE"
-    else
-      ensure_management_loopback
-    fi
-        echo "$(date) keepalive: hotspot recovered" >> "$LOG"
+        if [ -n "$IFACE" ] && softap_state_ok "$IFACE"; then
+          switch_management_to_hotspot "$IFACE"
+        else
+          ensure_management_loopback
+        fi
+        echo "$(date) keepalive: hotspot recovered from system auto-shutdown" >> "$LOG"
       else
+        echo "$(date) HOTSPOT_START source=keepalive result=failed state=${SNAP_AP_STATE:-unknown}" >> "$LOG"
+        # 保活失败不再把 DESIRED 永久改成 0。系统/驱动短暂忙时下一轮继续尝试，
+        # 否则一次瞬时启动失败就会把用户期望状态清掉，表现为“热点自己关了”。
         IFACE=
-        DESIRED=0
-        echo "$(date) keepalive: start failed, desired reset to off" >> "$LOG"
+        echo "$(date) keepalive: restart failed; desired kept on for next retry" >> "$LOG"
       fi
     fi
 

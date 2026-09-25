@@ -160,8 +160,25 @@ if [ "$PLAN_PERCENT" -ge 0 ] 2>/dev/null && [ -n "$PLAN_PERIOD_DAY" ]; then
   fi
 fi
 
-IDLE_LEFT=$(cat "$IDLE_FILE" 2>/dev/null | "$BB" tr -d ' ')
-case "$IDLE_LEFT" in ''|*[!0-9]*) IDLE_LEFT=0 ;; esac
+# v1.8.0-idlefix: do not trust idle.countdown as the display source.  It is only
+# refreshed by the 15s policy tick and can therefore remain stale after SoftAP has
+# already stopped.  Compute the remaining time from the persisted start timestamp
+# on every status generation; when the real hotspot is not ON, the countdown is 0.
+IDLE_LEFT=0
+IDLE_DEADLINE=0
+if [ "$HOTSPOT_STATE" = "ON" ] && [ "$DESIRED" = "1" ] && [ "${IDLE_SHUTDOWN:-0}" -gt 0 ] 2>/dev/null; then
+  IDLE_START=$(cat "$IDLE_SINCE" 2>/dev/null | "$BB" tr -d ' \r\n')
+  NOW_IDLE=$(/system/bin/date +%s 2>/dev/null || date +%s)
+  case "$IDLE_START" in ''|*[!0-9]*) IDLE_START=0 ;; esac
+  case "$NOW_IDLE" in ''|*[!0-9]*) NOW_IDLE=0 ;; esac
+  if [ "$IDLE_START" -gt 0 ] && [ "$NOW_IDLE" -ge "$IDLE_START" ]; then
+    IDLE_DEADLINE=$((IDLE_START + IDLE_SHUTDOWN * 60))
+    IDLE_REMAIN=$((IDLE_DEADLINE - NOW_IDLE))
+    if [ "$IDLE_REMAIN" -gt 0 ]; then
+      IDLE_LEFT=$(((IDLE_REMAIN + 59) / 60))
+    fi
+  fi
+fi
 
 # 客户端列表（合并流量统计）
 # P1-82：状态接口保持只读——统计链 RETURN 计数规则的维护已移至 service.sh 主循环，
@@ -384,7 +401,7 @@ printf '"traffic":{"today":%s,"month":%s,"todayValid":%s,"monthValid":%s,"plan":
 printf '"days":[%s],"history":%s},' "$(build_traffic_days)" "$(build_traffic_history)"
 printf '"smsFwd":{"on":%s,"keyword":%s,"senders":%s,"keywordText":"%s","sendersText":"%s"},' "$([ "${SMS_FWD:-0}" = "1" ] && echo true || echo false)" "$([ -n "${SMS_FWD_KEYWORD_B64:-}" ] && echo true || echo false)" "$([ -n "${SMS_FWD_SENDERS_B64:-}" ] && echo true || echo false)" "$(json_escape "${SMS_FWD_KEYWORD:-}")" "$(json_escape "${SMS_FWD_SENDERS:-}")"
 printf '"lowbatt":{"enable":%s,"threshold":%s,"level":"%s","power":%s,"latch":"%s","reason":"%s","checked":%s},' "$([ "$LB_EN" = "1" ] && echo true || echo false)" "$LB_TH" "$(json_escape "$LB_LEVEL")" "$LB_POWER" "$(json_escape "$LB_LATCH")" "$(json_escape "$LB_REASON")" "$LB_CHECKED"
-printf '"idleLeft":%s,' "$IDLE_LEFT"
+printf '"idleLeft":%s,"idleDeadline":%s,' "$IDLE_LEFT" "$IDLE_DEADLINE"
 printf '"notify":{"pp":%s,"dt":%s,"dtsec":%s,"limit":%s,"bark":%s,"thresholds":"%s"},' \
   "$([ -n "${PUSHPLUS_TOKEN_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_WEBHOOK_B64:-}" ] && echo true || echo false)" "$([ -n "${DINGTALK_SECRET_B64:-}" ] && echo true || echo false)" "$([ "${NOTIFY_LIMIT:-1}" = "1" ] && echo true || echo false)" "$([ -n "${BARK_KEY_B64:-}" ] && echo true || echo false)" "${NOTIFY_TRAFFIC_THRESHOLDS:-80,90,100}"
 printf '"notifyHealth":{"pp":%s,"dt":%s,"sms":%s,"bk":%s},' \

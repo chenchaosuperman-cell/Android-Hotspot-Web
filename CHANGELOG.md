@@ -1,4 +1,32 @@
-# v1.8.1-beta（2026-09-25）
+# v1.9.0-beta（2026-09-25）
+
+- 基于 v1.8.2-beta（stabilityfix 系列）发布整理：不改热点、DHCP、NAT、路由、SoftAP Bridge、流量统计与现有策略逻辑。
+- 发布元数据更新：module.prop 升级为 version=1.9.0-beta、versionCode=18103。
+- update.json 更新为 v1.9.0-beta，并指向 v1.9.0-beta Release ZIP。
+- Web CGI 请求缓存破坏号由 ?v=182 更新为 ?v=190，避免升级后浏览器继续使用旧缓存。
+
+# v1.8.2-beta（2026-09-25）
+
+- 基于 v1.8.0-beta-stabilityfix 发布整理，不改热点、DHCP、NAT、路由、SoftAP Bridge、流量统计与现有策略逻辑。
+- 发布元数据更新：module.prop 升级为 version=1.8.2-beta、versionCode=18102。
+- update.json 更新为 v1.8.2-beta，并指向 v1.8.2-beta Release ZIP。
+- Web CGI 请求缓存破坏号由 `?v=142` 更新为 `?v=182`，避免升级后浏览器继续使用旧缓存。
+
+# v1.8.0-beta-stabilityfix
+
+- 修复 Web `status()` 仅有“8 秒超时”文案、实际 fetch 无 AbortController 的问题；超时后会正确释放 `statusPromise` 并允许后续轮询恢复。
+- 代理状态刷新改为仅在“科学”Tab 且页面可见时每 10 秒刷新；切换到该 Tab 时立即刷新，离开或浏览器后台时停止代理刷新定时器。
+- 新增结构化热点启停来源日志：manual / config_restart / schedule / idle / limit / keepalive，便于定位“热点自行关闭/拉起”来源；不改变原有热点控制策略。
+- 保持 DHCP、NAT、固定管理地址、SoftAP Bridge、系统热点配置同步、空闲倒计时与 keepalive 判定逻辑不变。
+
+# v1.8.0-beta-autorecoverfix
+
+- 修复 HyperOS 系统 SoftAP 自带 600000ms（10 分钟）idle timeout 提前关闭热点后，模块因 wlan2/接口缓存仍存在而误判热点仍在线的问题。
+- keepalive 改为优先依据 Framework SoftAP 真实状态（DISABLED/FAILED）判断是否需要恢复。
+- keepalive 单次重启失败时不再把 DESIRED 永久清零，避免瞬时系统忙导致热点“自己关闭且不再恢复”。
+- 不修改 NAT、DHCP、上游切换、流量统计、30 分钟空闲策略。
+
+# v1.8.0-beta-usagefix
 
 - 仅修复影响实际使用的流量统计问题，不改热点启停、上游切换、NAT/FORWARD 与页面状态逻辑。
 - 修复 `mifi_up` / `mifi_dn` 统计链为空导致链字节永远为 0：为两条统计链加入纯计数 `RETURN` 规则。
