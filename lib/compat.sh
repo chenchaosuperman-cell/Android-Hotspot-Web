@@ -593,14 +593,16 @@ hotspot_start() {
   if bridge_available; then
     B_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-start 2>/dev/null)
     case "$B_OUT" in
-      ok=1*)
+      *'ok=1'*)
         echo "$(date) hotspot_start: bridge tether-start (system Tethering)" >> "$LOG" 2>/dev/null
         if wait_tether_enabled 10; then
           return 0
         fi
         echo "$(date) hotspot_start: bridge tether-start did not reach ENABLED within 10s" >> "$LOG" 2>/dev/null
         ;;
-      *) echo "$(date) hotspot_start: bridge tether-start unavailable/failed, fallback" >> "$LOG" 2>/dev/null ;;
+      *)
+        echo "$(date) hotspot_start: bridge tether-start unavailable/failed, fallback; result=$(printf '%s' "$B_OUT" | "$BB" tr '\n' ' ' | "$BB" head -c 180)" >> "$LOG" 2>/dev/null
+        ;;
     esac
   fi
 
@@ -652,7 +654,7 @@ hotspot_stop() {
   if bridge_available; then
     B_OUT=$("$APP_PROCESS" -Djava.class.path="$BRIDGE_DEX" /system/bin com.mifi.softap.SoftApBridge tether-stop 2>/dev/null)
     case "$B_OUT" in
-      ok=1*)
+      *'ok=1'*)
         echo "$(date) hotspot_stop: bridge tether-stop (system Tethering)" >> "$LOG" 2>/dev/null
         I=0
         STOP_CONFIRM_MAX=${STOP_CONFIRM_MAX:-8}
@@ -677,7 +679,9 @@ hotspot_stop() {
         echo "$(date) hotspot_stop: system still reports hotspot active after $STOP_CONFIRM_MAX s" >> "$LOG" 2>/dev/null
         return 1
         ;;
-      *) echo "$(date) hotspot_stop: bridge tether-stop unavailable, fallback" >> "$LOG" 2>/dev/null ;;
+      *)
+        echo "$(date) hotspot_stop: bridge tether-stop unavailable, fallback; result=$(printf '%s' "$B_OUT" | "$BB" tr '\n' ' ' | "$BB" head -c 180)" >> "$LOG" 2>/dev/null
+        ;;
     esac
   fi
   stop_hotspot_real

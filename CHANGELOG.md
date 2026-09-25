@@ -1,3 +1,23 @@
+# v1.8.0-beta-fullfix（2026-09-25）
+
+- 修复热点客户端无互联网的核心回程路由错误：旧代码把 local_network 链路路由写成 `192.168.43.1/24`，该前缀无效，实际诊断中 local_network 只有 default、没有热点子网；现统一使用 `192.168.43.0/24`。
+- 自建 Tethering 新增双向策略路由：`from 192.168.43.0/24` 负责客户端出站，`to 192.168.43.0/24` 负责 NAT 回包回到 wlan2，避开 Android 16 policy routing 的 unreachable。
+- 修复双 supervisor / 双 httpd：service.sh 改为原子 mkdir 单实例锁；启动时清理所有本模块遗留 httpd，不再只信任可能过期的 pidfile。
+- DHCP 生命周期重构：udhcpd 只允许长期 supervisor 启动，CGI 仅提交 `dhcp.request`，避免 httpd 请求结束后子进程被 cgroup 回收；同时强制单实例。
+- DHCP DNS 优先使用当前 Wi-Fi 上游网关，并保留 223.5.5.5 / 1.1.1.1 备用，避免固定 8.8.8.8 在部分网络下导致“已连 Wi-Fi 但提示无互联网”。
+- 普通“开启热点/保活恢复”不再先 stop；只有配置变更才执行 stop → start。
+- 诊断包新增 ip rule、FORWARD 全链、all-table defaults 与 udhcpd.log，后续网络问题可直接定位。
+
+# v1.8.0-beta-hotfix3
+
+- 修复系统 Tethering Bridge 成功结果误判：SoftApBridge 成功输出为 `backend=modern\nok=1`（或 legacy），旧 shell 仅匹配以 `ok=1` 开头，导致成功也被当作失败并继续 fallback 到 `cmd wifi start-softap`，可能覆盖/打断系统 DHCP/NAT。现改为匹配输出中的 `ok=1`。
+- stop 路径同步修复同类误判。
+- Bridge 真失败时记录非敏感返回摘要，便于继续定位 Android/HyperOS Tethering Binder 兼容问题。
+
+# v1.8.0-beta-hotfix1（2026-09-25）— 热点联网修复
+- 修复：Android/HyperOS 上 `ps -A -o PID,CMDLINE` 兼容性导致 DHCP 守护永久误判，反复拉起大量 udhcpd 实例；改为直接扫描 `/proc/*/cmdline`，并统一用于检测与停止。
+- 修复：自建 DHCP/NAT 模式下 Android 16 `main` 路由表无 default 时，热点客户端转发包命中策略路由末端 unreachable；为 `192.168.43.0/24` 增加仅作用于热点客户端的 `local_network` 策略路由规则，并在清理时删除。
+- 回归：原 134 项测试全部通过。
 # v1.8.0-beta（2026-09-24）— 诊断导出 + 日志与规则清理修复
 - 新增：后台诊断报告新增「导出诊断包」——一键打包 service.log（截断 3000 行）/状态缓存/运行时状态（接口、路由、iptables、进程、客户端）/关键系统属性/代理状态/脱敏配置为 tar.gz 下载，供其它机器遇到问题时一键收集发回分析；脱敏：config 密码/订阅/短信/令牌全部打码，日志中 token/password/sub_b64 替换为 ***；SMS_FWD 开关保留
 - 修复：status.cgi 读缺失缓存文件（notify_health/data_usage/stop_reason/config.saved）时，toybox sh 输入重定向（< file）打开失败在 shell 层报错、绕过命令的 2>/dev/null，stderr 经 httpd 反复刷屏 service.log 淹没真实日志——读前先 [ -r ] 判存在，tr < file 改 cat file 2>/dev/null | tr 管道

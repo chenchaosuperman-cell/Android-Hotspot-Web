@@ -658,32 +658,76 @@ ensure_hotspot_dhcp() {
   UP=$(get_upstream_iface)
   [ -n "$UP" ] && [ "$UP" != "$iface" ] || return 1
   # 3) ip_forward + 转发放行（记录原值供 cleanup 恢复；不重置系统其他链）
+  HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
   FWD_BEFORE=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null | "$BB" tr -d ' ')
-  printf '%s' "$FWD_BEFORE" > "$DATA_DIR/ip_forward.orig" 2>/dev/null
+  [ -r "$DATA_DIR/ip_forward.orig" ] || printf '%s' "$FWD_BEFORE" > "$DATA_DIR/ip_forward.orig" 2>/dev/null
   echo 1 > /proc/sys/net/ipv4/ip_forward
-  $IPT -t nat -C POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null     || $IPT -t nat -A POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null
-  $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null     || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
-  $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null     || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-  # 4) DHCP：busybox udhcpd（系统 dnsmasq 参数受限不可靠）
-  # v1.8.0：杀旧实例后等待 exec/退出完成，避免启动瞬间双实例抢 67 端口
-  kill_udhcpd 2>/dev/null
-  sleep 1
+  $IPT -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null \
+    || $IPT -t nat -A POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null
+  $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null \
+    || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
+  $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+
+  # Android 16/HyperOS 手工 Tethering 必须同时解决“出去”和“回来”的策略路由：
+  #  - from HOTSPOT_SUBNET：客户端出站查 local_network；
+  #  - to   HOTSPOT_SUBNET：NAT 回包查 local_network，避免落到 Android 的 unreachable 规则。
+  # 注意网络前缀必须是 192.168.43.0/24，不能写 192.168.43.1/24；旧代码这里写错后
+  # ip route replace 会失败，诊断中 local_network 因而只有 default、没有热点回程路由。
+  /system/bin/ip route replace "$HOTSPOT_SUBNET" dev "$iface" scope link table local_network 2>/dev/null
+  GW=$(/system/bin/ip route show table "$UP" 2>/dev/null | "$BB" awk '/^default/{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}')
+  if [ -n "$GW" ]; then
+    /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
+  else
+    /system/bin/ip route replace default dev "$UP" table local_network 2>/dev/null
+  fi
+  /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network" \
+    || /system/bin/ip rule add priority 17890 to "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
+  /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "from $HOTSPOT_SUBNET lookup local_network" \
+    || /system/bin/ip rule add priority 17900 from "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
+
+  # 4) DHCP：配置由任意调用方生成，但 udhcpd 只允许 supervisor 持有。
+  # CGI/httpd 子进程在请求结束时可能被 Android cgroup 回收，旧实现从 CGI 直接 & 启动
+  # udhcpd 会出现“刚启动就消失”；改为非 supervisor 仅提交 dhcp.request，由 service.sh 拉起。
+  DNS1="$GW"
+  [ -n "$DNS1" ] || DNS1=223.5.5.5
   {
     printf 'interface %s\n' "$iface"
     printf 'start %s.2\n' "${STABLE_IP%.*}"
     printf 'end %s.254\n' "${STABLE_IP%.*}"
     printf 'opt subnet 255.255.255.0\n'
     printf 'opt router %s\n' "$STABLE_IP"
-    printf 'opt dns 8.8.8.8 8.8.4.4\n'
+    printf 'opt dns %s 223.5.5.5 1.1.1.1\n' "$DNS1"
     printf 'opt lease 86400\n'
     printf 'lease_file %s/udhcpd.leases\n' "$DATA_DIR"
   } > "$DATA_DIR/udhcpd.conf" 2>/dev/null
-  # 预创建 lease 文件：/var 在 Android 上只读，默认路径打不开；
-  # 用数据目录下的文件（busybox 打开失败仅警告不退出，但预建后无噪音且可持久化租约）
-  : > "$DATA_DIR/udhcpd.leases" 2>/dev/null
-  rm -f "$DATA_DIR/udhcpd.pid" 2>/dev/null
-  "$BB" udhcpd -f "$DATA_DIR/udhcpd.conf" >> "$DATA_DIR/udhcpd.log" 2>&1 &
-  echo "$(date) ensure_hotspot_dhcp: self-built DHCP/NAT on $iface (upstream $UP, subnet ${STABLE_IP%.*}.0/24)" >> "$LOG" 2>/dev/null
+  [ -e "$DATA_DIR/udhcpd.leases" ] || : > "$DATA_DIR/udhcpd.leases" 2>/dev/null
+
+  SUP_PID=$(cat "$DATA_DIR/supervisor.pid" 2>/dev/null | "$BB" tr -d ' \r\n')
+  if [ "$SUP_PID" != "$$" ]; then
+    : > "$DATA_DIR/dhcp.request" 2>/dev/null
+    echo "$(date) ensure_hotspot_dhcp: routes/NAT ready; DHCP delegated to supervisor on $iface" >> "$LOG" 2>/dev/null
+    return 0
+  fi
+
+  # supervisor 内保证单实例：已有一个就复用，多余实例清掉；没有才启动。
+  FIRST=
+  for P in $(udhcpd_pids 2>/dev/null); do
+    if [ -z "$FIRST" ]; then FIRST=$P; else kill "$P" 2>/dev/null; fi
+  done
+  if [ -z "$FIRST" ]; then
+    rm -f "$DATA_DIR/udhcpd.pid" 2>/dev/null
+    "$BB" udhcpd -f "$DATA_DIR/udhcpd.conf" >> "$DATA_DIR/udhcpd.log" 2>&1 &
+    UDPID=$!
+    printf '%s\n' "$UDPID" > "$DATA_DIR/udhcpd.pid" 2>/dev/null
+    sleep 1
+    if ! udhcpd_alive; then
+      echo "$(date) ERROR ensure_hotspot_dhcp: udhcpd exited immediately; see udhcpd.log" >> "$LOG" 2>/dev/null
+      return 1
+    fi
+  fi
+  rm -f "$DATA_DIR/dhcp.request" 2>/dev/null
+  echo "$(date) ensure_hotspot_dhcp: self-built DHCP/NAT ready on $iface (upstream $UP, subnet $HOTSPOT_SUBNET)" >> "$LOG" 2>/dev/null
   return 0
 }
 
@@ -712,7 +756,17 @@ cleanup_hotspot_dhcp() {
     $IPT -D FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
     $IPT -D FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
   fi
+  # 清理仅属于模块自建热点的策略路由规则。
+  HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
+  while /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network"; do
+    /system/bin/ip rule del priority 17890 to "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null || break
+  done
+  while /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "from $HOTSPOT_SUBNET lookup local_network"; do
+    /system/bin/ip rule del priority 17900 from "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null || break
+  done
+  /system/bin/ip route del "$HOTSPOT_SUBNET" dev "$iface" table local_network 2>/dev/null
   /system/bin/ip addr del "$STABLE_IP/24" dev "$iface" 2>/dev/null
+  rm -f "$DATA_DIR/dhcp.request" 2>/dev/null
   # 恢复 ip_forward 原值（仅还原到模块启动前的值，避免影响系统其他转发）
   if [ -r "$DATA_DIR/ip_forward.orig" ]; then
     ORIG=$(cat "$DATA_DIR/ip_forward.orig" 2>/dev/null | "$BB" tr -d ' ')
@@ -725,10 +779,32 @@ cleanup_hotspot_dhcp() {
 # 停掉模块启动的 udhcpd（按配置文件路径匹配，避免误杀系统 DHCP）。
 # 注意：busybox 多进程的进程名都是 busybox，pidof udhcpd 匹配不到，
 # 必须 ps 扫描 cmdline（含 udhcpd 关键字）再按配置路径过滤。
+# 判断/停止模块 udhcpd：直接扫描 /proc，避免 Android toybox ps 的 CMDLINE/ARGS
+# 字段在不同版本上不兼容，导致 supervisor 永久误判 DHCP 已退出并反复拉起实例。
+udhcpd_pids() {
+  for D in /proc/[0-9]*; do
+    [ -r "$D/cmdline" ] || continue
+    CMD=$(cat "$D/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
+    case "$CMD" in
+      *udhcpd*"$DATA_DIR/udhcpd.conf"*) printf '%s\n' "${D#/proc/}" ;;
+    esac
+  done
+}
+
+udhcpd_alive() {
+  P=$(udhcpd_pids 2>/dev/null | "$BB" head -n1)
+  [ -n "$P" ] && [ -d "/proc/$P" ]
+}
+
 kill_udhcpd() {
-  for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
-    CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
-    case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) kill "$P" 2>/dev/null ;; esac
+  for P in $(udhcpd_pids 2>/dev/null); do
+    kill "$P" 2>/dev/null
+  done
+  # 等待旧实例真正退出，避免 67/udp 端口竞争。
+  I=0
+  while udhcpd_alive && [ "$I" -lt 20 ]; do
+    I=$((I + 1))
+    sleep 0.1
   done
   return 0
 }

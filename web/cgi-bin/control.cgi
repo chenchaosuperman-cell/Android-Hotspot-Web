@@ -74,21 +74,25 @@ verify_hotspot_params() {
 # $1=rollback：save_hotspot 传 1（启动失败自动回滚配置），start_softap 传 0。
 restart_hotspot_async() {
   ROLLBACK=${1:-0}
+  FORCE_RESTART=${2:-1}
   (
     trap 'release_operation_lock' EXIT
-    sleep 2
     load_config
     # v1.7.6：系统 SoftApConfiguration 为唯一数据源，run_softap 无参启动
     # （config.conf 残留旧热点字段时，run_softap 内部自动迁移到系统后清除）
     # v1.7.6：停止走系统 Tethering 路径（hotspot_stop → connectivity tether stop）
     # v1.7.9：必须确认旧热点已经成功停止再启动，否则 start-softap 可能因状态冲突
     # 失败或新旧热点交替异常。hotspot_stop 内部已等待确认（bridge/snapshot）。
-    if ! hotspot_stop >/dev/null 2>&1; then
-      write_operation error "热点重启失败：旧热点未能成功停止"
-      release_operation_lock
-      exit 0
+    if [ "$FORCE_RESTART" = "1" ]; then
+      if ! hotspot_stop >/dev/null 2>&1; then
+        write_operation error "热点重启失败：旧热点未能成功停止"
+        release_operation_lock
+        exit 0
+      fi
+      sleep 1
     fi
-    sleep 1
+    # 直接“开启热点”时不再先执行 stop；只有保存配置并需要重启时才 stop -> start。
+    # 这样避免热点原本关闭时白等 stop 确认（最多 8s）和额外启动延迟。
     # Keep loopback management address until hotspot is ready
     OUT=$(run_softap 2>&1)
     RC=$?
@@ -339,7 +343,7 @@ case "$ACTION" in
     chmod 0600 "$DESIRED_FILE"
     write_operation working "正在开启热点"
     printf '{"ok":true,"message":"热点正在启动，结果稍后显示"}'
-    restart_hotspot_async 0
+    restart_hotspot_async 0 0
     ;;
   stop)
     if ! acquire_operation_lock; then

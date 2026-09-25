@@ -18,6 +18,40 @@ chmod 0700 "$DATA_DIR"
 touch "$LOG"
 chmod 0600 "$LOG"
 
+# v1.8.0-fullfix：supervisor 原子单实例锁。旧 pidfile “先读再杀再写”存在竞态，
+# 两个 service.sh 同时启动时都能越过检查，最终出现双 supervisor + 双 httpd。
+SUPERVISOR_LOCK="$DATA_DIR/supervisor.lock"
+acquire_supervisor_lock() {
+  I=0
+  while [ "$I" -lt 2 ]; do
+    if mkdir "$SUPERVISOR_LOCK" 2>/dev/null; then
+      printf '%s\n' "$$" > "$SUPERVISOR_LOCK/pid" 2>/dev/null
+      printf '%s\n' "$$" > "$SUPERVISOR_PIDFILE" 2>/dev/null
+      chmod 0600 "$SUPERVISOR_LOCK/pid" "$SUPERVISOR_PIDFILE" 2>/dev/null
+      return 0
+    fi
+    OWNER=$(cat "$SUPERVISOR_LOCK/pid" 2>/dev/null)
+    case "$OWNER" in ''|*[!0-9]*) OWNER=0 ;; esac
+    if [ "$OWNER" -gt 1 ] && [ -r "/proc/$OWNER/cmdline" ]; then
+      OCMD=$(cat "/proc/$OWNER/cmdline" 2>/dev/null | tr '\000' ' ')
+      case "$OCMD" in *xiaomi_mifi_web*service.sh*) return 1 ;; esac
+    fi
+    rm -rf "$SUPERVISOR_LOCK" 2>/dev/null
+    I=$((I + 1))
+  done
+  return 1
+}
+release_supervisor_lock() {
+  OWNER=$(cat "$SUPERVISOR_LOCK/pid" 2>/dev/null)
+  [ "$OWNER" = "$$" ] && rm -rf "$SUPERVISOR_LOCK" 2>/dev/null
+}
+if ! acquire_supervisor_lock; then
+  echo "$(date) supervisor already running; duplicate service exits" >> "$LOG" 2>/dev/null
+  exit 0
+fi
+trap 'release_supervisor_lock' EXIT
+trap 'release_supervisor_lock; exit 0' HUP INT TERM
+
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
   sleep 2
 done
@@ -30,22 +64,6 @@ dedup_dup_modules
 
 # 旧版文本队列 → 目录式队列（一次性迁移，升级兼容）
 migrate_legacy_queues
-
-# 服务级 PID 锁（P1-12）：确保旧 supervisor 完全退出后再启动，避免新旧守护竞争
-if [ -f "$SUPERVISOR_PIDFILE" ]; then
-  OLD_PID=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
-  case "$OLD_PID" in ''|*[!0-9]*) OLD_PID=0 ;; esac
-  W=0
-  while [ "$OLD_PID" -gt 1 ] && [ -r "/proc/$OLD_PID/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_PID/cmdline" 2>/dev/null | "$BB" grep -q 'mifi_web/service.sh'; do
-    if [ "$W" -ge 10 ]; then kill -9 "$OLD_PID" 2>/dev/null; break; fi
-    kill "$OLD_PID" 2>/dev/null
-    W=$((W + 1))
-    sleep 1
-  done
-fi
-echo $$ > "$SUPERVISOR_PIDFILE"
-chmod 0600 "$SUPERVISOR_PIDFILE"
-
 
 if [ -z "$BB" ] || [ ! -x "$BB" ]; then
   echo "$(date) ERROR: KernelSU BusyBox not found" >> "$LOG"
@@ -167,14 +185,8 @@ start_hotspot() {
   # HyperOS build, WifiShellCommand can fail its Binder transaction when the
   # remote service receives such an FD. Capture through an anonymous pipe and
   # append the text afterwards instead.
-  # v1.7.6：停止走系统 Tethering 路径（hotspot_stop）
-  # v1.7.9：必须确认旧热点已经成功停止再启动，否则 start-softap 可能因
-  # 状态冲突失败或新旧热点交替异常。hotspot_stop 内部已等待确认（bridge/snapshot）。
-  if ! hotspot_stop >/dev/null 2>&1; then
-    echo "$(date) hotspot start aborted: previous hotspot failed to stop" >> "$LOG"
-    return 1
-  fi
-  sleep 1
+  # 直接启动路径不再先 stop：start_hotspot 只用于“当前热点未运行时”的启动/保活。
+  # 配置变更需要重启时由 control.cgi 显式执行 stop -> start，避免普通开启白等 8~11 秒。
   START_OUT=$(run_softap 2>&1)
   START_RC=$?
   printf '%s start-softap rc=%s\n%s\n' "$(date)" "$START_RC" "$START_OUT" >> "$LOG"
@@ -244,6 +256,17 @@ start_hotspot() {
 }
 
 start_httpd() {
+  # 清理所有本模块遗留 httpd，而不是只相信 pidfile；修复异常重启后的双 httpd。
+  for D in /proc/[0-9]*; do
+    [ -r "$D/cmdline" ] || continue
+    HPID=${D#/proc/}
+    [ "$HPID" = "$$" ] && continue
+    HCMD=$(cat "$D/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
+    case "$HCMD" in
+      *httpd*"$MODDIR/web"*) kill "$HPID" 2>/dev/null ;;
+    esac
+  done
+  sleep 1
   if [ -f "$PIDFILE" ]; then
     OLD_PID=$(cat "$PIDFILE" 2>/dev/null)
     case "$OLD_PID" in ''|*[!0-9]*) OLD_PID=0 ;; esac
@@ -256,16 +279,6 @@ start_httpd() {
   echo $! > "$PIDFILE"
   chmod 0600 "$PIDFILE"
 }
-
-if [ -f "$SUPERVISOR_PIDFILE" ]; then
-  OLD_SUPERVISOR=$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null)
-  case "$OLD_SUPERVISOR" in ''|*[!0-9]*) OLD_SUPERVISOR=0 ;; esac
-  if [ "$OLD_SUPERVISOR" -gt 1 ] && [ "$OLD_SUPERVISOR" != "$$" ] && [ -r "/proc/$OLD_SUPERVISOR/cmdline" ] && "$BB" tr '\000' ' ' < "/proc/$OLD_SUPERVISOR/cmdline" | "$BB" grep -q 'mifi_web.*service.sh'; then
-    kill "$OLD_SUPERVISOR" 2>/dev/null
-  fi
-fi
-echo $$ > "$SUPERVISOR_PIDFILE"
-chmod 0600 "$SUPERVISOR_PIDFILE"
 
 # MANUAL_OFF 是“本次开机”的临时状态：手机开机后 120 秒内由 init 拉起时清除；
 # 模块服务单独重启（restart_module）不清除，保留用户本次开机的选择。
@@ -579,36 +592,33 @@ while true; do
       # 1) 回程链路路由（关键）：Android 热点重启会清空 local_network 表；若缺
       #    $STABLE_IP/24 的链路路由，回程应答（SYN-ACK/DNS 响应等）查表走 default
       #    出 wlan0 直接丢包 → 客户端 TCP 全卡 SYN_RECV、页面打不开。必须补链路路由。
-      /system/bin/ip route replace "$STABLE_IP"/24 dev "$IFACE_C" table local_network 2>/dev/null
-      # 2) 出方向默认路由：从上游接口所在表取默认路由补进 local_network
-      if ! /system/bin/ip route show table local_network 2>/dev/null | "$BB" grep -q '^default'; then
-        UP=$(get_upstream_iface)
-        if [ -n "$UP" ]; then
-          GW=$(/system/bin/ip route show table "$UP" 2>/dev/null | "$BB" awk '/^default/{print $3; exit}')
-          [ -n "$GW" ] && /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
+      HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
+      /system/bin/ip route replace "$HOTSPOT_SUBNET" dev "$IFACE_C" scope link table local_network 2>/dev/null
+      # 2) 出方向默认路由：每轮按当前上游刷新，避免 Wi-Fi/蜂窝切换后保留旧 default。
+      UP=$(get_upstream_iface)
+      if [ -n "$UP" ] && [ "$UP" != "$IFACE_C" ]; then
+        GW=$(/system/bin/ip route show table "$UP" 2>/dev/null | "$BB" awk '/^default/{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}')
+        if [ -n "$GW" ]; then
+          /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
+        else
+          /system/bin/ip route replace default dev "$UP" table local_network 2>/dev/null
         fi
+        /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network" \
+          || /system/bin/ip rule add priority 17890 to "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
+        /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "from $HOTSPOT_SUBNET lookup local_network" \
+          || /system/bin/ip rule add priority 17900 from "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
       fi
       DHCP_ALIVE=0
-      for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
-        CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
-        case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) DHCP_ALIVE=1 ;; esac
-      done
-      # v1.8.0：udhcpd 刚启动时 /proc/PID/cmdline 可能尚未成形（exec 窗口），
-      # 立即扫描会误判 not running 而重复拉起，两个实例抢 67 端口导致设备拿不到 IP。
-      # 首次未发现时等待 1 秒复查，确认仍无才重新 ensure。
-      if [ "$DHCP_ALIVE" = 0 ]; then
-        sleep 1
-        for P in $(ps -A -o PID,CMDLINE 2>/dev/null | "$BB" grep 'udhcpd' | "$BB" grep -v grep | "$BB" awk '{print $1}'); do
-          CMD=$(cat "/proc/$P/cmdline" 2>/dev/null | "$BB" tr '\000' ' ')
-          case "$CMD" in *"$DATA_DIR/udhcpd.conf"*) DHCP_ALIVE=1 ;; esac
-        done
-      fi
-      if [ "$DHCP_ALIVE" = 0 ]; then
-        # 接口上有系统 DHCP 网段地址时不干预（ensure 内部同判；此处少一次空转）
+      udhcpd_alive && DHCP_ALIVE=1
+      if [ "$DHCP_ALIVE" = 0 ] || [ -e "$DATA_DIR/dhcp.request" ]; then
+        # 接口上有系统原生热点 IPv4 时由 netd/Tethering 自己提供 DHCP；否则由 supervisor
+        # 独占启动 udhcpd，禁止 CGI 子进程持有 DHCP。
         SYS_IP=$(/system/bin/ip -o -4 addr show dev "$IFACE_C" 2>/dev/null | "$BB" awk -v s="$STABLE_IP" '{split($4,a,"/"); if (a[1]!=s) {print a[1]; exit}}')
         if [ -z "$SYS_IP" ]; then
-          echo "$(date) dhcp-watch: udhcpd not running, re-ensuring" >> "$LOG" 2>/dev/null
+          echo "$(date) dhcp-watch: ensuring supervisor-owned udhcpd" >> "$LOG" 2>/dev/null
           ensure_hotspot_dhcp "$IFACE_C" >/dev/null 2>&1
+        else
+          rm -f "$DATA_DIR/dhcp.request" 2>/dev/null
         fi
       fi
     fi

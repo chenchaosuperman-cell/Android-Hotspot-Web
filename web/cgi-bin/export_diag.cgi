@@ -43,6 +43,7 @@ done
 [ -r "$DATA_DIR/operation.status" ] && cp -f "$DATA_DIR/operation.status" "$TMP/operation.status" 2>/dev/null
 [ -r "$DATA_DIR/udhcpd.conf" ] && cp -f "$DATA_DIR/udhcpd.conf" "$TMP/udhcpd.conf" 2>/dev/null
 [ -r "$DATA_DIR/udhcpd.leases" ] && cp -f "$DATA_DIR/udhcpd.leases" "$TMP/udhcpd.leases" 2>/dev/null
+[ -r "$DATA_DIR/udhcpd.log" ] && "$BB" tail -n 300 "$DATA_DIR/udhcpd.log" > "$TMP/udhcpd.log" 2>/dev/null
 
 # ---------- 3. 脱敏配置（密码/订阅/短信/令牌一律打码） ----------
 "$BB" awk -F= '{k=tolower($1); if(k ~ /password|passwd|sub_url|sub_b64|sms_fwd_|csrf|token|secret|apikey|webhook|key/) {print $1"=***"} else {print}}' \
@@ -62,6 +63,12 @@ done
   /system/bin/ip route show table local_network 2>/dev/null
   echo "--- route main ---"
   /system/bin/ip route show 2>/dev/null
+  echo "--- ip rule ---"
+  /system/bin/ip rule show 2>/dev/null
+  echo "--- route table all defaults ---"
+  /system/bin/ip -4 route show table all 2>/dev/null | grep '^default'
+  echo "--- iptables FORWARD ---"
+  $IPT -S FORWARD 2>/dev/null
   echo "--- iptables mifi 链 ---"
   $IPT -S 2>/dev/null | grep -i mifi
   echo "--- iptables -t nat (前 30 行) ---"
