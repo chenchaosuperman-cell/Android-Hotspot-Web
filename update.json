@@ -1,6 +1,6 @@
 {
-  "version": "v1.8.0-beta",
-  "versionCode": 1730,
-  "zipUrl": "https://github.com/chenchaosuperman-cell/Android-Hotspot-Web/releases/download/v1.8.0-beta/Android-Hotspot-Web_KSU_v1.8.0-beta.zip",
-  "changelog": "https://raw.githubusercontent.com/chenchaosuperman-cell/Android-Hotspot-Web/main/CHANGELOG.md"
+    "changelog":  "https://raw.githubusercontent.com/chenchaosuperman-cell/Android-Hotspot-Web/main/CHANGELOG.md",
+    "versionCode":  18101,
+    "version":  "v1.8.1-beta",
+    "zipUrl":  "https://github.com/chenchaosuperman-cell/Android-Hotspot-Web/releases/download/v1.8.1-beta/Android-Hotspot-Web_KSU_v1.8.1-beta.zip"
 }
