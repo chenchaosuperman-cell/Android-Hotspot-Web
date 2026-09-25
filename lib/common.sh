@@ -587,12 +587,78 @@ save_config() {
 # `ip route show default` 只查 main table 会返回空 → 必须 table all 探测）。
 # WiFi 并发中继时优先 wlan*（手机默认路由的上行 Wi-Fi）；否则取第一条 default。
 get_upstream_iface() {
-  UP=$(/system/bin/ip -4 route show table all 2>/dev/null | "$BB" grep '^default' \
-    | "$BB" grep -oE 'dev [^ ]+' | "$BB" awk '{print $2}' | "$BB" head -n5)
+  R=$(/system/bin/ip -4 route get 1.1.1.1 2>/dev/null | "$BB" head -n1)
+  I=$(printf '%s\n' "$R" | "$BB" sed -n 's/.* dev \([^ ]*\).*/\1/p' | "$BB" head -n1)
+  if [ -n "$I" ] && [ "$I" != "lo" ] && /system/bin/ip -o -4 addr show dev "$I" 2>/dev/null | "$BB" grep -q ' inet '; then
+    printf '%s' "$I"
+    return
+  fi
+  UP=$(/system/bin/ip -4 route show table all 2>/dev/null | "$BB" grep '^default' | "$BB" grep -oE 'dev [^ ]+' | "$BB" awk '{print $2}')
   for I in $UP; do
-    case "$I" in wlan[0-9]*) printf '%s' "$I"; return ;; esac
+    case "$I" in
+      wlan[0-9]*)
+        /system/bin/ip -o -4 addr show dev "$I" 2>/dev/null | "$BB" grep -q ' inet ' || continue
+        printf '%s' "$I"; return
+        ;;
+    esac
   done
-  printf '%s' "$UP" | "$BB" head -n1
+  for I in $UP; do
+    case "$I" in lo|'') continue ;; esac
+    /system/bin/ip -o -4 addr show dev "$I" 2>/dev/null | "$BB" grep -q ' inet ' || continue
+    printf '%s' "$I"; return
+  done
+  return 0
+}
+
+get_upstream_gateway() {
+  U=$1
+  [ -n "$U" ] || return 0
+  /system/bin/ip -4 route show table all 2>/dev/null | "$BB" awk -v d="$U" '
+    $1=="default" {
+      hit=0; gw="";
+      for(i=1;i<=NF;i++) {
+        if($i=="dev" && $(i+1)==d) hit=1;
+        if($i=="via") gw=$(i+1);
+      }
+      if(hit) { print gw; exit }
+    }'
+}
+
+ensure_hotspot_upstream() {
+  iface=$1
+  [ -n "$iface" ] || return 1
+  HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
+  UP=$(get_upstream_iface)
+  [ -n "$UP" ] && [ "$UP" != "$iface" ] || return 1
+  OLD=$(cat "$DATA_DIR/upstream.current" 2>/dev/null | "$BB" head -n1 | "$BB" tr -d ' \r\n')
+  if [ -n "$OLD" ] && [ "$OLD" != "$UP" ]; then
+    while $IPT -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$OLD" -j MASQUERADE 2>/dev/null; do
+      $IPT -t nat -D POSTROUTING -s "$HOTSPOT_SUBNET" -o "$OLD" -j MASQUERADE 2>/dev/null || break
+    done
+    while $IPT -C FORWARD -i "$iface" -o "$OLD" -j ACCEPT 2>/dev/null; do
+      $IPT -D FORWARD -i "$iface" -o "$OLD" -j ACCEPT 2>/dev/null || break
+    done
+    while $IPT -C FORWARD -i "$OLD" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do
+      $IPT -D FORWARD -i "$OLD" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || break
+    done
+  fi
+  $IPT -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null || $IPT -t nat -A POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null
+  $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
+  $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+  /system/bin/ip route replace "$HOTSPOT_SUBNET" dev "$iface" scope link table local_network 2>/dev/null
+  GW=$(get_upstream_gateway "$UP")
+  if [ -n "$GW" ]; then
+    /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
+  else
+    /system/bin/ip route replace default dev "$UP" table local_network 2>/dev/null
+  fi
+  /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network" || /system/bin/ip rule add priority 17890 to "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
+  /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "from $HOTSPOT_SUBNET lookup local_network" || /system/bin/ip rule add priority 17900 from "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
+  if [ "$OLD" != "$UP" ]; then
+    printf '%s\n' "$UP" > "$DATA_DIR/upstream.current" 2>/dev/null
+    echo "$(date) upstream-switch: ${OLD:-none} -> $UP (hotspot $iface)" >> "$LOG" 2>/dev/null
+  fi
+  return 0
 }
 
 # v1.7.9：热点下游接口识别（修复 WiFi 并发下识别错接口）：
@@ -653,58 +719,37 @@ ensure_hotspot_dhcp() {
   [ -n "$SYS_IP" ] && return 0
   # 1) 管理网段地址（含网关，供 DHCP 与后台使用）
   /system/bin/ip addr replace "$STABLE_IP/24" dev "$iface" 2>/dev/null
-  # 2) 上游接口（默认路由；WiFi 并发时为 wlan0，蜂窝 IPv4 时为其 rmnet/ccmni）
-  #    Android policy routing：必须 table all 探测 default（main table 为空）
+  # 2/3) 上游 + NAT/FORWARD/策略路由；支持 Wi-Fi <-> 蜂窝热切换。
+  HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
   UP=$(get_upstream_iface)
   [ -n "$UP" ] && [ "$UP" != "$iface" ] || return 1
-  # 3) ip_forward + 转发放行（记录原值供 cleanup 恢复；不重置系统其他链）
-  HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
   FWD_BEFORE=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null | "$BB" tr -d ' ')
   [ -r "$DATA_DIR/ip_forward.orig" ] || printf '%s' "$FWD_BEFORE" > "$DATA_DIR/ip_forward.orig" 2>/dev/null
   echo 1 > /proc/sys/net/ipv4/ip_forward
-  $IPT -t nat -C POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null \
-    || $IPT -t nat -A POSTROUTING -s "$HOTSPOT_SUBNET" -o "$UP" -j MASQUERADE 2>/dev/null
-  $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null \
-    || $IPT -I FORWARD 1 -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
-  $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
-    || $IPT -I FORWARD 2 -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-
-  # Android 16/HyperOS 手工 Tethering 必须同时解决“出去”和“回来”的策略路由：
-  #  - from HOTSPOT_SUBNET：客户端出站查 local_network；
-  #  - to   HOTSPOT_SUBNET：NAT 回包查 local_network，避免落到 Android 的 unreachable 规则。
-  # 注意网络前缀必须是 192.168.43.0/24，不能写 192.168.43.1/24；旧代码这里写错后
-  # ip route replace 会失败，诊断中 local_network 因而只有 default、没有热点回程路由。
-  /system/bin/ip route replace "$HOTSPOT_SUBNET" dev "$iface" scope link table local_network 2>/dev/null
-  GW=$(/system/bin/ip route show table "$UP" 2>/dev/null | "$BB" awk '/^default/{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}')
-  if [ -n "$GW" ]; then
-    /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
-  else
-    /system/bin/ip route replace default dev "$UP" table local_network 2>/dev/null
-  fi
-  /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network" \
-    || /system/bin/ip rule add priority 17890 to "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
-  /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "from $HOTSPOT_SUBNET lookup local_network" \
-    || /system/bin/ip rule add priority 17900 from "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
+  ensure_hotspot_upstream "$iface" || return 1
+  GW=$(get_upstream_gateway "$UP")
 
   # 4) DHCP：配置由任意调用方生成，但 udhcpd 只允许 supervisor 持有。
   # CGI/httpd 子进程在请求结束时可能被 Android cgroup 回收，旧实现从 CGI 直接 & 启动
   # udhcpd 会出现“刚启动就消失”；改为非 supervisor 仅提交 dhcp.request，由 service.sh 拉起。
-  DNS1="$GW"
-  [ -n "$DNS1" ] || DNS1=223.5.5.5
+  DNS1=223.5.5.5
   {
     printf 'interface %s\n' "$iface"
     printf 'start %s.2\n' "${STABLE_IP%.*}"
     printf 'end %s.254\n' "${STABLE_IP%.*}"
     printf 'opt subnet 255.255.255.0\n'
     printf 'opt router %s\n' "$STABLE_IP"
-    printf 'opt dns %s 223.5.5.5 1.1.1.1\n' "$DNS1"
+    printf 'opt dns %s 1.1.1.1 8.8.8.8\n' "$DNS1"
     printf 'opt lease 86400\n'
     printf 'lease_file %s/udhcpd.leases\n' "$DATA_DIR"
   } > "$DATA_DIR/udhcpd.conf" 2>/dev/null
   [ -e "$DATA_DIR/udhcpd.leases" ] || : > "$DATA_DIR/udhcpd.leases" 2>/dev/null
 
   SUP_PID=$(cat "$DATA_DIR/supervisor.pid" 2>/dev/null | "$BB" tr -d ' \r\n')
-  if [ "$SUP_PID" != "$$" ]; then
+  # v1.8.0-latencyfix: service.sh also owns a lightweight DHCP request worker.
+  # That worker is a child shell, so its PID is not supervisor.pid; mark it with
+  # SUPERVISOR_CONTEXT=1 instead of forcing it to bounce the request back another 5s.
+  if [ "$SUP_PID" != "$$" ] && [ "${SUPERVISOR_CONTEXT:-0}" != "1" ]; then
     : > "$DATA_DIR/dhcp.request" 2>/dev/null
     echo "$(date) ensure_hotspot_dhcp: routes/NAT ready; DHCP delegated to supervisor on $iface" >> "$LOG" 2>/dev/null
     return 0
@@ -750,12 +795,20 @@ cleanup_hotspot_dhcp() {
   $IPT -F mifi_stats 2>/dev/null
   $IPT -F mifi_up 2>/dev/null
   $IPT -F mifi_dn 2>/dev/null
-  UP=$(get_upstream_iface)
+  UP=$(cat "$DATA_DIR/upstream.current" 2>/dev/null | "$BB" head -n1 | "$BB" tr -d ' \r\n')
+  [ -n "$UP" ] || UP=$(get_upstream_iface)
   if [ -n "$UP" ]; then
-    $IPT -t nat -D POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null
-    $IPT -D FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null
-    $IPT -D FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+    while $IPT -t nat -C POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null; do
+      $IPT -t nat -D POSTROUTING -s "$STABLE_IP/24" -o "$UP" -j MASQUERADE 2>/dev/null || break
+    done
+    while $IPT -C FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null; do
+      $IPT -D FORWARD -i "$iface" -o "$UP" -j ACCEPT 2>/dev/null || break
+    done
+    while $IPT -C FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do
+      $IPT -D FORWARD -i "$UP" -o "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || break
+    done
   fi
+  rm -f "$DATA_DIR/upstream.current" 2>/dev/null
   # 清理仅属于模块自建热点的策略路由规则。
   HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
   while /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network"; do
@@ -2105,6 +2158,11 @@ ensure_usage_chain() {
   printf '%s\n' "$iface" > "$USAGE_IFACE_FILE" 2>/dev/null
   $IPT -N mifi_up 2>/dev/null || true
   $IPT -N mifi_dn 2>/dev/null || true
+  # usagefix：统计链必须至少有一条规则才能产生可读取的字节计数。
+  # user-defined chain 直接落到底虽然会返回调用链，但链本身没有 rule counter，
+  # get_chain_bytes() 因此会永远读到 0。加入纯 RETURN 只用于计数，不改变转发结果。
+  $IPT -C mifi_up -j RETURN 2>/dev/null || $IPT -A mifi_up -j RETURN 2>/dev/null
+  $IPT -C mifi_dn -j RETURN 2>/dev/null || $IPT -A mifi_dn -j RETURN 2>/dev/null
   $IPT -C FORWARD -i "$iface" -j mifi_up 2>/dev/null || \
     $IPT -I FORWARD 1 -i "$iface" -j mifi_up 2>/dev/null
   $IPT -C FORWARD -o "$iface" -j mifi_dn 2>/dev/null || \

@@ -1,3 +1,25 @@
+# v1.8.1-beta（2026-09-25）
+
+- 仅修复影响实际使用的流量统计问题，不改热点启停、上游切换、NAT/FORWARD 与页面状态逻辑。
+- 修复 `mifi_up` / `mifi_dn` 统计链为空导致链字节永远为 0：为两条统计链加入纯计数 `RETURN` 规则。
+- 该规则不会改变数据包放行、NAT 或路由，只让已有热点转发流量能够被正确累计，用于今日/月度流量、套餐用量与限额判断。
+
+# v1.8.0-beta-upstreamfix（2026-09-25）
+
+- 修复热点从 Wi-Fi 上游切到 4G/5G 后断网：自动迁移 MASQUERADE / FORWARD / local_network 默认路由。
+- 上游识别过滤无 IPv4 的陈旧 Wi-Fi 路由，并优先采用当前 route-get 出口。
+- 蜂窝网关从全部 Android policy routing 表按真实接口查找，不假设表名等于接口名。
+- DHCP DNS 改为不依赖原 Wi-Fi 网关，避免切到蜂窝后 DNS 仍指向 192.168.x.1。
+- 新增 1 秒轻量上游监视器，Wi-Fi <-> 4G/5G 切换无需重启热点。
+
+# v1.8.0-beta-latencyfix (2026-09-25)
+
+- 缩短 Bridge Tethering 启动等待：系统返回成功后仅短暂等待 3 秒；若 SoftAP 接口已经出现，立即进入网络准备，不再白等 10 秒。
+- 新增 fast DHCP worker：CGI 提交 `dhcp.request` 后约 0.25 秒级接手，不再等待主 supervisor 5 秒 tick。
+- 热点启动成功提示前短暂等待 DHCP 请求被消费，使“已启动”更接近“客户端已可联网”。
+- 保留 fullfix 的单实例、DHCP/NAT、local_network 双向策略路由修复。
+- 原项目测试：134/134 通过。
+
 # v1.8.0-beta-fullfix（2026-09-25）
 
 - 修复热点客户端无互联网的核心回程路由错误：旧代码把 local_network 链路路由写成 `192.168.43.1/24`，该前缀无效，实际诊断中 local_network 只有 default、没有热点子网；现统一使用 `192.168.43.0/24`。
@@ -578,3 +600,9 @@
 ### 遗留（待真机验证，HyperOS 相关）
 - cmd wifi / dumpsys 输出解析、wlan2 接口名、SELinux 对 su 调用限制需在小米 14 真机确认。
 - tc / iptables 对 HyperOS 内核的可用性未真机验证。
+## v1.8.0-beta-statesyncfix
+- 修复热点已在系统状态栏开启、Web 页面仍长时间停留在旧状态的问题。
+- 根因：完整 `status.cgi` 允许复用最长 30 秒的 JSON 缓存，热点状态被旧缓存一起冻结。
+- 新增轻量 `hotspot_state.cgi`：热点状态与完整设备状态解耦；普通轮询只读轻量状态缓存。
+- 用户手动开启/关闭热点后的 12-15 秒内启用 800ms 实时 SoftAP 状态轮询，系统状态变化后页面约 1 秒级跟随。
+- 平时每 2 秒轻量同步热点状态，不触发完整设备状态重建；完整状态仍保持 5 秒轮询，降低系统负载。

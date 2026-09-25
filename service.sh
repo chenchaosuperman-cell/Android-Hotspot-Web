@@ -327,6 +327,43 @@ try_stop_hotspot() {
   return 1
 }
 
+# v1.8.0-latencyfix: fast DHCP request worker.
+# The main supervisor tick is intentionally 5s because it runs expensive dumpsys/cache
+# maintenance. DHCP cannot wait for that tick: a client may associate immediately and
+# otherwise sit for several seconds without an IPv4 lease. This lightweight worker only
+# wakes when control.cgi has already prepared routes/NAT and created dhcp.request.
+fast_dhcp_worker() {
+  export SUPERVISOR_CONTEXT=1
+  while true; do
+    if [ -e "$DATA_DIR/dhcp.request" ]; then
+      F_IF=$(cat "$HOTSPOT_IFACE_FILE" 2>/dev/null | "$BB" head -n1 | "$BB" tr -d ' \r\n')
+      case "$F_IF" in
+        wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*) : ;;
+        *) F_IF=$(get_hotspot_iface 2>/dev/null) ;;
+      esac
+      if [ -n "$F_IF" ]; then
+        ensure_hotspot_dhcp "$F_IF" >/dev/null 2>&1
+      fi
+    fi
+    sleep 0.25
+  done
+}
+fast_dhcp_worker &
+FAST_DHCP_PID=$!
+
+fast_upstream_worker() {
+  export SUPERVISOR_CONTEXT=1
+  while true; do
+    F_IF=$(cat "$HOTSPOT_IFACE_FILE" 2>/dev/null | "$BB" head -n1 | "$BB" tr -d ' \r\n')
+    case "$F_IF" in
+      wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*) ensure_hotspot_upstream "$F_IF" >/dev/null 2>&1 ;;
+    esac
+    sleep 1
+  done
+}
+fast_upstream_worker &
+FAST_UPSTREAM_PID=$!
+
 # Keep both the LAN admin page and the desired hotspot state alive.
 # HyperOS reports a 600-second idle SoftAP shutdown timeout; the watchdog
 # restarts it when keepalive is enabled. Schedule and idle shutdown are
@@ -594,20 +631,8 @@ while true; do
       #    出 wlan0 直接丢包 → 客户端 TCP 全卡 SYN_RECV、页面打不开。必须补链路路由。
       HOTSPOT_SUBNET="${STABLE_IP%.*}.0/24"
       /system/bin/ip route replace "$HOTSPOT_SUBNET" dev "$IFACE_C" scope link table local_network 2>/dev/null
-      # 2) 出方向默认路由：每轮按当前上游刷新，避免 Wi-Fi/蜂窝切换后保留旧 default。
-      UP=$(get_upstream_iface)
-      if [ -n "$UP" ] && [ "$UP" != "$IFACE_C" ]; then
-        GW=$(/system/bin/ip route show table "$UP" 2>/dev/null | "$BB" awk '/^default/{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}')
-        if [ -n "$GW" ]; then
-          /system/bin/ip route replace default via "$GW" dev "$UP" table local_network 2>/dev/null
-        else
-          /system/bin/ip route replace default dev "$UP" table local_network 2>/dev/null
-        fi
-        /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "to $HOTSPOT_SUBNET lookup local_network" \
-          || /system/bin/ip rule add priority 17890 to "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
-        /system/bin/ip rule show 2>/dev/null | "$BB" grep -Fq "from $HOTSPOT_SUBNET lookup local_network" \
-          || /system/bin/ip rule add priority 17900 from "$HOTSPOT_SUBNET" lookup local_network 2>/dev/null
-      fi
+      # 2) 上游热切换：同步迁移 NAT/FORWARD 与默认路由。
+      ensure_hotspot_upstream "$IFACE_C" >/dev/null 2>&1
       DHCP_ALIVE=0
       udhcpd_alive && DHCP_ALIVE=1
       if [ "$DHCP_ALIVE" = 0 ] || [ -e "$DATA_DIR/dhcp.request" ]; then

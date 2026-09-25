@@ -129,6 +129,14 @@ restart_hotspot_async() {
         switch_management_to_hotspot "$VERIFY_IFACE"
         # v1.7.9：系统 DHCP 未建立时自建 DHCP/NAT（修复热点半开——设备连上无网）
         ensure_hotspot_dhcp "$VERIFY_IFACE"
+        # v1.8.0-latencyfix: the fast supervisor worker should consume dhcp.request
+        # within a few hundred ms. Wait briefly before reporting success so UI success
+        # means the client network path is actually ready, not merely that SoftAP exists.
+        READY_I=0
+        while [ -e "$DATA_DIR/dhcp.request" ] && [ "$READY_I" -lt 10 ]; do
+          READY_I=$((READY_I + 1))
+          sleep 0.2
+        done
         flush_stats_chain
         ensure_stats_chain "$VERIFY_IFACE"
         apply_mac_policy "$VERIFY_IFACE"
