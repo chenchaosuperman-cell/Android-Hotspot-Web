@@ -1,3 +1,7 @@
+# v1.9.2-beta（2026-09-25）
+
+- 修复日志面板 JSON 解析失败（前端报 Bad control character in string literal in JSON）：log.cgi 原先用 json_escape 转义日志，而日志含真实换行/回车等控制字符，产出非法 JSON；改为 json_escape_nl（换行转义为 \n、回车去化、引号/反斜杠转义），日志内容完整保留且 JSON 合法。
+- 发布元数据更新：module.prop 升级为 version=1.9.2-beta、versionCode=18105；update.json 指向 v1.9.2-beta Release ZIP。
 # v1.9.1-beta（2026-09-25）
 
 - 修复 HyperOS 系统 SoftAP 10 分钟 idle timeout 反复自动关闭热点导致的周期性断网：SoftApBridge 写入 SoftApConfiguration 时设置 shutdownTimeoutMillis=604800000（7 天等效禁用；HyperOS 拒绝 0 值），系统不再每 10 分钟强制 DISABLED 热点、keepalive 反复拉起。
