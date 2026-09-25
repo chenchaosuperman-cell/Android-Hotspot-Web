@@ -374,11 +374,15 @@ public class SoftApBridge {
         // 实测 uid=0（root）时 Tethering 状态机报 Invalid serving state、IpServer 不启动、
         // DHCP 不建立（连接的设备拿不到地址）；uid=1000 与系统 Settings 一致可正常流转。
         _setIntField(req, new String[]{"uid"}, 1000);
-        // HyperOS 扩展字段：系统 Settings 开热点实测会传 interfaceName 与
-        // localIPv4Address（固定网段 172.18.100.120/24）。不带时 Tethering 状态机
-        // 报 Invalid serving state、IpServer 不启动、DHCP 不建立。
-        _setStringField(req, new String[]{"interfaceName"}, "wlan2");
-        _setStringField(req, new String[]{"localIPv4Address"}, "172.18.100.120/24");
+        // These values were observed only on Xiaomi 14 (houji). Passing wlan2 to
+        // another phone whose AP is wlan1 can prevent its SoftAP from starting.
+        // Leave OEM extensions unset elsewhere so Tethering selects the interface
+        // and local address itself. Preserve the verified Xiaomi 14 path.
+        if ("xiaomi".equalsIgnoreCase(android.os.Build.MANUFACTURER)
+                && "houji".equalsIgnoreCase(android.os.Build.DEVICE)) {
+            _setStringField(req, new String[]{"interfaceName"}, "wlan2");
+            _setStringField(req, new String[]{"localIPv4Address"}, "172.18.100.120/24");
+        }
         return req;
     }
 

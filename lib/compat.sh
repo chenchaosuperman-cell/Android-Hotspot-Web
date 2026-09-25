@@ -595,23 +595,39 @@ hotspot_start() {
     case "$B_OUT" in
       *'ok=1'*)
         echo "$(date) hotspot_start: bridge tether-start (system Tethering)" >> "$LOG" 2>/dev/null
+        # The Xiaomi 14 quick path is verified; other ROMs can take longer to
+        # bring up Tethering. Do not issue a second start-softap while their
+        # first request is still being processed.
+        DEVICE_CODE=$(/system/bin/getprop ro.product.device 2>/dev/null)
+        DEVICE_MFR=$(/system/bin/getprop ro.product.manufacturer 2>/dev/null | "$BB" tr 'A-Z' 'a-z')
+        if [ "$DEVICE_CODE" = houji ] && [ "$DEVICE_MFR" = xiaomi ]; then
+          TETHER_WAIT=3
+        else
+          TETHER_WAIT=15
+        fi
         # v1.8.0-latencyfix: Android/HyperOS may create the SoftAP interface first and
         # finish netd/Tethering several seconds later. Waiting the old full 10s here
         # delayed our DHCP/NAT fallback and made clients look connected-but-offline.
         # Give the native stack a short grace period; if the AP interface already
         # exists, return success immediately so the caller can prepare DHCP/NAT in
         # parallel while system Tethering continues converging.
-        if wait_tether_enabled 3; then
+        if wait_tether_enabled "$TETHER_WAIT"; then
           return 0
         fi
-        QUICK_IF=$(get_hotspot_iface 2>/dev/null)
-        case "$QUICK_IF" in
-          wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*)
-            echo "$(date) hotspot_start: SoftAP interface $QUICK_IF is up before Tethering ready; continue with immediate network preparation" >> "$LOG" 2>/dev/null
-            return 0
-            ;;
-        esac
-        echo "$(date) hotspot_start: bridge tether-start did not create a usable AP within 3s; fallback" >> "$LOG" 2>/dev/null
+        if [ "$TETHER_WAIT" = 3 ]; then
+          QUICK_IF=$(get_hotspot_iface 2>/dev/null)
+          case "$QUICK_IF" in
+            wlan[0-9]*|ap[0-9]*|softap[0-9]*|swlan[0-9]*|wlan_ap[0-9]*|apbr[0-9]*)
+              echo "$(date) hotspot_start: SoftAP interface $QUICK_IF is up before Tethering ready; continue with immediate network preparation" >> "$LOG" 2>/dev/null
+              return 0
+              ;;
+          esac
+          echo "$(date) hotspot_start: bridge tether-start did not create a usable AP within 3s; fallback" >> "$LOG" 2>/dev/null
+        else
+          softap_state_snapshot 2>/dev/null
+          echo "$(date) hotspot_start: system Tethering not ready after ${TETHER_WAIT}s (state=${SNAP_AP_STATE:-UNKNOWN}); skip competing start-softap" >> "$LOG" 2>/dev/null
+          return 1
+        fi
         ;;
       *)
         echo "$(date) hotspot_start: bridge tether-start unavailable/failed, fallback; result=$(printf '%s' "$B_OUT" | "$BB" tr '\n' ' ' | "$BB" head -c 180)" >> "$LOG" 2>/dev/null

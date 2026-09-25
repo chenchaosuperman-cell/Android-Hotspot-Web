@@ -448,6 +448,21 @@ if "$BB" grep -q 'wifi start-softap' "$MOCK_LOG"; then ok 'hotspot_start 未错�
 # tethering 异步 → 轮询 bridge tether-state 确认 ENABLED
 assert_eq 'hotspot_start 返回 0（tether 激活确认）' '0' "$?"
 
+# A non-Xiaomi ROM may accept an asynchronous Tethering request without
+# enabling SoftAP immediately. It must not receive a competing cmd wifi start.
+: > "$MOCK_LOG"
+(
+  wait_tether_enabled() { return 1; }
+  softap_state_snapshot() { SNAP_AP_STATE=STARTING; }
+  hotspot_start "" "" "" "" "" ""
+)
+assert_eq '非小米 Tethering 未就绪时返回失败' '1' "$?"
+if "$BB" grep -q 'wifi start-softap' "$MOCK_LOG"; then
+  ok '非小米不在系统请求进行中重复启动 SoftAP' 1
+else
+  ok '非小米不在系统请求进行中重复启动 SoftAP' 0
+fi
+
 # --- hotspot_start 迁移：系统从未配置 + 模块旧参数 → 经 Framework 持久化后启动 ---
 : > "$MOCK_LOG"
 : > "$BRIDGE_STATE"   # 模拟系统从未配置热点
