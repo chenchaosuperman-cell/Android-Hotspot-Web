@@ -1,3 +1,10 @@
+# v1.9.3-beta（2026-09-26）
+
+- 非小米设备热点启动兼容（hotspotfix1 系列）：
+  - SoftApBridge 仅对小米 14（houji/xiaomi）写入 wlan2 与 172.18.100.120/24 Tethering 扩展字段；其他设备由系统自选热点接口与本地地址，避免硬编码 wlan2 导致其他机型 SoftAP 无法启动。
+  - hotspot_start：非小米设备等待系统 Tethering 就绪最多 15 秒；系统已接受请求但尚未就绪时不再补发竞争性 start-softap，避免重复启动冲突与热点起不来。
+  - 重新编译 lib/softap_bridge.dex 与 tools/softap_bridge/classes.dex，并新增非小米场景回归测试用例。
+- 发布元数据更新：module.prop 升级为 version=1.9.3-beta、versionCode=18106；update.json 指向 v1.9.3-beta Release ZIP。
 # v1.9.2-beta（2026-09-25）
 
 - 修复日志面板 JSON 解析失败（前端报 Bad control character in string literal in JSON）：log.cgi 原先用 json_escape 转义日志，而日志含真实换行/回车等控制字符，产出非法 JSON；改为 json_escape_nl（换行转义为 \n、回车去化、引号/反斜杠转义），日志内容完整保留且 JSON 合法。
